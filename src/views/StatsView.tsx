@@ -160,24 +160,29 @@ export function StatsView() {
 
           {hasWeeklyFocusData ? (
             <div>
-              <div className="grid h-52 grid-cols-7 gap-3">
+              <div className="grid h-56 grid-cols-7 items-end gap-2">
               {recentWeekData.map((day, index) => {
-                const height = day.focusHours === 0 ? 0 : Math.max(12, (day.focusHours / maxWeekHours) * 100);
+                const height =
+                  day.focusHours === 0 ? 0 : Math.min(100, Math.max(18, (day.focusHours / maxWeekHours) * 100));
                 return (
-                  <div key={`${index}-${day.label}`} className="flex flex-col items-center">
-                    <p className="mb-2 text-[10px] font-black text-slate-700">
+                  <div key={`${index}-${day.label}`} className="flex min-w-0 flex-col items-center">
+                    <p className="mb-2 whitespace-nowrap text-sm font-black tracking-tight text-slate-700">
                       {day.focusHours === 0 ? '--' : `${day.focusHours.toFixed(1)}h`}
                     </p>
-                    <div className="relative w-full flex-1 overflow-hidden rounded-[22px] border border-slate-200 bg-[linear-gradient(to_top,_rgba(148,163,184,0.08)_1px,_transparent_1px)] bg-[length:100%_25%] bg-slate-50">
-                      {day.focusHours > 0 && (
-                        <div
-                          className="absolute inset-x-1.5 bottom-1.5 rounded-[18px] bg-gradient-to-t from-indigo-600 via-indigo-500 to-indigo-300 shadow-[0_10px_25px_rgba(99,102,241,0.25)] transition-all duration-500"
-                          style={{height: `${height}%`}}
-                        />
-                      )}
+                    <div className="relative h-40 w-full max-w-[46px] overflow-hidden rounded-[14px] border border-slate-200 bg-[linear-gradient(to_top,_rgba(148,163,184,0.08)_1px,_transparent_1px)] bg-[length:100%_25%] bg-slate-50 shadow-[inset_0_1px_2px_rgba(148,163,184,0.08)]">
+                      <div className="absolute inset-1.5 overflow-hidden rounded-[10px]">
+                        {day.focusHours > 0 && (
+                          <div
+                            className="absolute inset-x-0 bottom-0 rounded-[8px] bg-gradient-to-t from-indigo-600 via-indigo-500 to-indigo-300 shadow-[0_10px_22px_rgba(99,102,241,0.22)] transition-all duration-500"
+                            style={{height: `${height}%`}}
+                          />
+                        )}
+                      </div>
                     </div>
-                    <p className="mt-2 text-[10px] font-black text-slate-500">{day.label}</p>
-                    <p className="text-[10px] text-slate-400">{day.dateLabel}</p>
+                    <p className="mt-2 whitespace-nowrap text-[11px] font-black text-slate-500">{day.label}</p>
+                    <p className="whitespace-nowrap text-[11px] font-medium tracking-tight text-slate-400">
+                      {day.dateLabel}
+                    </p>
                   </div>
                 );
               })}
