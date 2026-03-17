@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   BadgeCheck,
   Calendar as CalendarIcon,
@@ -163,6 +163,365 @@ function buildTemplateSummary(drafts: AllocationDraft[]) {
   return summary || '先添加几个活动模板';
 }
 
+interface AllocationComposerPanelProps {
+  remaining: number;
+  onAllocate: (type: ActivityType, hours: number) => boolean;
+}
+
+const AllocationComposerPanel = React.memo(function AllocationComposerPanel({
+  remaining,
+  onAllocate,
+}: AllocationComposerPanelProps) {
+  const [selectedType, setSelectedType] = useState<ActivityType>('work');
+  const [allocateHours, setAllocateHours] = useState(0.5);
+  const pendingHoursRef = useRef(0.5);
+  const frameRef = useRef<number | null>(null);
+
+  const sliderMax = remaining > 0 ? remaining : 0;
+  const selectedActivity = getActivityConfig(selectedType);
+  const sliderPercent =
+    sliderMax === 0 ? 0 : Math.min(100, Math.max(0, (allocateHours / sliderMax) * 100));
+
+  const scheduleHours = useCallback(
+    (hours: number) => {
+      const nextHours =
+        sliderMax <= 0 ? 0 : Math.max(0, Math.min(sliderMax, Math.round(hours * 10) / 10));
+      pendingHoursRef.current = nextHours;
+
+      if (frameRef.current !== null) return;
+
+      frameRef.current = requestAnimationFrame(() => {
+        frameRef.current = null;
+        setAllocateHours(pendingHoursRef.current);
+      });
+    },
+    [sliderMax],
+  );
+
+  useEffect(() => {
+    const nextHours = sliderMax <= 0 ? 0 : Math.min(pendingHoursRef.current, sliderMax);
+    pendingHoursRef.current = nextHours;
+    setAllocateHours(nextHours);
+  }, [sliderMax]);
+
+  useEffect(() => {
+    return () => {
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current);
+      }
+    };
+  }, []);
+
+  const handleAllocateClick = () => {
+    const nextHours = Math.round(pendingHoursRef.current * 10) / 10;
+    if (nextHours <= 0 || nextHours > remaining) return;
+
+    const success = onAllocate(selectedType, nextHours);
+    if (!success) return;
+
+    pendingHoursRef.current = 0;
+    setAllocateHours(0);
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-5 gap-1.5">
+        {ACTIVITY_CONFIG.map((activity) => (
+          <button
+            key={activity.type}
+            onClick={() => setSelectedType(activity.type)}
+            className={cn(
+              'flex flex-col items-center gap-1.5 rounded-2xl border px-1.5 py-2.5 transition-all',
+              selectedType === activity.type
+                ? cn(activity.color, 'shadow-sm')
+                : 'border-transparent bg-white/80 text-slate-400 shadow-sm',
+            )}>
+            {activity.icon}
+            <span className="text-[9px] font-black">{activity.label}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="rounded-[28px] border border-indigo-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.98)_0%,rgba(243,244,255,0.92)_100%)] p-3.5 shadow-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div
+              className={cn(
+                'flex h-10 w-10 items-center justify-center rounded-xl text-white shadow-lg',
+                selectedActivity?.baseColor,
+              )}>
+              {selectedActivity?.icon}
+            </div>
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-[0.22em] text-slate-400">
+                当前分配
+              </p>
+              <p className="mt-1 text-sm font-black text-slate-800">{selectedActivity?.label}</p>
+            </div>
+          </div>
+          <div className="text-right">
+            <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-400">
+              本次时长
+            </p>
+            <div className="mt-1 text-[28px] font-mono font-black tracking-tight text-slate-900">
+              {formatHours(allocateHours)}
+              <span className="ml-1 text-sm font-bold text-slate-400">h</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {TIME_PRESETS.map((preset) => (
+            <button
+              key={preset}
+              onClick={() => scheduleHours(Math.min(preset, sliderMax))}
+              disabled={sliderMax === 0}
+              className={cn(
+                'rounded-full border px-2.5 py-1.5 text-[11px] font-black transition-all whitespace-nowrap',
+                sliderMax > 0
+                  ? 'border-slate-200 bg-white text-slate-600 active:scale-[0.96]'
+                  : 'border-slate-100 bg-slate-50 text-slate-300',
+              )}>
+              {formatHours(preset)}h
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-3 rounded-[18px] border border-indigo-50 bg-white px-2.5 py-2.5 shadow-[inset_0_1px_3px_rgba(15,23,42,0.03)]">
+          <input
+            type="range"
+            min="0"
+            max={sliderMax}
+            step="0.5"
+            value={Math.min(allocateHours, sliderMax)}
+            onInput={(event) =>
+              scheduleHours(parseFloat((event.target as HTMLInputElement).value))
+            }
+            className="time-slider w-full appearance-none"
+            style={{
+              '--slider-color': selectedActivity?.hexColor ?? '#6366f1',
+              '--slider-shadow': `${selectedActivity?.hexColor ?? '#6366f1'}30`,
+              '--slider-soft': `${selectedActivity?.hexColor ?? '#6366f1'}16`,
+              background: `linear-gradient(90deg, ${selectedActivity?.hexColor ?? '#6366f1'} 0%, ${selectedActivity?.hexColor ?? '#6366f1'} ${sliderPercent}%, rgba(226,232,240,0.92) ${sliderPercent}%, rgba(226,232,240,0.92) 100%)`,
+            } as React.CSSProperties}
+            disabled={remaining === 0}
+          />
+        </div>
+
+        <div className="mt-2 flex items-center justify-between gap-3">
+          <span className="text-[11px] font-medium text-slate-400">左右拖动调节，支持 0.5h 步进</span>
+          <span className="rounded-full bg-white/90 px-3 py-1.5 text-[10px] font-black text-slate-500 shadow-sm whitespace-nowrap">
+            {remaining === 0 ? '今日已满' : `本次最多 ${formatHours(sliderMax)}h`}
+          </span>
+        </div>
+
+        <button
+          onClick={handleAllocateClick}
+          disabled={remaining === 0 || allocateHours <= 0 || allocateHours > remaining}
+          className={cn(
+            'mt-3 w-full rounded-2xl py-3.5 text-sm font-black uppercase tracking-[0.24em] transition-all active:scale-95',
+            remaining === 0 || allocateHours <= 0 || allocateHours > remaining
+              ? 'bg-slate-100 text-slate-300'
+              : 'bg-slate-900 text-white shadow-lg shadow-slate-200',
+          )}>
+          加入今日分配
+        </button>
+      </div>
+    </div>
+  );
+});
+
+interface DraftComposerRowProps {
+  draft: AllocationDraft;
+  drafts: AllocationDraft[];
+  onChange: (drafts: AllocationDraft[]) => void;
+}
+
+const DraftComposerRow = React.memo(function DraftComposerRow({
+  draft,
+  drafts,
+  onChange,
+}: DraftComposerRowProps) {
+  const activity = getActivityConfig(draft.type);
+  const maxHours = useMemo(() => getMaxDraftHours(drafts, draft.type), [drafts, draft.type]);
+  const [localHours, setLocalHours] = useState(draft.hours);
+  const pendingHoursRef = useRef(draft.hours);
+  const frameRef = useRef<number | null>(null);
+  const isDraggingRef = useRef(false);
+
+  useEffect(() => {
+    if (isDraggingRef.current) return;
+    pendingHoursRef.current = draft.hours;
+    setLocalHours(draft.hours);
+  }, [draft.hours]);
+
+  useEffect(() => {
+    const nextHours = Math.min(pendingHoursRef.current, maxHours);
+    pendingHoursRef.current = nextHours;
+    setLocalHours(nextHours);
+  }, [maxHours]);
+
+  useEffect(() => {
+    return () => {
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current);
+      }
+    };
+  }, []);
+
+  const commitHours = useCallback(
+    (hours: number) => {
+      const nextHours = Math.max(0, Math.min(maxHours, Math.round(hours * 10) / 10));
+      onChange(setDraftHours(drafts, draft.type, nextHours));
+    },
+    [draft.type, drafts, maxHours, onChange],
+  );
+
+  const scheduleHours = useCallback(
+    (hours: number) => {
+      const nextHours = Math.max(0, Math.min(maxHours, Math.round(hours * 10) / 10));
+      pendingHoursRef.current = nextHours;
+
+      if (frameRef.current !== null) return;
+
+      frameRef.current = requestAnimationFrame(() => {
+        frameRef.current = null;
+        setLocalHours(pendingHoursRef.current);
+      });
+    },
+    [maxHours],
+  );
+
+  const finishDragging = useCallback(() => {
+    if (!isDraggingRef.current) return;
+    isDraggingRef.current = false;
+    commitHours(pendingHoursRef.current);
+  }, [commitHours]);
+
+  const sliderPercent =
+    maxHours <= 0 ? 0 : Math.min(100, Math.max(0, (localHours / maxHours) * 100));
+
+  return (
+    <div className="rounded-[26px] border border-white/70 bg-white/92 p-4 shadow-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <div
+            className={cn(
+              'flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl text-white shadow-sm',
+              activity?.baseColor,
+            )}>
+            {activity?.icon}
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm font-black text-slate-800">{activity?.label}</p>
+            <p className="mt-1 text-[11px] font-medium text-slate-400">
+              本项最高可设 {formatHours(maxHours)}h
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={() => onChange(removeDraftType(drafts, draft.type))}
+          className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-[10px] font-black text-slate-500 transition-all active:scale-[0.96]">
+          移除
+        </button>
+      </div>
+
+      <div className="mt-4 flex items-center justify-between gap-3">
+        <div className="rounded-2xl bg-slate-50 px-3 py-2">
+          <span className="text-[22px] font-mono font-black tracking-tight text-slate-900">
+            {formatHours(localHours)}
+          </span>
+          <span className="ml-1 text-sm font-bold text-slate-400">h</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              const nextHours = localHours - 0.5;
+              scheduleHours(nextHours);
+              commitHours(nextHours);
+            }}
+            className="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-black text-slate-600 shadow-sm transition-all active:scale-[0.96]">
+            -0.5h
+          </button>
+          <button
+            onClick={() => {
+              const nextHours = Math.min(maxHours, localHours + 0.5);
+              scheduleHours(nextHours);
+              commitHours(nextHours);
+            }}
+            disabled={localHours >= maxHours}
+            className={cn(
+              'rounded-2xl px-3 py-2 text-[11px] font-black transition-all',
+              localHours >= maxHours
+                ? 'bg-slate-100 text-slate-300'
+                : 'bg-slate-900 text-white shadow-sm active:scale-[0.96]',
+            )}>
+            +0.5h
+          </button>
+        </div>
+      </div>
+
+      <div className="mt-3 rounded-[18px] border border-indigo-50 bg-white px-2.5 py-2.5 shadow-[inset_0_1px_3px_rgba(15,23,42,0.03)]">
+        <input
+          type="range"
+          min="0"
+          max={maxHours}
+          step="0.5"
+          value={Math.min(localHours, maxHours)}
+          onInput={(event) => {
+            isDraggingRef.current = true;
+            scheduleHours(parseFloat((event.target as HTMLInputElement).value));
+          }}
+          onPointerUp={finishDragging}
+          onPointerCancel={finishDragging}
+          onTouchEnd={finishDragging}
+          onMouseUp={finishDragging}
+          onBlur={finishDragging}
+          className="time-slider w-full appearance-none"
+          style={{
+            '--slider-color': activity?.hexColor ?? '#6366f1',
+            '--slider-shadow': `${activity?.hexColor ?? '#6366f1'}30`,
+            '--slider-soft': `${activity?.hexColor ?? '#6366f1'}16`,
+            background: `linear-gradient(90deg, ${activity?.hexColor ?? '#6366f1'} 0%, ${activity?.hexColor ?? '#6366f1'} ${sliderPercent}%, rgba(226,232,240,0.92) ${sliderPercent}%, rgba(226,232,240,0.92) 100%)`,
+          } as React.CSSProperties}
+          disabled={maxHours <= 0}
+        />
+      </div>
+
+      <div className="mt-2 flex items-center justify-between gap-3">
+        <span className="text-[11px] font-medium text-slate-400">左右拖动调节，支持 0.5h 步进</span>
+        <span className="rounded-full bg-white/90 px-3 py-1.5 text-[10px] font-black text-slate-500 shadow-sm whitespace-nowrap">
+          本项最多 {formatHours(maxHours)}h
+        </span>
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        {Array.from(new Set(TIME_PRESETS.map((preset) => Math.min(preset, maxHours))))
+          .filter((preset) => preset > 0)
+          .map((preset) => {
+            const isActive = Math.abs(localHours - preset) < 0.05;
+            return (
+              <button
+                key={`${draft.type}-${preset}`}
+                onClick={() => {
+                  scheduleHours(preset);
+                  commitHours(preset);
+                }}
+                className={cn(
+                  'rounded-full border px-2.5 py-1.5 text-[10px] font-black transition-all whitespace-nowrap',
+                  isActive
+                    ? cn(activity?.color ?? 'text-indigo-600 border-indigo-100 bg-indigo-50')
+                    : 'border-slate-200 bg-white text-slate-500 active:scale-[0.96]',
+                )}>
+                {formatHours(preset)}h
+              </button>
+            );
+          })}
+      </div>
+    </div>
+  );
+});
+
 export function HomeView() {
   const {
     allocations,
@@ -184,8 +543,6 @@ export function HomeView() {
     updateUnusedAllocation,
     clearDailyPlan,
   } = useStore();
-  const [selectedType, setSelectedType] = useState<ActivityType>('work');
-  const [allocateHours, setAllocateHours] = useState(0.5);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [templateSheetMode, setTemplateSheetMode] = useState<TemplateSheetMode>(null);
@@ -222,11 +579,12 @@ export function HomeView() {
     [todayAllocations, editingAllocationId],
   );
 
-  const handleAllocate = () => {
-    if (allocateHours <= 0 || allocateHours > remaining) return;
-    allocateTime(todayStr, selectedType, allocateHours);
-    setAllocateHours(0);
+  const handleAllocate = (type: ActivityType, hours: number) => {
+    if (hours <= 0 || hours > remaining) return false;
+    const success = allocateTime(todayStr, type, hours);
+    if (!success) return false;
     setActionFeedback('已新增分配');
+    return true;
   };
 
   const totalEggProgress = currentEgg.progress.focus + currentEgg.progress.heal + currentEgg.progress.active;
@@ -424,9 +782,6 @@ export function HomeView() {
     return 'D';
   })();
 
-  const sliderMax = remaining > 0 ? remaining : 0;
-  const sliderPercent =
-    sliderMax === 0 ? 0 : Math.min(100, Math.max(0, (allocateHours / sliderMax) * 100));
   const animatedTotalAllocated = (Object.values(animatedDistribution) as number[]).reduce(
     (sum, hours) => sum + hours,
     0,
@@ -441,7 +796,6 @@ export function HomeView() {
     [ringDisplayDistribution, ringVisibleHours],
   );
   const maxDistributionHours = Math.max(...(Object.values(animatedDistribution) as number[]), 0);
-  const selectedActivity = getActivityConfig(selectedType);
   const dominantActivity = useMemo(
     () =>
       ACTIVITY_CONFIG.reduce(
@@ -1293,99 +1647,14 @@ export function HomeView() {
 
         {normalizedDrafts.length > 0 ? (
           <div className="space-y-3">
-            {normalizedDrafts.map((draft) => {
-              const activity = getActivityConfig(draft.type);
-              const maxHours = getMaxDraftHours(normalizedDrafts, draft.type);
-
-              return (
-                <div
-                  key={draft.type}
-                  className="rounded-[26px] border border-white/70 bg-white/92 p-4 shadow-sm">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex min-w-0 items-center gap-3">
-                      <div
-                        className={cn(
-                          'flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl text-white shadow-sm',
-                          activity?.baseColor,
-                        )}>
-                        {activity?.icon}
-                      </div>
-                      <div className="min-w-0">
-                        <p className="text-sm font-black text-slate-800">{activity?.label}</p>
-                        <p className="mt-1 text-[11px] font-medium text-slate-400">
-                          本项最高可设 {formatHours(maxHours)}h
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => onChange(removeDraftType(normalizedDrafts, draft.type))}
-                      className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-[10px] font-black text-slate-500 transition-all active:scale-[0.96]">
-                      移除
-                    </button>
-                  </div>
-
-                  <div className="mt-4 flex items-center justify-between gap-3">
-                    <div className="rounded-2xl bg-slate-50 px-3 py-2">
-                      <span className="text-[22px] font-mono font-black tracking-tight text-slate-900">
-                        {formatHours(draft.hours)}
-                      </span>
-                      <span className="ml-1 text-sm font-bold text-slate-400">h</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() =>
-                          onChange(setDraftHours(normalizedDrafts, draft.type, draft.hours - 0.5))
-                        }
-                        className="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-black text-slate-600 shadow-sm transition-all active:scale-[0.96]">
-                        -0.5h
-                      </button>
-                      <button
-                        onClick={() =>
-                          onChange(
-                            setDraftHours(
-                              normalizedDrafts,
-                              draft.type,
-                              Math.min(maxHours, draft.hours + 0.5),
-                            ),
-                          )
-                        }
-                        disabled={draft.hours >= maxHours}
-                        className={cn(
-                          'rounded-2xl px-3 py-2 text-[11px] font-black transition-all',
-                          draft.hours >= maxHours
-                            ? 'bg-slate-100 text-slate-300'
-                            : 'bg-slate-900 text-white shadow-sm active:scale-[0.96]',
-                        )}>
-                        +0.5h
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {Array.from(new Set(TIME_PRESETS.map((preset) => Math.min(preset, maxHours))))
-                      .filter((preset) => preset > 0)
-                      .map((preset) => {
-                        const isActive = Math.abs(draft.hours - preset) < 0.05;
-                        return (
-                          <button
-                            key={`${draft.type}-${preset}`}
-                            onClick={() =>
-                              onChange(setDraftHours(normalizedDrafts, draft.type, preset))
-                            }
-                            className={cn(
-                              'rounded-full border px-2.5 py-1.5 text-[10px] font-black transition-all whitespace-nowrap',
-                              isActive
-                                ? cn(activity?.color ?? 'text-indigo-600 border-indigo-100 bg-indigo-50')
-                                : 'border-slate-200 bg-white text-slate-500 active:scale-[0.96]',
-                            )}>
-                            {formatHours(preset)}h
-                          </button>
-                        );
-                      })}
-                  </div>
-                </div>
-              );
-            })}
+            {normalizedDrafts.map((draft) => (
+              <DraftComposerRow
+                key={draft.type}
+                draft={draft}
+                drafts={normalizedDrafts}
+                onChange={onChange}
+              />
+            ))}
           </div>
         ) : (
           <div className="rounded-[26px] border border-dashed border-slate-200 bg-white/80 px-4 py-6 text-center">
@@ -1564,94 +1833,7 @@ export function HomeView() {
             />
           ) : (
             <div className="space-y-3">
-              <div className="grid grid-cols-5 gap-1.5">
-                {ACTIVITY_CONFIG.map((activity) => (
-                  <button
-                    key={activity.type}
-                    onClick={() => setSelectedType(activity.type)}
-                    className={cn(
-                      'flex flex-col items-center gap-1.5 rounded-2xl border px-1.5 py-2.5 transition-all',
-                      selectedType === activity.type
-                        ? cn(activity.color, 'shadow-sm')
-                        : 'border-transparent bg-white/80 text-slate-400 shadow-sm',
-                    )}>
-                    {activity.icon}
-                    <span className="text-[9px] font-black">{activity.label}</span>
-                  </button>
-                ))}
-              </div>
-
-              <div className="rounded-[28px] border border-indigo-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.98)_0%,rgba(243,244,255,0.92)_100%)] p-3.5 shadow-sm">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className={cn('flex h-10 w-10 items-center justify-center rounded-xl text-white shadow-lg', selectedActivity?.baseColor)}>
-                      {selectedActivity?.icon}
-                    </div>
-                    <div>
-                      <p className="text-[10px] font-black uppercase tracking-[0.22em] text-slate-400">当前分配</p>
-                      <p className="mt-1 text-sm font-black text-slate-800">{selectedActivity?.label}</p>
-                    </div>
-                  </div>
-                  <div className="text-right">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-400">本次时长</p>
-                      <div className="mt-1 text-[28px] font-mono font-black tracking-tight text-slate-900">
-                        {formatHours(allocateHours)}
-                        <span className="ml-1 text-sm font-bold text-slate-400">h</span>
-                      </div>
-                    </div>
-                  </div>
-
-                <div className="mt-3 flex flex-wrap gap-1.5">
-                  {TIME_PRESETS.map((preset) => (
-                    <button
-                      key={preset}
-                      onClick={() => setAllocateHours(Math.min(preset, sliderMax))}
-                      disabled={sliderMax === 0}
-                      className={cn(
-                        'rounded-full border px-2.5 py-1.5 text-[11px] font-black transition-all whitespace-nowrap',
-                        sliderMax > 0
-                          ? 'border-slate-200 bg-white text-slate-600 active:scale-[0.96]'
-                          : 'border-slate-100 bg-slate-50 text-slate-300',
-                      )}>
-                      {formatHours(preset)}h
-                    </button>
-                  ))}
-                </div>
-
-                <div className="mt-3 rounded-full bg-white px-1.5 py-2 shadow-inner ring-1 ring-slate-100">
-                  <input
-                    type="range"
-                    min="0"
-                    max={sliderMax}
-                    step="0.5"
-                    value={Math.min(allocateHours, sliderMax)}
-                    onChange={(e) => setAllocateHours(parseFloat(e.target.value))}
-                    className="time-slider w-full cursor-pointer appearance-none"
-                    style={{
-                      background: `linear-gradient(90deg, ${selectedActivity?.hexColor ?? '#6366f1'} 0%, ${selectedActivity?.hexColor ?? '#6366f1'} ${sliderPercent}%, #e2e8f0 ${sliderPercent}%, #e2e8f0 100%)`,
-                    }}
-                    disabled={remaining === 0}
-                  />
-                </div>
-
-                <div className="mt-2 flex items-center justify-between text-[11px] font-medium text-slate-400">
-                  <span>0h</span>
-                  <span>剩余 {formatHours(remaining)}h</span>
-                  <span>{formatHours(sliderMax)}h</span>
-                </div>
-
-                <button
-                  onClick={handleAllocate}
-                  disabled={remaining === 0 || allocateHours <= 0 || allocateHours > remaining}
-                  className={cn(
-                    'mt-3 w-full rounded-2xl py-3.5 text-sm font-black uppercase tracking-[0.24em] transition-all active:scale-95',
-                    remaining === 0 || allocateHours <= 0 || allocateHours > remaining
-                      ? 'bg-slate-100 text-slate-300'
-                      : 'bg-slate-900 text-white shadow-lg shadow-slate-200',
-                  )}>
-                  加入今日分配
-                </button>
-              </div>
+              <AllocationComposerPanel remaining={remaining} onAllocate={handleAllocate} />
 
               <div
                 className={cn(
@@ -2461,19 +2643,23 @@ export function HomeView() {
                   max={editHoursMax}
                   step="0.5"
                   value={Math.min(editHours, editHoursMax)}
-                  onChange={(e) => setEditHours(parseFloat(e.target.value))}
+                  onInput={(e) => setEditHours(parseFloat((e.target as HTMLInputElement).value))}
                   className="time-slider w-full cursor-pointer appearance-none"
                   style={{
+                    '--slider-color': getActivityConfig(editType)?.hexColor ?? '#6366f1',
+                    '--slider-shadow': `${getActivityConfig(editType)?.hexColor ?? '#6366f1'}33`,
+                    '--slider-soft': `${getActivityConfig(editType)?.hexColor ?? '#6366f1'}16`,
                     background: `linear-gradient(90deg, ${getActivityConfig(editType)?.hexColor ?? '#6366f1'} 0%, ${getActivityConfig(editType)?.hexColor ?? '#6366f1'} ${editHoursMax === 0 ? 0 : (editHours / editHoursMax) * 100}%, rgba(255,255,255,0.16) ${editHoursMax === 0 ? 0 : (editHours / editHoursMax) * 100}%, rgba(255,255,255,0.16) 100%)`,
-                  }}
+                  } as React.CSSProperties}
                   disabled={editHoursMax === 0}
                 />
               </div>
 
-              <div className="mt-3 flex items-center justify-between text-[11px] font-medium text-white/60">
-                <span>0h</span>
-                <span>可用上限 {formatHours(editHoursMax)}h</span>
-                <span>{formatHours(editHoursMax)}h</span>
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <span className="text-[11px] font-medium text-white/60">左右拖动调节</span>
+                <span className="rounded-full bg-white/12 px-3 py-1.5 text-[10px] font-black text-white/80 whitespace-nowrap">
+                  上限 {formatHours(editHoursMax)}h
+                </span>
               </div>
             </div>
 
