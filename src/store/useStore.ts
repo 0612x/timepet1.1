@@ -41,6 +41,22 @@ export interface CustomPet {
   image: string;
 }
 
+export interface AllocationDraft {
+  type: ActivityType;
+  hours: number;
+}
+
+export interface PlanTemplate {
+  id: string;
+  label: string;
+  drafts: AllocationDraft[];
+}
+
+export interface AllocationUpdate {
+  type?: ActivityType;
+  hours?: number;
+}
+
 interface AppState {
   currentTab: TabType;
   setCurrentTab: (tab: TabType) => void;
@@ -50,6 +66,19 @@ interface AppState {
   
   allocations: Record<string, Allocation[]>;
   allocateTime: (date: string, type: ActivityType, hours: number) => boolean;
+  applyAllocationDrafts: (date: string, drafts: AllocationDraft[]) => boolean;
+  copyAllocationsFromDate: (sourceDate: string, targetDate: string) => boolean;
+  removeLastUnusedAllocation: (date: string) => boolean;
+  clearUnusedAllocations: (date: string) => boolean;
+  updateUnusedAllocation: (date: string, allocationId: string, update: AllocationUpdate) => boolean;
+  deleteUnusedAllocation: (date: string, allocationId: string) => boolean;
+  dailyPlans: Record<string, AllocationDraft[]>;
+  setDailyPlanDrafts: (date: string, drafts: AllocationDraft[]) => boolean;
+  clearDailyPlan: (date: string) => boolean;
+  planTemplates: PlanTemplate[];
+  createPlanTemplate: (input: Omit<PlanTemplate, 'id'>) => boolean;
+  updatePlanTemplate: (id: string, update: Partial<Omit<PlanTemplate, 'id'>>) => boolean;
+  deletePlanTemplate: (id: string) => boolean;
   
   currentEgg: EggState;
   feedEgg: (date: string, allocationId: string) => boolean;
@@ -65,6 +94,44 @@ interface AppState {
   advanceDay: () => void;
 }
 
+const ACTIVITY_ORDER: ActivityType[] = ['work', 'study', 'entertainment', 'rest', 'exercise'];
+
+const DEFAULT_PLAN_TEMPLATES: PlanTemplate[] = [
+  {
+    id: 'workday',
+    label: '工作日',
+    drafts: [
+      {type: 'work', hours: 8},
+      {type: 'study', hours: 2},
+      {type: 'exercise', hours: 1},
+      {type: 'entertainment', hours: 2},
+      {type: 'rest', hours: 11},
+    ],
+  },
+  {
+    id: 'balanced',
+    label: '平衡日',
+    drafts: [
+      {type: 'work', hours: 6},
+      {type: 'study', hours: 3},
+      {type: 'exercise', hours: 2},
+      {type: 'entertainment', hours: 3},
+      {type: 'rest', hours: 10},
+    ],
+  },
+  {
+    id: 'weekend',
+    label: '周末',
+    drafts: [
+      {type: 'work', hours: 1},
+      {type: 'study', hours: 2},
+      {type: 'exercise', hours: 2},
+      {type: 'entertainment', hours: 5},
+      {type: 'rest', hours: 14},
+    ],
+  },
+];
+
 const getInitialEgg = (theme: ThemeType): EggState => ({
   theme,
   progress: { focus: 0, heal: 0, active: 0 },
@@ -72,6 +139,76 @@ const getInitialEgg = (theme: ThemeType): EggState => ({
   stage: 'egg',
   finalState: null,
 });
+
+const createAllocation = (type: ActivityType, hours: number, offset = 0): Allocation => ({
+  id: Math.random().toString(36).substring(2, 9),
+  type,
+  hours,
+  used: false,
+  timestamp: Date.now() + offset,
+});
+
+function setDailyAllocations(
+  allocations: Record<string, Allocation[]>,
+  date: string,
+  nextDailyAllocations: Allocation[],
+) {
+  if (nextDailyAllocations.length === 0) {
+    const {[date]: _removed, ...rest} = allocations;
+    return rest;
+  }
+
+  return {
+    ...allocations,
+    [date]: nextDailyAllocations,
+  };
+}
+
+function sanitizeDrafts(drafts: AllocationDraft[]) {
+  const totals = ACTIVITY_ORDER.reduce<Record<ActivityType, number>>(
+    (result, type) => ({...result, [type]: 0}),
+    {
+      work: 0,
+      study: 0,
+      entertainment: 0,
+      rest: 0,
+      exercise: 0,
+    },
+  );
+
+  drafts.forEach((draft) => {
+    if (draft.hours <= 0) return;
+    totals[draft.type] += draft.hours;
+  });
+
+  return ACTIVITY_ORDER.map((type) => ({
+    type,
+    hours: Math.round(totals[type] * 10) / 10,
+  })).filter((draft) => draft.hours > 0);
+}
+
+function setDailyPlanDraftMap(
+  dailyPlans: Record<string, AllocationDraft[]>,
+  date: string,
+  drafts: AllocationDraft[],
+) {
+  if (drafts.length === 0) {
+    const {[date]: _removed, ...rest} = dailyPlans;
+    return rest;
+  }
+
+  return {
+    ...dailyPlans,
+    [date]: drafts,
+  };
+}
+
+function sanitizeTemplateInput(input: Omit<PlanTemplate, 'id'>) {
+  return {
+    label: input.label.trim(),
+    drafts: sanitizeDrafts(input.drafts),
+  };
+}
 
 export const useStore = create<AppState>()(
   persist(
@@ -83,6 +220,8 @@ export const useStore = create<AppState>()(
       setCurrentTheme: (theme) => set({ currentTheme: theme }),
       
       allocations: {},
+      dailyPlans: {},
+      planTemplates: DEFAULT_PLAN_TEMPLATES,
       allocateTime: (date, type, hours) => {
         const state = get();
         const dailyAllocs = state.allocations[date] || [];
@@ -91,14 +230,8 @@ export const useStore = create<AppState>()(
         if (totalAllocated + hours > 24) {
           return false; // Exceeds 24h limit
         }
-        
-        const newAlloc: Allocation = {
-          id: Math.random().toString(36).substring(2, 9),
-          type,
-          hours,
-          used: false,
-          timestamp: Date.now(),
-        };
+
+        const newAlloc = createAllocation(type, hours);
         
         set({
           allocations: {
@@ -106,6 +239,214 @@ export const useStore = create<AppState>()(
             [date]: [...dailyAllocs, newAlloc]
           }
         });
+        return true;
+      },
+      applyAllocationDrafts: (date, drafts) => {
+        const state = get();
+        const dailyAllocs = state.allocations[date] || [];
+
+        if (dailyAllocs.some((allocation) => allocation.used)) return false;
+
+        const sanitizedDrafts = sanitizeDrafts(drafts);
+        const totalHours = sanitizedDrafts.reduce((sum, draft) => sum + draft.hours, 0);
+
+        if (totalHours > 24) return false;
+
+        const nextDailyAllocations = sanitizedDrafts.map((draft, index) =>
+          createAllocation(draft.type, draft.hours, index),
+        );
+
+        set({
+          allocations: setDailyAllocations(state.allocations, date, nextDailyAllocations),
+        });
+
+        return true;
+      },
+      copyAllocationsFromDate: (sourceDate, targetDate) => {
+        const state = get();
+        const sourceAllocations = state.allocations[sourceDate] || [];
+        const targetAllocations = state.allocations[targetDate] || [];
+
+        if (sourceAllocations.length === 0 || targetAllocations.some((allocation) => allocation.used)) {
+          return false;
+        }
+
+        const nextDailyAllocations = sourceAllocations.map((allocation, index) =>
+          createAllocation(allocation.type, allocation.hours, index),
+        );
+
+        set({
+          allocations: setDailyAllocations(state.allocations, targetDate, nextDailyAllocations),
+        });
+
+        return true;
+      },
+      removeLastUnusedAllocation: (date) => {
+        const state = get();
+        const dailyAllocs = state.allocations[date] || [];
+        const lastUnusedIndex = [...dailyAllocs]
+          .map((allocation, index) => ({allocation, index}))
+          .filter(({allocation}) => !allocation.used)
+          .sort((left, right) => right.allocation.timestamp - left.allocation.timestamp)[0]?.index;
+
+        if (lastUnusedIndex === undefined) return false;
+
+        const nextDailyAllocations = dailyAllocs.filter((_, index) => index !== lastUnusedIndex);
+
+        set({
+          allocations: setDailyAllocations(state.allocations, date, nextDailyAllocations),
+        });
+
+        return true;
+      },
+      clearUnusedAllocations: (date) => {
+        const state = get();
+        const dailyAllocs = state.allocations[date] || [];
+        const nextDailyAllocations = dailyAllocs.filter((allocation) => allocation.used);
+
+        if (nextDailyAllocations.length === dailyAllocs.length) return false;
+
+        set({
+          allocations: setDailyAllocations(state.allocations, date, nextDailyAllocations),
+        });
+
+        return true;
+      },
+      updateUnusedAllocation: (date, allocationId, update) => {
+        const state = get();
+        const dailyAllocs = state.allocations[date] || [];
+        const allocationIndex = dailyAllocs.findIndex(
+          (allocation) => allocation.id === allocationId && !allocation.used,
+        );
+
+        if (allocationIndex === -1) return false;
+
+        const currentAllocation = dailyAllocs[allocationIndex];
+        const nextHours = update.hours ?? currentAllocation.hours;
+        const nextType = update.type ?? currentAllocation.type;
+
+        if (nextHours <= 0) return false;
+
+        const totalWithoutCurrent = dailyAllocs.reduce((sum, allocation, index) => {
+          if (index === allocationIndex) return sum;
+          return sum + allocation.hours;
+        }, 0);
+
+        if (totalWithoutCurrent + nextHours > 24) return false;
+
+        const nextDailyAllocations = [...dailyAllocs];
+        nextDailyAllocations[allocationIndex] = {
+          ...currentAllocation,
+          type: nextType,
+          hours: nextHours,
+        };
+
+        set({
+          allocations: setDailyAllocations(state.allocations, date, nextDailyAllocations),
+        });
+
+        return true;
+      },
+      deleteUnusedAllocation: (date, allocationId) => {
+        const state = get();
+        const dailyAllocs = state.allocations[date] || [];
+        const allocation = dailyAllocs.find((item) => item.id === allocationId);
+
+        if (!allocation || allocation.used) return false;
+
+        const nextDailyAllocations = dailyAllocs.filter((item) => item.id !== allocationId);
+
+        set({
+          allocations: setDailyAllocations(state.allocations, date, nextDailyAllocations),
+        });
+
+        return true;
+      },
+      setDailyPlanDrafts: (date, drafts) => {
+        const state = get();
+        const sanitizedDrafts = sanitizeDrafts(drafts);
+        const totalHours = sanitizedDrafts.reduce((sum, draft) => sum + draft.hours, 0);
+
+        if (totalHours > 24) return false;
+
+        set({
+          dailyPlans: setDailyPlanDraftMap(state.dailyPlans, date, sanitizedDrafts),
+        });
+
+        return true;
+      },
+      clearDailyPlan: (date) => {
+        const state = get();
+        const currentPlan = state.dailyPlans[date] || [];
+
+        if (currentPlan.length === 0) return false;
+
+        set({
+          dailyPlans: setDailyPlanDraftMap(state.dailyPlans, date, []),
+        });
+
+        return true;
+      },
+      createPlanTemplate: (input) => {
+        const state = get();
+        const nextTemplate = sanitizeTemplateInput(input);
+        const totalHours = nextTemplate.drafts.reduce((sum, draft) => sum + draft.hours, 0);
+
+        if (!nextTemplate.label || nextTemplate.drafts.length === 0 || totalHours > 24) {
+          return false;
+        }
+
+        set({
+          planTemplates: [
+            ...state.planTemplates,
+            {
+              id: Math.random().toString(36).substring(2, 9),
+              ...nextTemplate,
+            },
+          ],
+        });
+
+        return true;
+      },
+      updatePlanTemplate: (id, update) => {
+        const state = get();
+        const templateIndex = state.planTemplates.findIndex((template) => template.id === id);
+
+        if (templateIndex === -1) return false;
+
+        const currentTemplate = state.planTemplates[templateIndex];
+        const nextTemplate = sanitizeTemplateInput({
+          label: update.label ?? currentTemplate.label,
+          drafts: update.drafts ?? currentTemplate.drafts,
+        });
+        const totalHours = nextTemplate.drafts.reduce((sum, draft) => sum + draft.hours, 0);
+
+        if (!nextTemplate.label || nextTemplate.drafts.length === 0 || totalHours > 24) {
+          return false;
+        }
+
+        const nextTemplates = [...state.planTemplates];
+        nextTemplates[templateIndex] = {
+          ...currentTemplate,
+          ...nextTemplate,
+        };
+
+        set({
+          planTemplates: nextTemplates,
+        });
+
+        return true;
+      },
+      deletePlanTemplate: (id) => {
+        const state = get();
+        const nextTemplates = state.planTemplates.filter((template) => template.id !== id);
+
+        if (nextTemplates.length === state.planTemplates.length) return false;
+
+        set({
+          planTemplates: nextTemplates,
+        });
+
         return true;
       },
       
