@@ -163,6 +163,73 @@ function buildTemplateSummary(drafts: AllocationDraft[]) {
   return summary || '先添加几个活动模板';
 }
 
+interface AnimatedHoursValueProps {
+  value: number;
+  valueClassName: string;
+  unitClassName?: string;
+}
+
+const AnimatedHoursValue = React.memo(function AnimatedHoursValue({
+  value,
+  valueClassName,
+  unitClassName,
+}: AnimatedHoursValueProps) {
+  const displayValue = formatHours(value);
+  const previousValueRef = useRef(value);
+  const directionRef = useRef(1);
+
+  if (value !== previousValueRef.current) {
+    directionRef.current = value >= previousValueRef.current ? 1 : -1;
+  }
+
+  useEffect(() => {
+    previousValueRef.current = value;
+  }, [value]);
+
+  return (
+    <span className="inline-flex items-end">
+      <span
+        className={cn(
+          'relative inline-flex overflow-hidden align-baseline whitespace-nowrap leading-[1.14]',
+          valueClassName,
+        )}
+        style={{height: '1.26em', perspective: '240px'}}>
+        <span aria-hidden className="invisible inline-block pt-[0.04em]">
+          {displayValue}
+        </span>
+        <AnimatePresence initial={false} custom={directionRef.current}>
+          <motion.span
+            key={displayValue}
+            custom={directionRef.current}
+            initial={(direction) => ({
+              y: direction > 0 ? '92%' : '-92%',
+              opacity: 0,
+              rotateX: direction > 0 ? -16 : 16,
+              filter: 'blur(1.5px)',
+            })}
+            animate={{
+              y: '0%',
+              opacity: 1,
+              rotateX: 0,
+              filter: 'blur(0px)',
+            }}
+            exit={(direction) => ({
+              y: direction > 0 ? '-92%' : '92%',
+              opacity: 0,
+              rotateX: direction > 0 ? 16 : -16,
+              filter: 'blur(1.5px)',
+            })}
+            transition={{duration: 0.18, ease: [0.22, 1, 0.36, 1]}}
+            className="absolute inset-0 inline-block pt-[0.04em] will-change-transform">
+            {displayValue}
+          </motion.span>
+        </AnimatePresence>
+      </span>
+      {unitClassName ? <span className={unitClassName}>h</span> : null}
+    </span>
+  );
+});
+
 interface AllocationComposerPanelProps {
   remaining: number;
   onAllocate: (type: ActivityType, hours: number) => boolean;
@@ -264,8 +331,11 @@ const AllocationComposerPanel = React.memo(function AllocationComposerPanel({
               本次时长
             </p>
             <div className="mt-1 text-[28px] font-mono font-black tracking-tight text-slate-900">
-              {formatHours(allocateHours)}
-              <span className="ml-1 text-sm font-bold text-slate-400">h</span>
+              <AnimatedHoursValue
+                value={allocateHours}
+                valueClassName=""
+                unitClassName="ml-1 text-sm font-bold text-slate-400"
+              />
             </div>
           </div>
         </div>
@@ -428,10 +498,11 @@ const DraftComposerRow = React.memo(function DraftComposerRow({
 
       <div className="mt-4 flex items-center justify-between gap-3">
         <div className="rounded-2xl bg-slate-50 px-3 py-2">
-          <span className="text-[22px] font-mono font-black tracking-tight text-slate-900">
-            {formatHours(localHours)}
-          </span>
-          <span className="ml-1 text-sm font-bold text-slate-400">h</span>
+          <AnimatedHoursValue
+            value={localHours}
+            valueClassName="text-[22px] font-mono font-black tracking-tight text-slate-900"
+            unitClassName="ml-1 text-sm font-bold text-slate-400"
+          />
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -2616,7 +2687,10 @@ export function HomeView() {
             <div className="mt-5 rounded-[28px] bg-slate-900 p-4 text-white">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-black">分配时长</span>
-                <span className="text-2xl font-mono font-black">{formatHours(editHours)}h</span>
+                <div className="text-2xl font-mono font-black">
+                  <AnimatedHoursValue value={editHours} valueClassName="" unitClassName="" />
+                  <span>h</span>
+                </div>
               </div>
 
               <div className="mt-4 flex flex-wrap gap-2">
