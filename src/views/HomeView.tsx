@@ -40,10 +40,9 @@ import {formatZhDate, getDateKey, getSimulatedDate} from '../utils/date';
 
 const RING_CIRCUMFERENCE = 352;
 const EMPTY_ALLOCATIONS: Allocation[] = [];
-const EMPTY_DRAFTS: AllocationDraft[] = [];
 const RING_ACTIVITY_ORDER: ActivityType[] = ACTIVITY_CONFIG.map((activity) => activity.type);
 const TIME_PRESETS = [0.5, 1, 2, 4, 8];
-type TemplateSheetMode = 'apply' | 'plan' | 'edit-plan' | 'create-template' | 'edit-template' | null;
+type TemplateSheetMode = 'apply' | 'create-template' | 'edit-template' | null;
 type TemplateSortMode = 'recent' | 'name' | 'hours';
 
 interface AvatarStateConfig {
@@ -97,14 +96,6 @@ function buildRingSegments(
       },
     ];
   });
-}
-
-function buildDistributionFromDrafts(drafts: AllocationDraft[]) {
-  const totals = createEmptyActivityTotals();
-  drafts.forEach((draft) => {
-    totals[draft.type] += draft.hours;
-  });
-  return totals;
 }
 
 function formatHours(hours: number) {
@@ -172,17 +163,6 @@ function buildTemplateSummary(drafts: AllocationDraft[]) {
     .join(' · ');
 
   return summary || '先添加几个活动模板';
-}
-
-function buildUniqueLabel(baseLabel: string, existingLabels: string[]) {
-  if (!existingLabels.includes(baseLabel)) return baseLabel;
-
-  let index = 2;
-  while (existingLabels.includes(`${baseLabel} ${index}`)) {
-    index += 1;
-  }
-
-  return `${baseLabel} ${index}`;
 }
 
 interface AnimatedHoursValueProps {
@@ -879,7 +859,6 @@ const TodayDistributionSection = React.memo(function TodayDistributionSection({
 export function HomeView() {
   const {
     allocations,
-    dailyPlans,
     planTemplates,
     allocateTime,
     applyAllocationDrafts,
@@ -891,24 +870,20 @@ export function HomeView() {
     deleteUnusedAllocation,
     markPlanTemplateUsed,
     removeLastUnusedAllocation,
-    setDailyPlanDrafts,
     simulatedDateOffset,
     advanceDay,
     currentEgg,
     togglePlanTemplatePinned,
     updatePlanTemplate,
     updateUnusedAllocation,
-    clearDailyPlan,
   } = useStore();
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [selectedDetailDateKey, setSelectedDetailDateKey] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [templateSheetMode, setTemplateSheetMode] = useState<TemplateSheetMode>(null);
-  const [templateSheetOrigin, setTemplateSheetOrigin] = useState<'apply' | 'plan'>('apply');
   const [templateEditorId, setTemplateEditorId] = useState<string | null>(null);
   const [templateEditorLabel, setTemplateEditorLabel] = useState('');
   const [templateEditorDrafts, setTemplateEditorDrafts] = useState<AllocationDraft[]>([]);
-  const [planEditorDrafts, setPlanEditorDrafts] = useState<AllocationDraft[]>([]);
   const [templateSortMode, setTemplateSortMode] = useState<TemplateSortMode>('recent');
   const [showSecondaryActions, setShowSecondaryActions] = useState(false);
   const [editingAllocationId, setEditingAllocationId] = useState<string | null>(null);
@@ -924,10 +899,6 @@ export function HomeView() {
   const todayAllocations = useMemo(
     () => allocations[todayStr] ?? EMPTY_ALLOCATIONS,
     [allocations, todayStr],
-  );
-  const todayPlanDrafts = useMemo(
-    () => dailyPlans[todayStr] ?? EMPTY_DRAFTS,
-    [dailyPlans, todayStr],
   );
   const todayUsedAllocations = todayAllocations.filter((allocation) => allocation.used);
   const todayUnusedAllocations = todayAllocations.filter((allocation) => !allocation.used);
@@ -1332,99 +1303,6 @@ export function HomeView() {
   useEffect(() => {
     setShowAvatarInsight(false);
   }, [avatarState.label, todayStr]);
-  const planDistribution = useMemo(
-    () => buildDistributionFromDrafts(todayPlanDrafts),
-    [todayPlanDrafts],
-  );
-  const planTotal = useMemo(() => getDistributionTotal(planDistribution), [planDistribution]);
-  const planProgress = useMemo(() => {
-    if (planTotal <= 0.001) return 0;
-    return Math.min(100, Math.round((totalAllocated / planTotal) * 100));
-  }, [planTotal, totalAllocated]);
-  const planOverlapHours = useMemo(
-    () =>
-      ACTIVITY_CONFIG.reduce((sum, activity) => {
-        return sum + Math.min(distribution[activity.type], planDistribution[activity.type]);
-      }, 0),
-    [distribution, planDistribution],
-  );
-  const livePlanAlignment = useMemo(() => {
-    if (totalAllocated <= 0.001) return 0;
-    return Math.min(100, Math.round((planOverlapHours / totalAllocated) * 100));
-  }, [planOverlapHours, totalAllocated]);
-  const finalPlanFit = useMemo(() => {
-    if (planTotal <= 0.001 || totalAllocated <= 0.001) return 0;
-    return Math.min(100, Math.round(((planOverlapHours * 2) / (planTotal + totalAllocated)) * 100));
-  }, [planOverlapHours, planTotal, totalAllocated]);
-  const planComparisonItems = useMemo(
-    () =>
-      ACTIVITY_CONFIG.map((activity) => ({
-        ...activity,
-        planned: planDistribution[activity.type],
-        actual: distribution[activity.type],
-        delta: distribution[activity.type] - planDistribution[activity.type],
-      }))
-        .filter((activity) => activity.planned > 0 || activity.actual > 0)
-        .sort((left, right) => {
-          const leftWeight = Math.max(left.planned, left.actual);
-          const rightWeight = Math.max(right.planned, right.actual);
-          if (rightWeight !== leftWeight) return rightWeight - leftWeight;
-          return ACTIVITY_CONFIG.findIndex((item) => item.type === left.type)
-            - ACTIVITY_CONFIG.findIndex((item) => item.type === right.type);
-        }),
-    [distribution, planDistribution],
-  );
-  const biggestPlanDelta = useMemo(
-    () =>
-      [...planComparisonItems].sort((left, right) => Math.abs(right.delta) - Math.abs(left.delta))[0] ?? null,
-    [planComparisonItems],
-  );
-  const biggestPlanOvershoot = useMemo(
-    () =>
-      [...planComparisonItems]
-        .filter((item) => item.delta >= 0.75)
-        .sort((left, right) => right.delta - left.delta)[0] ?? null,
-    [planComparisonItems],
-  );
-  const planMetric = useMemo(() => {
-    if (planTotal <= 0.001) {
-      return {
-        label: '贴合度',
-        value: '--',
-        description: '先设一个计划，之后这里会显示对照结果。',
-      };
-    }
-
-    if (totalAllocated <= 0.001) {
-      return {
-        label: '记录进度',
-        value: '0%',
-        description: '今天还没开始记录，先填一点再看对照。',
-      };
-    }
-
-    if (totalAllocated < Math.min(6, planTotal * 0.35)) {
-      return {
-        label: '记录进度',
-        value: `${planProgress}%`,
-        description: '当前记录还少，先看进度，暂不判断最终贴合。',
-      };
-    }
-
-    if (totalAllocated < Math.min(14, planTotal * 0.8)) {
-      return {
-        label: '阶段贴合',
-        value: `${livePlanAlignment}%`,
-        description: '只按已记录部分计算，全天结果还会继续变化。',
-      };
-    }
-
-    return {
-      label: '贴合度',
-      value: `${finalPlanFit}%`,
-      description: '按当前全天结构计算，记录越完整越准确。',
-    };
-  }, [finalPlanFit, livePlanAlignment, planProgress, planTotal, totalAllocated]);
   const recordStatus = useMemo(() => {
     if (totalAllocated > 24.001) {
       return {
@@ -1475,58 +1353,13 @@ export function HomeView() {
       };
     }
 
-    if (planTotal > 0 && totalAllocated < Math.min(6, planTotal * 0.35)) {
-      return {
-        title: '现在判断计划偏差还太早',
-        description: `已记录 ${formatHours(totalAllocated)}h / 计划 ${formatHours(planTotal)}h，先继续记录，再看对照会更准确。`,
-        accent: 'text-slate-600',
-        background: 'bg-slate-50',
-      };
-    }
-
-    if (planTotal > 0 && biggestPlanOvershoot) {
-      return {
-        title: `${biggestPlanOvershoot.label} 已超出计划`,
-        description: `目前比计划多了 ${formatHours(biggestPlanOvershoot.delta)}h，后续可以少分一些到这一类。`,
-        accent: 'text-emerald-600',
-        background: 'bg-emerald-50',
-      };
-    }
-
-    if (
-      planTotal > 0 &&
-      totalAllocated >= Math.min(14, planTotal * 0.8) &&
-      biggestPlanDelta &&
-      Math.abs(biggestPlanDelta.delta) >= 1.5
-    ) {
-      const deltaLabel = `${biggestPlanDelta.delta > 0 ? '比计划多了' : '比计划少了'} ${formatHours(Math.abs(biggestPlanDelta.delta))}h`;
-      return {
-        title: '今天和计划有明显偏差',
-        description:
-          remaining <= 0.001
-            ? `${biggestPlanDelta.label}${deltaLabel}，今天已经记满，明天可以往回调一调。`
-            : `${biggestPlanDelta.label}${deltaLabel}，剩余时间可以往回调一调。`,
-        accent: 'text-indigo-600',
-        background: 'bg-indigo-50',
-      };
-    }
-
-    if (planTotal > 0 && totalAllocated >= Math.min(14, planTotal * 0.8) && finalPlanFit >= 88) {
-      return {
-        title: '今天基本按计划推进',
-        description:
-          remaining <= 0.001
-            ? '全天结构和计划比较贴合，今天这份记录已经完整归档。'
-            : '当前结构和计划比较贴合，剩余时段保持住就好。',
-        accent: 'text-indigo-600',
-        background: 'bg-indigo-50',
-      };
-    }
-
     if (focusRatio >= 72 && distribution.rest < 7 && totalAllocated >= 8) {
       return {
         title: '今天是高专注日',
-        description: '专注投入很高，但休息略少，晚上适合补一点恢复时段。',
+        description:
+          remaining <= 0.001
+            ? '专注投入很高，但恢复时段偏少，今天整体节奏会更紧一些。'
+            : '专注投入很高，但休息略少，后面可以补一点恢复时段。',
         accent: 'text-rose-500',
         background: 'bg-rose-50',
       };
@@ -1553,10 +1386,7 @@ export function HomeView() {
     if (remaining <= 0.001) {
       return {
         title: '今天已完整记录',
-        description:
-          planTotal > 0
-            ? '24 小时已经记录完成，今天的分布可以直接作为完整对照样本。'
-            : '24 小时已经记录完成，可以去回看流水、统计或继续投喂。',
+        description: '24 小时已经记录完成，可以去回看流水、统计或继续投喂。',
         accent: 'text-emerald-600',
         background: 'bg-emerald-50',
       };
@@ -1578,14 +1408,10 @@ export function HomeView() {
       background: 'bg-slate-50',
     };
   }, [
-    biggestPlanDelta,
-    biggestPlanOvershoot,
     distribution.exercise,
     distribution.rest,
-    finalPlanFit,
     focusHours,
     focusRatio,
-    planTotal,
     remaining,
     totalAllocated,
   ]);
@@ -1631,6 +1457,28 @@ export function HomeView() {
         }),
     [planTemplates, templateSortMode],
   );
+  const recentTemplates = useMemo(
+    () =>
+      [...planTemplates]
+        .map((template) => {
+          const drafts = normalizeDraftCollection(template.drafts);
+          return {
+            ...template,
+            drafts,
+            totalHours: getDraftTotal(drafts),
+          };
+        })
+        .filter((template) => template.lastUsedAt !== null || template.usageCount > 0)
+        .sort((left, right) => {
+          const leftRecent = left.lastUsedAt ?? 0;
+          const rightRecent = right.lastUsedAt ?? 0;
+          if (rightRecent !== leftRecent) return rightRecent - leftRecent;
+          if (right.usageCount !== left.usageCount) return right.usageCount - left.usageCount;
+          return right.updatedAt - left.updatedAt;
+        })
+        .slice(0, 2),
+    [planTemplates],
+  );
   const currentDistributionDrafts = useMemo(
     () => buildDraftsFromTotals(distribution),
     [distribution],
@@ -1666,47 +1514,20 @@ export function HomeView() {
     setActionFeedback(`已套用${template.label}`);
   };
 
-  const handleSetPlan = (template: Pick<PlanTemplate, 'id' | 'label' | 'drafts'>) => {
-    if (!setDailyPlanDrafts(todayStr, template.drafts)) {
-      setActionFeedback('计划保存失败');
-      return;
-    }
-
-    markPlanTemplateUsed(template.id);
-    setTemplateSheetMode(null);
-    setActionFeedback(`已设为${template.label}计划`);
-  };
-
-  const handleOpenTemplateSheet = (mode: 'apply' | 'plan') => {
+  const handleOpenTemplateSheet = () => {
     setShowSecondaryActions(false);
-    setTemplateSheetOrigin(mode);
-    setTemplateSheetMode(mode);
-  };
-
-  const handleOpenPlanEditor = () => {
-    setPlanEditorDrafts(normalizeDraftCollection(todayPlanDrafts));
-    setTemplateSheetMode('edit-plan');
+    setTemplateSheetMode('apply');
   };
 
   const handleOpenCreateTemplate = ({
     seedDrafts,
     label,
-    origin,
   }: {
     seedDrafts?: AllocationDraft[];
     label?: string;
-    origin?: 'apply' | 'plan';
   } = {}) => {
-    const nextOrigin = origin ?? templateSheetOrigin;
     const nextSeedDrafts =
-      seedDrafts ??
-      (nextOrigin === 'plan' && todayPlanDrafts.length > 0
-        ? todayPlanDrafts
-        : currentDistributionDrafts.length > 0
-          ? currentDistributionDrafts
-          : []);
-
-    setTemplateSheetOrigin(nextOrigin);
+      seedDrafts ?? (currentDistributionDrafts.length > 0 ? currentDistributionDrafts : []);
     setTemplateEditorId(null);
     setTemplateEditorLabel(label ?? '');
     setTemplateEditorDrafts(normalizeDraftCollection(nextSeedDrafts));
@@ -1725,27 +1546,13 @@ export function HomeView() {
     setTemplateEditorId(null);
     setTemplateEditorLabel('');
     setTemplateEditorDrafts([]);
-    setPlanEditorDrafts([]);
   };
 
   const handleBackToTemplateList = () => {
-    setTemplateSheetMode(templateSheetOrigin);
+    setTemplateSheetMode('apply');
     setTemplateEditorId(null);
     setTemplateEditorLabel('');
     setTemplateEditorDrafts([]);
-  };
-
-  const handleSavePlanEditor = () => {
-    if (!setDailyPlanDrafts(todayStr, normalizeDraftCollection(planEditorDrafts))) {
-      setActionFeedback('今日计划保存失败');
-      return;
-    }
-
-    setTemplateSheetMode(null);
-    setPlanEditorDrafts([]);
-    setActionFeedback(
-      planEditorDrafts.length > 0 ? '已保存今日计划' : '已清空今日计划',
-    );
   };
 
   const handleSaveTemplateEditor = () => {
@@ -1772,7 +1579,7 @@ export function HomeView() {
       return;
     }
 
-    setTemplateSheetMode(templateSheetOrigin);
+    setTemplateSheetMode('apply');
     setTemplateEditorId(null);
     setTemplateEditorLabel('');
     setTemplateEditorDrafts([]);
@@ -1809,22 +1616,6 @@ export function HomeView() {
     }
 
     setActionFeedback(`已复制${template.label}`);
-  };
-
-  const handleSavePlanAsTemplate = () => {
-    if (todayPlanDrafts.length === 0) {
-      setActionFeedback('今天还没有计划可保存');
-      return;
-    }
-
-    handleOpenCreateTemplate({
-      seedDrafts: todayPlanDrafts,
-      label: buildUniqueLabel(
-        '今日计划模板',
-        planTemplates.map((template) => template.label),
-      ),
-      origin: 'plan',
-    });
   };
 
   const handleUndoLast = () => {
@@ -1872,15 +1663,6 @@ export function HomeView() {
       setEditingAllocationId(null);
     }
     setActionFeedback('已删除这条分配');
-  };
-
-  const handleClearPlan = () => {
-    if (!clearDailyPlan(todayStr)) {
-      setActionFeedback('今天还没有计划');
-      return;
-    }
-
-    setActionFeedback('已清空今日计划');
   };
 
   const renderDraftComposer = ({
@@ -2109,15 +1891,9 @@ export function HomeView() {
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
                 <p className="text-[15px] font-black leading-none text-slate-900">{recordStatus.title}</p>
-                {!actionFeedback && todayPlanDrafts.length > 0 ? (
-                  <span className="rounded-full bg-indigo-50 px-2 py-1 text-[10px] font-black leading-none text-indigo-600 whitespace-nowrap">
-                    已设计划
-                  </span>
-                ) : null}
               </div>
               <p className="mt-1 text-[11px] font-medium leading-5 text-slate-500">
                 已记录 {formatHours(totalAllocated)}h
-                {todayPlanDrafts.length > 0 ? ` · 计划 ${formatHours(planTotal)}h` : ''}
                 {remaining > 0.001 ? ` · 还差 ${formatHours(remaining)}h` : ' · 已完成'}
               </p>
             </div>
@@ -2160,6 +1936,24 @@ export function HomeView() {
             </div>
           </div>
 
+          {canQuickFill && recentTemplates.length > 0 ? (
+            <div className="mt-3 flex items-center gap-2 overflow-x-auto scroll-hide">
+              <span className="shrink-0 text-[10px] font-black uppercase tracking-widest text-slate-400">
+                最近模板
+              </span>
+              {recentTemplates.map((template) => (
+                <button
+                  key={template.id}
+                  onClick={() => handleApplyTemplate(template)}
+                  className="flex h-8 shrink-0 items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 text-[10px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
+                  <span className="text-slate-800">{template.label}</span>
+                  <span className="text-slate-300">·</span>
+                  <span className="text-slate-400">{formatHours(template.totalHours)}h</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
+
           <div className="mt-3 flex items-center gap-2">
             {canCopyYesterday ? (
               <button
@@ -2173,7 +1967,7 @@ export function HomeView() {
             ) : null}
 
             <button
-              onClick={() => handleOpenTemplateSheet('apply')}
+              onClick={handleOpenTemplateSheet}
               className={cn(
                 'flex h-9 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-[11px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]',
                 canCopyYesterday || hasSecondaryActions ? 'flex-1' : 'w-full',
@@ -2274,136 +2068,6 @@ export function HomeView() {
           summaryInsight={summaryInsight}
           dayKey={todayStr}
         />
-
-        <section className="glass-card rounded-[32px] p-5 shadow-xl border-white/40">
-          <div className="mb-4 flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h2 className="font-semibold flex items-center gap-2 text-slate-800 whitespace-nowrap">
-                <FileText size={18} className="text-indigo-500" />
-                计划 vs 实际
-              </h2>
-              <p className="mt-1 text-[11px] font-medium text-slate-400">
-                先给今天一个参考分布，记录越完整，对照越准
-              </p>
-            </div>
-            <span className="shrink-0 rounded-full bg-white/85 px-3 py-1.5 text-[10px] font-black text-slate-500 shadow-sm whitespace-nowrap">
-              {todayPlanDrafts.length > 0 ? '已设计划' : '可选'}
-            </span>
-          </div>
-
-          {todayPlanDrafts.length === 0 ? (
-            <div className="rounded-[28px] border border-dashed border-slate-200 bg-slate-50/80 px-4 py-5 text-center">
-              <p className="text-sm font-black text-slate-700">还没有今日计划</p>
-              <p className="mt-1 text-xs font-medium text-slate-400">
-                先从模板带入一个参考结构，或者直接手动设定今天的目标分布。
-              </p>
-              <div className="mt-4 grid grid-cols-2 gap-2">
-                <button
-                  onClick={() => handleOpenTemplateSheet('plan')}
-                  className="rounded-2xl border border-indigo-100 bg-white px-3 py-3 text-[12px] font-black text-indigo-600 shadow-sm transition-all active:scale-[0.97]">
-                  从模板选择
-                </button>
-                <button
-                  onClick={handleOpenPlanEditor}
-                  className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-[12px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
-                  手动设定
-                </button>
-              </div>
-              {templateLibrary.length > 0 ? (
-                <div className="mt-4 flex flex-wrap justify-center gap-2">
-                  {templateLibrary.slice(0, 3).map((template) => (
-                    <span
-                      key={template.id}
-                      className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[10px] font-black text-slate-500">
-                      {template.label}
-                    </span>
-                  ))}
-                  {templateLibrary.length > 3 ? (
-                    <span className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[10px] font-black text-slate-400">
-                      +{templateLibrary.length - 3} 个模板
-                    </span>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <div className="grid grid-cols-3 gap-3">
-                <div className="rounded-[24px] bg-slate-50 px-4 py-3">
-                  <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">计划总量</p>
-                  <p className="mt-2 text-xl font-black text-slate-800">{formatHours(planTotal)}h</p>
-                </div>
-                <div className="rounded-[24px] bg-slate-50 px-4 py-3">
-                  <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">实际记录</p>
-                  <p className="mt-2 text-xl font-black text-slate-800">{formatHours(totalAllocated)}h</p>
-                </div>
-                <div className="rounded-[24px] bg-slate-50 px-4 py-3">
-                  <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">{planMetric.label}</p>
-                  <p className="mt-2 text-xl font-black text-indigo-600">{planMetric.value}</p>
-                </div>
-              </div>
-
-              <p className="px-1 text-[11px] font-medium text-slate-400">{planMetric.description}</p>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={handleOpenPlanEditor}
-                  className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-[11px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
-                  编辑计划
-                </button>
-                <button
-                  onClick={handleSavePlanAsTemplate}
-                  className="rounded-2xl border border-slate-900/10 bg-slate-900 px-3 py-3 text-[11px] font-black text-white shadow-sm transition-all active:scale-[0.97]">
-                  另存模板
-                </button>
-                <button
-                  onClick={() => handleOpenTemplateSheet('plan')}
-                  className="rounded-2xl border border-indigo-100 bg-indigo-50 px-3 py-3 text-[11px] font-black text-indigo-600 shadow-sm transition-all active:scale-[0.97]">
-                  换个模板
-                </button>
-                <button
-                  onClick={handleClearPlan}
-                  className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3 text-[11px] font-black text-slate-500 transition-all active:scale-[0.97] whitespace-nowrap">
-                  清空
-                </button>
-              </div>
-
-              <div className="space-y-3">
-                {planComparisonItems.map((item) => (
-                  <div key={item.type} className="rounded-[24px] border border-slate-100 bg-white/80 p-3 shadow-sm">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <div className={cn('h-2.5 w-2.5 rounded-full shrink-0', item.baseColor)} />
-                        <span className="truncate text-sm font-black text-slate-700">{item.label}</span>
-                      </div>
-                      <span
-                        className={cn(
-                          'shrink-0 whitespace-nowrap rounded-full px-2 py-1 text-[10px] font-black',
-                          item.delta > 0.05 && 'bg-emerald-50 text-emerald-600',
-                          item.delta < -0.05 && 'bg-amber-50 text-amber-600',
-                          Math.abs(item.delta) <= 0.05 && 'bg-slate-100 text-slate-500',
-                        )}>
-                        {item.delta > 0.05 ? '+' : ''}
-                        {formatHours(item.delta)}h
-                      </span>
-                    </div>
-
-                    <div className="mt-2 whitespace-nowrap text-[11px] font-medium text-slate-400">
-                      计划 {formatHours(item.planned)}h · 实际 {formatHours(item.actual)}h
-                    </div>
-
-                    <div className="mt-3 h-2 rounded-full bg-slate-100 overflow-hidden">
-                      <div className="h-full rounded-full bg-slate-300" style={{width: `${(item.planned / 24) * 100}%`}} />
-                    </div>
-                    <div className="mt-[-8px] h-2 rounded-full overflow-hidden">
-                      <div className={cn('h-full rounded-full', item.baseColor)} style={{width: `${(item.actual / 24) * 100}%`}} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </section>
 
         <div className="grid grid-cols-2 gap-4">
           <div className="glass-card rounded-[28px] p-5 border-white/40 shadow-sm">
@@ -2580,46 +2244,22 @@ export function HomeView() {
                     className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/80 bg-white/90 text-slate-400 shadow-sm transition-colors hover:text-slate-700">
                     <ChevronLeft size={18} />
                   </button>
-                ) : templateSheetMode === 'edit-plan' ? (
-                  <button
-                    onClick={handleCloseTemplateSheet}
-                    className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/80 bg-white/90 text-slate-400 shadow-sm transition-colors hover:text-slate-700">
-                    <ChevronLeft size={18} />
-                  </button>
                 ) : null}
                 <div className="min-w-0">
-                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-400">
-                    {templateSheetMode === 'apply'
-                      ? '模板库'
-                      : templateSheetMode === 'plan'
-                        ? '今日计划'
-                        : templateSheetMode === 'edit-plan'
-                          ? '今日计划'
-                          : '模板库'}
-                  </p>
+                  <p className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-400">模板库</p>
                   <h3 className="mt-1 text-xl font-black text-slate-900">
                     {templateSheetMode === 'apply'
                       ? '套用常用模板'
-                      : templateSheetMode === 'plan'
-                        ? '选择计划模板'
-                        : templateSheetMode === 'edit-plan'
-                          ? todayPlanDrafts.length > 0
-                            ? '编辑今日计划'
-                            : '手动设定今日计划'
-                          : templateSheetMode === 'create-template'
-                            ? '新建模板'
-                            : '编辑模板'}
+                      : templateSheetMode === 'create-template'
+                        ? '新建模板'
+                        : '编辑模板'}
                   </h3>
                   <p className="mt-1 text-[11px] font-medium leading-5 text-slate-400">
                     {templateSheetMode === 'apply'
                       ? '这里可以直接套用、编辑或新增常用分布模板。'
-                      : templateSheetMode === 'plan'
-                        ? '先挑一个参考结构，或者直接手动设定今天计划。'
-                        : templateSheetMode === 'edit-plan'
-                          ? '只影响今天，不会写入模板库。'
-                          : templateSheetMode === 'create-template'
-                            ? '保存一个常用分布，后面可以一键套用。'
-                            : '调整名称和结构，保存后模板库会同步更新。'}
+                      : templateSheetMode === 'create-template'
+                        ? '保存一个常用分布，后面可以一键套用。'
+                        : '调整名称和结构，保存后模板库会同步更新。'}
                   </p>
                 </div>
               </div>
@@ -2631,28 +2271,13 @@ export function HomeView() {
             </div>
 
             <div className="relative max-h-[calc(88vh-120px)] overflow-y-auto scroll-hide pr-1">
-              {templateSheetMode === 'apply' || templateSheetMode === 'plan' ? (
+              {templateSheetMode === 'apply' ? (
                 <div className="space-y-3 pb-1">
-                  {templateSheetMode === 'plan' ? (
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        onClick={handleOpenCreateTemplate}
-                        className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-[12px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
-                        新建模板
-                      </button>
-                      <button
-                        onClick={handleOpenPlanEditor}
-                        className="rounded-2xl border border-indigo-100 bg-indigo-50 px-3 py-3 text-[12px] font-black text-indigo-600 shadow-sm transition-all active:scale-[0.97]">
-                        手动设定
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={handleOpenCreateTemplate}
-                      className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 text-[12px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
-                      新建模板
-                    </button>
-                  )}
+                  <button
+                    onClick={handleOpenCreateTemplate}
+                    className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 text-[12px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
+                    新建模板
+                  </button>
 
                   <div className="flex items-center justify-between gap-3 rounded-[24px] border border-white/80 bg-white/82 px-3 py-3 shadow-sm">
                     <div className="min-w-0">
@@ -2775,21 +2400,15 @@ export function HomeView() {
 
                         <div className="mt-3 flex items-center justify-end">
                           <button
-                            onClick={() =>
-                              templateSheetMode === 'apply'
-                                ? handleApplyTemplate(template)
-                                : handleSetPlan(template)
-                            }
-                            disabled={templateSheetMode === 'apply' && !canQuickFill}
+                            onClick={() => handleApplyTemplate(template)}
+                            disabled={!canQuickFill}
                             className={cn(
                               'rounded-full px-4 py-2 text-[11px] font-black transition-all whitespace-nowrap',
-                              templateSheetMode === 'apply'
-                                ? canQuickFill
-                                  ? 'bg-slate-900 text-white shadow-sm active:scale-[0.97]'
-                                  : 'bg-slate-100 text-slate-300'
-                                : 'bg-indigo-600 text-white shadow-sm active:scale-[0.97]',
+                              canQuickFill
+                                ? 'bg-slate-900 text-white shadow-sm active:scale-[0.97]'
+                                : 'bg-slate-100 text-slate-300',
                             )}>
-                            {templateSheetMode === 'apply' ? '套用到今天' : '设为今日计划'}
+                            套用到今天
                           </button>
                         </div>
                       </div>
@@ -2807,26 +2426,6 @@ export function HomeView() {
                       </button>
                     </div>
                   )}
-                </div>
-              ) : templateSheetMode === 'edit-plan' ? (
-                <div className="space-y-4 pb-1">
-                  {renderDraftComposer({
-                    drafts: planEditorDrafts,
-                    onChange: (drafts) => setPlanEditorDrafts(drafts),
-                  })}
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      onClick={() => setPlanEditorDrafts([])}
-                      className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm font-black text-slate-500 transition-all active:scale-[0.97]">
-                      清空内容
-                    </button>
-                    <button
-                      onClick={handleSavePlanEditor}
-                      className="rounded-2xl bg-indigo-600 px-4 py-4 text-sm font-black text-white shadow-lg shadow-indigo-200 transition-all active:scale-[0.97]">
-                      保存今日计划
-                    </button>
-                  </div>
                 </div>
               ) : (
                 <div className="space-y-4 pb-1">
