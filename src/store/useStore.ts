@@ -50,6 +50,11 @@ export interface PlanTemplate {
   id: string;
   label: string;
   drafts: AllocationDraft[];
+  pinned: boolean;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt: number | null;
+  usageCount: number;
 }
 
 export interface AllocationUpdate {
@@ -76,9 +81,15 @@ interface AppState {
   setDailyPlanDrafts: (date: string, drafts: AllocationDraft[]) => boolean;
   clearDailyPlan: (date: string) => boolean;
   planTemplates: PlanTemplate[];
-  createPlanTemplate: (input: Omit<PlanTemplate, 'id'>) => boolean;
-  updatePlanTemplate: (id: string, update: Partial<Omit<PlanTemplate, 'id'>>) => boolean;
+  createPlanTemplate: (input: {label: string; drafts: AllocationDraft[]; pinned?: boolean}) => boolean;
+  updatePlanTemplate: (
+    id: string,
+    update: Partial<Omit<PlanTemplate, 'id' | 'createdAt' | 'lastUsedAt' | 'usageCount'>>,
+  ) => boolean;
   deletePlanTemplate: (id: string) => boolean;
+  duplicatePlanTemplate: (id: string) => boolean;
+  togglePlanTemplatePinned: (id: string) => boolean;
+  markPlanTemplateUsed: (id: string) => void;
   
   currentEgg: EggState;
   feedEgg: (date: string, allocationId: string) => boolean;
@@ -107,6 +118,11 @@ const DEFAULT_PLAN_TEMPLATES: PlanTemplate[] = [
       {type: 'entertainment', hours: 2},
       {type: 'rest', hours: 11},
     ],
+    pinned: true,
+    createdAt: 1,
+    updatedAt: 1,
+    lastUsedAt: null,
+    usageCount: 0,
   },
   {
     id: 'balanced',
@@ -118,6 +134,11 @@ const DEFAULT_PLAN_TEMPLATES: PlanTemplate[] = [
       {type: 'entertainment', hours: 3},
       {type: 'rest', hours: 10},
     ],
+    pinned: true,
+    createdAt: 2,
+    updatedAt: 2,
+    lastUsedAt: null,
+    usageCount: 0,
   },
   {
     id: 'weekend',
@@ -129,6 +150,11 @@ const DEFAULT_PLAN_TEMPLATES: PlanTemplate[] = [
       {type: 'entertainment', hours: 5},
       {type: 'rest', hours: 14},
     ],
+    pinned: true,
+    createdAt: 3,
+    updatedAt: 3,
+    lastUsedAt: null,
+    usageCount: 0,
   },
 ];
 
@@ -203,11 +229,41 @@ function setDailyPlanDraftMap(
   };
 }
 
-function sanitizeTemplateInput(input: Omit<PlanTemplate, 'id'>) {
+function sanitizeTemplateInput(input: {label: string; drafts: AllocationDraft[]; pinned?: boolean}) {
   return {
     label: input.label.trim(),
     drafts: sanitizeDrafts(input.drafts),
+    pinned: Boolean(input.pinned),
   };
+}
+
+function normalizePlanTemplate(
+  template: Partial<PlanTemplate> & Pick<PlanTemplate, 'id' | 'label' | 'drafts'>,
+  fallbackTimestamp: number,
+): PlanTemplate {
+  const createdAt = template.createdAt ?? fallbackTimestamp;
+  return {
+    id: template.id,
+    label: template.label.trim(),
+    drafts: sanitizeDrafts(template.drafts),
+    pinned: Boolean(template.pinned),
+    createdAt,
+    updatedAt: template.updatedAt ?? createdAt,
+    lastUsedAt: template.lastUsedAt ?? null,
+    usageCount: template.usageCount ?? 0,
+  };
+}
+
+function duplicateTemplateLabel(label: string, existingLabels: string[]) {
+  const baseLabel = `${label} 副本`;
+  if (!existingLabels.includes(baseLabel)) return baseLabel;
+
+  let index = 2;
+  while (existingLabels.includes(`${baseLabel} ${index}`)) {
+    index += 1;
+  }
+
+  return `${baseLabel} ${index}`;
 }
 
 export const useStore = create<AppState>()(
@@ -396,13 +452,22 @@ export const useStore = create<AppState>()(
           return false;
         }
 
+        const now = Date.now();
+
         set({
           planTemplates: [
             ...state.planTemplates,
-            {
-              id: Math.random().toString(36).substring(2, 9),
-              ...nextTemplate,
-            },
+            normalizePlanTemplate(
+              {
+                id: Math.random().toString(36).substring(2, 9),
+                ...nextTemplate,
+                createdAt: now,
+                updatedAt: now,
+                lastUsedAt: null,
+                usageCount: 0,
+              },
+              now,
+            ),
           ],
         });
 
@@ -418,6 +483,7 @@ export const useStore = create<AppState>()(
         const nextTemplate = sanitizeTemplateInput({
           label: update.label ?? currentTemplate.label,
           drafts: update.drafts ?? currentTemplate.drafts,
+          pinned: update.pinned ?? currentTemplate.pinned,
         });
         const totalHours = nextTemplate.drafts.reduce((sum, draft) => sum + draft.hours, 0);
 
@@ -426,10 +492,14 @@ export const useStore = create<AppState>()(
         }
 
         const nextTemplates = [...state.planTemplates];
-        nextTemplates[templateIndex] = {
-          ...currentTemplate,
-          ...nextTemplate,
-        };
+        nextTemplates[templateIndex] = normalizePlanTemplate(
+          {
+            ...currentTemplate,
+            ...nextTemplate,
+            updatedAt: Date.now(),
+          },
+          currentTemplate.createdAt,
+        );
 
         set({
           planTemplates: nextTemplates,
@@ -448,6 +518,77 @@ export const useStore = create<AppState>()(
         });
 
         return true;
+      },
+      duplicatePlanTemplate: (id) => {
+        const state = get();
+        const template = state.planTemplates.find((item) => item.id === id);
+
+        if (!template) return false;
+
+        const now = Date.now();
+        const nextLabel = duplicateTemplateLabel(
+          template.label,
+          state.planTemplates.map((item) => item.label),
+        );
+
+        set({
+          planTemplates: [
+            ...state.planTemplates,
+            normalizePlanTemplate(
+              {
+                ...template,
+                id: Math.random().toString(36).substring(2, 9),
+                label: nextLabel,
+                pinned: false,
+                createdAt: now,
+                updatedAt: now,
+                lastUsedAt: null,
+                usageCount: 0,
+              },
+              now,
+            ),
+          ],
+        });
+
+        return true;
+      },
+      togglePlanTemplatePinned: (id) => {
+        const state = get();
+        const templateIndex = state.planTemplates.findIndex((template) => template.id === id);
+
+        if (templateIndex === -1) return false;
+
+        const nextTemplates = [...state.planTemplates];
+        const currentTemplate = nextTemplates[templateIndex];
+        nextTemplates[templateIndex] = {
+          ...currentTemplate,
+          pinned: !currentTemplate.pinned,
+          updatedAt: Date.now(),
+        };
+
+        set({
+          planTemplates: nextTemplates,
+        });
+
+        return true;
+      },
+      markPlanTemplateUsed: (id) => {
+        const state = get();
+        const templateIndex = state.planTemplates.findIndex((template) => template.id === id);
+
+        if (templateIndex === -1) return;
+
+        const nextTemplates = [...state.planTemplates];
+        const currentTemplate = nextTemplates[templateIndex];
+        nextTemplates[templateIndex] = {
+          ...currentTemplate,
+          lastUsedAt: Date.now(),
+          usageCount: currentTemplate.usageCount + 1,
+        };
+
+        set({
+          planTemplates: nextTemplates,
+        });
       },
       
       currentEgg: getInitialEgg('A'),
@@ -604,6 +745,21 @@ export const useStore = create<AppState>()(
     }),
     {
       name: 'chronotext-storage-v3', // Change name to avoid conflicts with old schema
+      merge: (persistedState, currentState) => {
+        const typedPersistedState = persistedState as Partial<AppState> | undefined;
+        const rawTemplates =
+          typedPersistedState?.planTemplates && typedPersistedState.planTemplates.length > 0
+            ? typedPersistedState.planTemplates
+            : currentState.planTemplates;
+
+        return {
+          ...currentState,
+          ...typedPersistedState,
+          planTemplates: rawTemplates.map((template, index) =>
+            normalizePlanTemplate(template, Date.now() + index),
+          ),
+        };
+      },
     }
   )
 );

@@ -12,6 +12,7 @@ import {
   Target,
   TrendingUp,
 } from 'lucide-react';
+import {DayDetailSheet} from '../components/DayDetailSheet';
 import {TimeHeatmap} from '../components/TimeHeatmap';
 import {ACTIVITY_CONFIG, createEmptyActivityTotals} from '../constants/activities';
 import {type ActivityType, useStore} from '../store/useStore';
@@ -333,6 +334,7 @@ export function StatsView() {
   const {allocations, simulatedDateOffset} = useStore();
   const [period, setPeriod] = useState<PeriodKey>('thisWeek');
   const [trendMetric, setTrendMetric] = useState<TrendMetricKey>('total');
+  const [selectedDetailDateKey, setSelectedDetailDateKey] = useState<string | null>(null);
   const sectionClassName =
     'glass-card rounded-[30px] border border-white/50 p-4 shadow-[0_18px_40px_rgba(15,23,42,0.08)] min-[430px]:p-5';
   const softCardClassName = 'rounded-[24px] bg-slate-50/90 px-4 py-3';
@@ -771,12 +773,20 @@ export function StatsView() {
               <p className="text-[11px] font-semibold text-slate-400">平均每天</p>
               <p className="mt-2 text-2xl font-black text-slate-800">{currentAverageDailyHours.toFixed(1)}h</p>
             </div>
-            <div className={softCardClassName}>
+            <button
+              type="button"
+              onClick={() => bestDay && bestDay.total > 0.01 && setSelectedDetailDateKey(bestDay.dateKey)}
+              disabled={!bestDay || bestDay.total <= 0.01}
+              className={cn(
+                softCardClassName,
+                'text-left transition-all',
+                bestDay && bestDay.total > 0.01 ? 'active:scale-[0.98]' : 'cursor-default',
+              )}>
               <p className="text-[11px] font-semibold text-slate-400">记得最多的一天</p>
               <p className="mt-2 text-base font-black text-slate-800">
                 {bestDay ? `${bestDay.shortDate} · ${bestDay.total.toFixed(1)}h` : '暂无'}
               </p>
-            </div>
+            </button>
           </div>
         </section>
 
@@ -818,9 +828,11 @@ export function StatsView() {
                   const isMissing = day.total <= 0.5;
 
                   return (
-                    <div
+                    <button
                       key={day.dateKey}
-                      className="flex items-center justify-between gap-3 rounded-[18px] bg-white/90 px-4 py-3">
+                      type="button"
+                      onClick={() => setSelectedDetailDateKey(day.dateKey)}
+                      className="flex w-full items-center justify-between gap-3 rounded-[18px] bg-white/90 px-4 py-3 text-left transition-all active:scale-[0.98]">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           <p className="text-sm font-black text-slate-800">{formatMonthDay(day.date)}</p>
@@ -839,7 +851,7 @@ export function StatsView() {
                       <span className="shrink-0 text-xs font-black text-slate-400">
                         {isMissing ? '0h' : `${day.total.toFixed(1)}h`}
                       </span>
-                    </div>
+                    </button>
                   );
                 })}
 
@@ -1089,7 +1101,11 @@ export function StatsView() {
                       return (
                         <div key={day.dateKey} className="flex h-full items-end justify-center">
                           {day.value > 0.01 ? (
-                            <div
+                            <button
+                              type="button"
+                              onClick={() => setSelectedDetailDateKey(day.dateKey)}
+                              className="flex h-full w-full items-end justify-center focus:outline-none">
+                              <div
                               className="w-full rounded-[4px] transition-all duration-500"
                               style={{
                                 height: `${heightPercent}%`,
@@ -1098,6 +1114,7 @@ export function StatsView() {
                                 boxShadow: `0 6px 14px ${selectedTrendOption.glowColor}`,
                               }}
                             />
+                            </button>
                           ) : null}
                         </div>
                       );
@@ -1247,9 +1264,22 @@ export function StatsView() {
             </div>
           </div>
 
-          <TimeHeatmap allocations={allocations} simulatedDateOffset={simulatedDateOffset} variant="plain" />
+          <TimeHeatmap
+            allocations={allocations}
+            simulatedDateOffset={simulatedDateOffset}
+            variant="plain"
+            onDaySelect={setSelectedDetailDateKey}
+            selectedDateKey={selectedDetailDateKey}
+          />
         </section>
       </main>
+
+      <DayDetailSheet
+        open={selectedDetailDateKey !== null}
+        dateKey={selectedDetailDateKey}
+        allocations={allocations}
+        onClose={() => setSelectedDetailDateKey(null)}
+      />
     </div>
   );
 }

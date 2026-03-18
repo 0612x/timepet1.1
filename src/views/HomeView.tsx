@@ -10,7 +10,9 @@ import {
   FileText,
   Info,
   LayoutGrid,
+  MoreHorizontal,
   Pencil,
+  Pin,
   Plus,
   RotateCcw,
   Sparkles,
@@ -19,6 +21,7 @@ import {
   X,
 } from 'lucide-react';
 import {AnimatePresence, motion} from 'motion/react';
+import {DayDetailSheet} from '../components/DayDetailSheet';
 import {TimeHeatmap} from '../components/TimeHeatmap';
 import {
   ACTIVITY_CONFIG,
@@ -41,6 +44,7 @@ const EMPTY_DRAFTS: AllocationDraft[] = [];
 const RING_ACTIVITY_ORDER: ActivityType[] = ACTIVITY_CONFIG.map((activity) => activity.type);
 const TIME_PRESETS = [0.5, 1, 2, 4, 8];
 type TemplateSheetMode = 'apply' | 'plan' | 'edit-plan' | 'create-template' | 'edit-template' | null;
+type TemplateSortMode = 'recent' | 'name' | 'hours';
 
 interface AvatarStateConfig {
   label: string;
@@ -51,6 +55,13 @@ interface AvatarStateConfig {
   overlayClass: string;
   imageStyle: React.CSSProperties;
   badgeIcon: React.ReactNode;
+}
+
+interface SummaryInsightConfig {
+  title: string;
+  description: string;
+  accent: string;
+  background: string;
 }
 
 function getDistributionTotal(totals: Record<ActivityType, number>) {
@@ -161,6 +172,17 @@ function buildTemplateSummary(drafts: AllocationDraft[]) {
     .join(' · ');
 
   return summary || '先添加几个活动模板';
+}
+
+function buildUniqueLabel(baseLabel: string, existingLabels: string[]) {
+  if (!existingLabels.includes(baseLabel)) return baseLabel;
+
+  let index = 2;
+  while (existingLabels.includes(`${baseLabel} ${index}`)) {
+    index += 1;
+  }
+
+  return `${baseLabel} ${index}`;
 }
 
 interface AnimatedHoursValueProps {
@@ -593,6 +615,267 @@ const DraftComposerRow = React.memo(function DraftComposerRow({
   );
 });
 
+interface TodayDistributionSectionProps {
+  distribution: Record<ActivityType, number>;
+  recordProgress: number;
+  summaryInsight: SummaryInsightConfig;
+  dayKey: string;
+}
+
+const TodayDistributionSection = React.memo(function TodayDistributionSection({
+  distribution,
+  recordProgress,
+  summaryInsight,
+  dayKey,
+}: TodayDistributionSectionProps) {
+  const [highlightDistribution, setHighlightDistribution] = useState(false);
+  const [animatedDistribution, setAnimatedDistribution] =
+    useState<Record<ActivityType, number>>(() => distribution);
+  const animatedDistributionRef = useRef(animatedDistribution);
+  const [ringClearState, setRingClearState] = useState<{
+    active: boolean;
+    source: Record<ActivityType, number>;
+  }>({
+    active: false,
+    source: createEmptyActivityTotals(),
+  });
+
+  const distributionSignature = useMemo(
+    () => ACTIVITY_CONFIG.map((activity) => distribution[activity.type].toFixed(2)).join('|'),
+    [distribution],
+  );
+  const previousDistributionSignatureRef = useRef(distributionSignature);
+
+  const distributionRanking = useMemo(() => {
+    const isClearing =
+      (Object.values(distribution) as number[]).every((hours) => hours <= 0.01) &&
+      (Object.values(animatedDistribution) as number[]).some((hours) => hours > 0.01);
+    const rankingSource = isClearing ? animatedDistribution : distribution;
+    const orderMap = new Map(ACTIVITY_CONFIG.map((activity, index) => [activity.type, index]));
+
+    return ACTIVITY_CONFIG.map((activity) => ({
+      ...activity,
+      hours: rankingSource[activity.type],
+    })).sort((left, right) => {
+      if (right.hours !== left.hours) return right.hours - left.hours;
+      return (orderMap.get(left.type) ?? 0) - (orderMap.get(right.type) ?? 0);
+    });
+  }, [distribution, animatedDistribution]);
+
+  useEffect(() => {
+    animatedDistributionRef.current = animatedDistribution;
+  }, [animatedDistribution]);
+
+  useEffect(() => {
+    const startDistribution = {...animatedDistributionRef.current};
+    const isClearing =
+      (Object.values(distribution) as number[]).every((hours) => hours <= 0.001) &&
+      (Object.values(startDistribution) as number[]).some((hours) => hours > 0.001);
+    const duration = isClearing ? 1180 : 560;
+    let frameId = 0;
+    const startTime = performance.now();
+
+    const tick = (currentTime: number) => {
+      const progress = Math.min(1, (currentTime - startTime) / duration);
+      const eased = Math.min(1, Math.max(0, (() => {
+        if (!isClearing) return 1 - (1 - progress) ** 2.6;
+        const slowDownStart = 0.46;
+        if (progress <= slowDownStart) return progress;
+        const tailProgress = (progress - slowDownStart) / (1 - slowDownStart);
+        const tailEased =
+          (-1.55 * (tailProgress ** 3)) + (2 * (tailProgress ** 2)) + (0.55 * tailProgress);
+        return slowDownStart + (1 - slowDownStart) * tailEased;
+      })()));
+      const nextDistribution = createEmptyActivityTotals();
+
+      (Object.keys(distribution) as ActivityType[]).forEach((type) => {
+        const nextValue =
+          startDistribution[type] + (distribution[type] - startDistribution[type]) * eased;
+        nextDistribution[type] = Math.abs(nextValue) < 0.001 ? 0 : Math.max(0, nextValue);
+      });
+
+      if (progress < 1) {
+        setAnimatedDistribution(nextDistribution);
+        frameId = requestAnimationFrame(tick);
+      } else {
+        setAnimatedDistribution(distribution);
+        animatedDistributionRef.current = distribution;
+      }
+    };
+
+    frameId = requestAnimationFrame(tick);
+
+    return () => cancelAnimationFrame(frameId);
+  }, [distribution, dayKey]);
+
+  useEffect(() => {
+    const nextTotal = getDistributionTotal(distribution);
+    const startDistribution = {...animatedDistributionRef.current};
+    const startTotal = getDistributionTotal(startDistribution);
+
+    if (nextTotal > 0.001 || startTotal <= 0.001) {
+      setRingClearState((previous) =>
+        previous.active
+          ? {
+              active: false,
+              source: createEmptyActivityTotals(),
+            }
+          : previous,
+      );
+      return;
+    }
+
+    setRingClearState({
+      active: true,
+      source: startDistribution,
+    });
+  }, [distribution, dayKey]);
+
+  const animatedTotalAllocated = useMemo(
+    () => (Object.values(animatedDistribution) as number[]).reduce((sum, hours) => sum + hours, 0),
+    [animatedDistribution],
+  );
+
+  useEffect(() => {
+    if (!ringClearState.active || animatedTotalAllocated > 0.01) return;
+
+    setRingClearState({
+      active: false,
+      source: createEmptyActivityTotals(),
+    });
+  }, [animatedTotalAllocated, ringClearState.active]);
+
+  useEffect(() => {
+    const previousSignature = previousDistributionSignatureRef.current;
+    previousDistributionSignatureRef.current = distributionSignature;
+
+    if (previousSignature === distributionSignature) return;
+
+    setHighlightDistribution(true);
+    const timer = window.setTimeout(() => setHighlightDistribution(false), 720);
+    return () => window.clearTimeout(timer);
+  }, [distributionSignature, dayKey]);
+
+  const ringDisplayDistribution = ringClearState.active ? ringClearState.source : animatedDistribution;
+  const ringVisibleHours = ringClearState.active
+    ? animatedTotalAllocated
+    : getDistributionTotal(ringDisplayDistribution);
+  const ringSegments = useMemo(
+    () => buildRingSegments(ringDisplayDistribution, RING_ACTIVITY_ORDER, ringVisibleHours),
+    [ringDisplayDistribution, ringVisibleHours],
+  );
+  const maxDistributionHours = useMemo(
+    () => Math.max(...(Object.values(animatedDistribution) as number[]), 0),
+    [animatedDistribution],
+  );
+
+  return (
+    <section
+      className={cn(
+        'glass-card rounded-[32px] p-5 shadow-xl border-white/40 transition-all duration-500',
+        highlightDistribution && 'ring-2 ring-indigo-100 shadow-[0_18px_42px_rgba(99,102,241,0.14)]',
+      )}>
+      <div className="flex justify-between items-center mb-4">
+        <h2 className="font-semibold flex items-center gap-2 text-slate-800">
+          <TrendingUp size={18} className="text-indigo-500" />
+          今日时间分布
+        </h2>
+        <span className="text-xs text-slate-400">记录进度 {recordProgress}%</span>
+      </div>
+
+      <div className="flex items-center gap-5">
+        <div className="relative w-32 h-32 shrink-0 flex items-center justify-center">
+          <svg className="absolute inset-0 w-full h-full -rotate-90">
+            <circle
+              cx="64"
+              cy="64"
+              r="56"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="12"
+              className="text-slate-100"
+            />
+            {ringSegments.map((segment) => (
+              <circle
+                key={segment.key}
+                cx="64"
+                cy="64"
+                r="56"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="12"
+                strokeDasharray={segment.dashArray}
+                strokeDashoffset={segment.dashOffset}
+                className={segment.colorClassName}
+                strokeLinecap="butt"
+              />
+            ))}
+          </svg>
+          <div className="text-center">
+            <div className="text-2xl font-black tracking-tighter">{animatedTotalAllocated.toFixed(1)}</div>
+            <div className="text-[8px] font-black text-slate-400 uppercase tracking-widest">已分配 (h)</div>
+          </div>
+        </div>
+
+        <div className="min-w-0 flex-1 space-y-2">
+          {distributionRanking.map((activity, index) => {
+            const topBadgeStyle =
+              index === 0
+                ? 'bg-amber-400 text-white shadow-[0_8px_20px_rgba(251,191,36,0.25)]'
+                : index === 1
+                  ? 'bg-slate-400 text-white shadow-[0_8px_20px_rgba(148,163,184,0.2)]'
+                  : index === 2
+                    ? 'bg-orange-400 text-white shadow-[0_8px_20px_rgba(251,146,60,0.22)]'
+                    : 'bg-slate-100 text-slate-400';
+            const fillPercent =
+              maxDistributionHours === 0
+                ? 0
+                : (animatedDistribution[activity.type] / maxDistributionHours) * 100;
+
+            return (
+              <motion.div
+                key={activity.type}
+                layout="position"
+                transition={{type: 'spring', stiffness: 320, damping: 28, mass: 0.7}}
+                className="relative overflow-hidden rounded-xl border border-slate-100 bg-white/90 px-3 py-1.5 shadow-sm">
+                <div
+                  aria-hidden="true"
+                  className={cn('absolute inset-[1px] origin-left rounded-[11px]', activity.baseColor)}
+                  style={{
+                    transform: `scaleX(${fillPercent <= 0.1 ? 0 : Math.max(fillPercent, 12) / 100})`,
+                    opacity: fillPercent === 0 ? 0 : 0.12,
+                  }}
+                />
+                <div className="relative flex min-w-0 items-center gap-1.5">
+                  <span
+                    className={cn(
+                      'flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full text-[9px] font-black leading-none shadow-sm',
+                      topBadgeStyle,
+                    )}>
+                    {index + 1}
+                  </span>
+                  <div className={cn('h-2.5 w-2.5 shrink-0 rounded-full', activity.baseColor)} />
+                  <span className="text-[13px] font-black leading-none text-slate-700">
+                    {activity.label}
+                  </span>
+                  <span className="text-[13px] font-mono font-black leading-none tracking-tight text-slate-800">
+                    {animatedDistribution[activity.type].toFixed(1)}h
+                  </span>
+                </div>
+              </motion.div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className={cn('mt-5 rounded-[24px] px-4 py-3', summaryInsight.background)}>
+        <div className={cn('text-sm font-black', summaryInsight.accent)}>{summaryInsight.title}</div>
+        <p className="mt-1 text-xs font-medium leading-5 text-slate-500">{summaryInsight.description}</p>
+      </div>
+    </section>
+  );
+});
+
 export function HomeView() {
   const {
     allocations,
@@ -604,17 +887,21 @@ export function HomeView() {
     createPlanTemplate,
     copyAllocationsFromDate,
     deletePlanTemplate,
+    duplicatePlanTemplate,
     deleteUnusedAllocation,
+    markPlanTemplateUsed,
     removeLastUnusedAllocation,
     setDailyPlanDrafts,
     simulatedDateOffset,
     advanceDay,
     currentEgg,
+    togglePlanTemplatePinned,
     updatePlanTemplate,
     updateUnusedAllocation,
     clearDailyPlan,
   } = useStore();
   const [showHeatmap, setShowHeatmap] = useState(false);
+  const [selectedDetailDateKey, setSelectedDetailDateKey] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [templateSheetMode, setTemplateSheetMode] = useState<TemplateSheetMode>(null);
   const [templateSheetOrigin, setTemplateSheetOrigin] = useState<'apply' | 'plan'>('apply');
@@ -622,11 +909,12 @@ export function HomeView() {
   const [templateEditorLabel, setTemplateEditorLabel] = useState('');
   const [templateEditorDrafts, setTemplateEditorDrafts] = useState<AllocationDraft[]>([]);
   const [planEditorDrafts, setPlanEditorDrafts] = useState<AllocationDraft[]>([]);
+  const [templateSortMode, setTemplateSortMode] = useState<TemplateSortMode>('recent');
+  const [showSecondaryActions, setShowSecondaryActions] = useState(false);
   const [editingAllocationId, setEditingAllocationId] = useState<string | null>(null);
   const [editType, setEditType] = useState<ActivityType>('work');
   const [editHours, setEditHours] = useState(0.5);
   const [showAvatarInsight, setShowAvatarInsight] = useState(false);
-  const [highlightDistribution, setHighlightDistribution] = useState(false);
   const avatarInsightRef = useRef<HTMLDivElement | null>(null);
 
   const todayDate = useMemo(() => getSimulatedDate(simulatedDateOffset), [simulatedDateOffset]);
@@ -669,107 +957,6 @@ export function HomeView() {
     });
     return data;
   }, [todayAllocations]);
-  const [animatedDistribution, setAnimatedDistribution] =
-    useState<Record<ActivityType, number>>(() => distribution);
-  const animatedDistributionRef = useRef(animatedDistribution);
-  const [ringClearState, setRingClearState] = useState<{
-    active: boolean;
-    source: Record<ActivityType, number>;
-  }>({
-    active: false,
-    source: createEmptyActivityTotals(),
-  });
-
-  const distributionRanking = useMemo(() => {
-    const isClearing =
-      (Object.values(distribution) as number[]).every((hours) => hours <= 0.01) &&
-      (Object.values(animatedDistribution) as number[]).some((hours) => hours > 0.01);
-    const rankingSource = isClearing ? animatedDistribution : distribution;
-    const orderMap = new Map(ACTIVITY_CONFIG.map((activity, index) => [activity.type, index]));
-
-    return ACTIVITY_CONFIG.map((activity) => ({
-      ...activity,
-      hours: rankingSource[activity.type],
-    })).sort((left, right) => {
-      if (right.hours !== left.hours) return right.hours - left.hours;
-      return (orderMap.get(left.type) ?? 0) - (orderMap.get(right.type) ?? 0);
-    });
-  }, [distribution, animatedDistribution]);
-
-  useEffect(() => {
-    animatedDistributionRef.current = animatedDistribution;
-  }, [animatedDistribution]);
-
-  useEffect(() => {
-    const startDistribution = {...animatedDistributionRef.current};
-    const zeroDistribution = createEmptyActivityTotals();
-    const isClearing =
-      (Object.values(distribution) as number[]).every((hours) => hours <= 0.001) &&
-      (Object.values(startDistribution) as number[]).some((hours) => hours > 0.001);
-    const duration = isClearing ? 1180 : 560;
-    let frameId = 0;
-    const startTime = performance.now();
-
-    const tick = (currentTime: number) => {
-      const progress = Math.min(1, (currentTime - startTime) / duration);
-      const eased = Math.min(1, Math.max(0, (() => {
-        if (!isClearing) return 1 - (1 - progress) ** 2.6;
-        const slowDownStart = 0.46;
-        if (progress <= slowDownStart) return progress;
-        const tailProgress = (progress - slowDownStart) / (1 - slowDownStart);
-        const tailEased =
-          (-1.55 * (tailProgress ** 3)) + (2 * (tailProgress ** 2)) + (0.55 * tailProgress);
-        return slowDownStart + (1 - slowDownStart) * tailEased;
-      })()));
-      const nextDistribution = createEmptyActivityTotals();
-
-      (Object.keys(distribution) as ActivityType[]).forEach((type) => {
-        const nextValue =
-          startDistribution[type] + (distribution[type] - startDistribution[type]) * eased;
-        nextDistribution[type] = Math.abs(nextValue) < 0.001 ? 0 : Math.max(0, nextValue);
-      });
-
-      const nextTotal = (Object.values(nextDistribution) as number[]).reduce(
-        (sum, hours) => sum + hours,
-        0,
-      );
-
-      if (progress < 1) {
-        setAnimatedDistribution(nextDistribution);
-        frameId = requestAnimationFrame(tick);
-      } else {
-        setAnimatedDistribution(distribution);
-        animatedDistributionRef.current = distribution;
-      }
-    };
-
-    frameId = requestAnimationFrame(tick);
-
-    return () => cancelAnimationFrame(frameId);
-  }, [distribution, todayStr]);
-
-  useEffect(() => {
-    const nextTotal = getDistributionTotal(distribution);
-    const startDistribution = {...animatedDistributionRef.current};
-    const startTotal = getDistributionTotal(startDistribution);
-
-    if (nextTotal > 0.001 || startTotal <= 0.001) {
-      setRingClearState((previous) =>
-        previous.active
-          ? {
-              active: false,
-              source: createEmptyActivityTotals(),
-            }
-          : previous,
-      );
-      return;
-    }
-
-    setRingClearState({
-      active: true,
-      source: startDistribution,
-    });
-  }, [distribution, todayStr]);
 
   useEffect(() => {
     if (!editingAllocationId) return;
@@ -789,11 +976,9 @@ export function HomeView() {
     return () => window.clearTimeout(timer);
   }, [actionFeedback]);
 
-  const distributionSignature = useMemo(
-    () => ACTIVITY_CONFIG.map((activity) => distribution[activity.type].toFixed(2)).join('|'),
-    [distribution],
-  );
-  const previousDistributionSignatureRef = useRef(distributionSignature);
+  useEffect(() => {
+    setShowSecondaryActions(false);
+  }, [todayStr]);
 
   useEffect(() => {
     if (!showAvatarInsight) return;
@@ -807,17 +992,6 @@ export function HomeView() {
     window.addEventListener('pointerdown', handlePointerDown);
     return () => window.removeEventListener('pointerdown', handlePointerDown);
   }, [showAvatarInsight]);
-
-  useEffect(() => {
-    const previousSignature = previousDistributionSignatureRef.current;
-    previousDistributionSignatureRef.current = distributionSignature;
-
-    if (previousSignature === distributionSignature) return;
-
-    setHighlightDistribution(true);
-    const timer = window.setTimeout(() => setHighlightDistribution(false), 720);
-    return () => window.clearTimeout(timer);
-  }, [distributionSignature, todayStr]);
 
   const yesterdayDateKey = useMemo(() => {
     const yesterdayDate = new Date(todayDate);
@@ -852,21 +1026,6 @@ export function HomeView() {
     if (focusRatio >= 35) return 'C';
     return 'D';
   })();
-
-  const animatedTotalAllocated = (Object.values(animatedDistribution) as number[]).reduce(
-    (sum, hours) => sum + hours,
-    0,
-  );
-  const ringDisplayDistribution = ringClearState.active ? ringClearState.source : animatedDistribution;
-  const ringDisplayHours = animatedTotalAllocated;
-  const ringVisibleHours = ringClearState.active
-    ? animatedTotalAllocated
-    : getDistributionTotal(ringDisplayDistribution);
-  const ringSegments = useMemo(
-    () => buildRingSegments(ringDisplayDistribution, RING_ACTIVITY_ORDER, ringVisibleHours),
-    [ringDisplayDistribution, ringVisibleHours],
-  );
-  const maxDistributionHours = Math.max(...(Object.values(animatedDistribution) as number[]), 0);
   const dominantActivity = useMemo(
     () =>
       ACTIVITY_CONFIG.reduce(
@@ -1439,23 +1598,38 @@ export function HomeView() {
     return Math.max(0, 24 - totalWithoutCurrent);
   }, [editingAllocation, todayAllocations]);
 
-  useEffect(() => {
-    if (!ringClearState.active || animatedTotalAllocated > 0.01) return;
-
-    setRingClearState({
-      active: false,
-      source: createEmptyActivityTotals(),
-    });
-  }, [animatedTotalAllocated, ringClearState.active]);
-
   const templateLibrary = useMemo(
     () =>
-      planTemplates.map((template) => ({
-        ...template,
-        drafts: normalizeDraftCollection(template.drafts),
-        summary: buildTemplateSummary(template.drafts),
-      })),
-    [planTemplates],
+      [...planTemplates]
+        .map((template) => {
+          const drafts = normalizeDraftCollection(template.drafts);
+          return {
+            ...template,
+            drafts,
+            summary: buildTemplateSummary(drafts),
+            totalHours: getDraftTotal(drafts),
+          };
+        })
+        .sort((left, right) => {
+          if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
+
+          if (templateSortMode === 'name') {
+            return left.label.localeCompare(right.label, 'zh-Hans-CN');
+          }
+
+          if (templateSortMode === 'hours' && right.totalHours !== left.totalHours) {
+            return right.totalHours - left.totalHours;
+          }
+
+          const leftRecent = left.lastUsedAt ?? left.updatedAt ?? left.createdAt;
+          const rightRecent = right.lastUsedAt ?? right.updatedAt ?? right.createdAt;
+
+          if (rightRecent !== leftRecent) return rightRecent - leftRecent;
+          if (right.usageCount !== left.usageCount) return right.usageCount - left.usageCount;
+
+          return left.label.localeCompare(right.label, 'zh-Hans-CN');
+        }),
+    [planTemplates, templateSortMode],
   );
   const currentDistributionDrafts = useMemo(
     () => buildDraftsFromTotals(distribution),
@@ -1465,6 +1639,12 @@ export function HomeView() {
   const canCopyYesterday = canQuickFill && yesterdayAllocations.length > 0;
   const canUndoLast = todayUnusedAllocations.length > 0;
   const canClearToday = todayUnusedAllocations.length > 0;
+  const hasSecondaryActions = canUndoLast || canClearToday;
+
+  useEffect(() => {
+    if (hasSecondaryActions) return;
+    setShowSecondaryActions(false);
+  }, [hasSecondaryActions]);
 
   const handleCopyYesterday = () => {
     if (!copyAllocationsFromDate(yesterdayDateKey, todayStr)) {
@@ -1475,27 +1655,30 @@ export function HomeView() {
     setActionFeedback('已复制昨天');
   };
 
-  const handleApplyTemplate = (drafts: AllocationDraft[], label: string) => {
-    if (!applyAllocationDrafts(todayStr, drafts)) {
+  const handleApplyTemplate = (template: Pick<PlanTemplate, 'id' | 'label' | 'drafts'>) => {
+    if (!applyAllocationDrafts(todayStr, template.drafts)) {
       setActionFeedback(canQuickFill ? '模板应用失败' : '已投喂后无法应用模板');
       return;
     }
 
+    markPlanTemplateUsed(template.id);
     setTemplateSheetMode(null);
-    setActionFeedback(`已套用${label}`);
+    setActionFeedback(`已套用${template.label}`);
   };
 
-  const handleSetPlan = (drafts: AllocationDraft[], label: string) => {
-    if (!setDailyPlanDrafts(todayStr, drafts)) {
+  const handleSetPlan = (template: Pick<PlanTemplate, 'id' | 'label' | 'drafts'>) => {
+    if (!setDailyPlanDrafts(todayStr, template.drafts)) {
       setActionFeedback('计划保存失败');
       return;
     }
 
+    markPlanTemplateUsed(template.id);
     setTemplateSheetMode(null);
-    setActionFeedback(`已设为${label}计划`);
+    setActionFeedback(`已设为${template.label}计划`);
   };
 
   const handleOpenTemplateSheet = (mode: 'apply' | 'plan') => {
+    setShowSecondaryActions(false);
     setTemplateSheetOrigin(mode);
     setTemplateSheetMode(mode);
   };
@@ -1505,17 +1688,28 @@ export function HomeView() {
     setTemplateSheetMode('edit-plan');
   };
 
-  const handleOpenCreateTemplate = () => {
-    const seedDrafts =
-      templateSheetOrigin === 'plan' && todayPlanDrafts.length > 0
+  const handleOpenCreateTemplate = ({
+    seedDrafts,
+    label,
+    origin,
+  }: {
+    seedDrafts?: AllocationDraft[];
+    label?: string;
+    origin?: 'apply' | 'plan';
+  } = {}) => {
+    const nextOrigin = origin ?? templateSheetOrigin;
+    const nextSeedDrafts =
+      seedDrafts ??
+      (nextOrigin === 'plan' && todayPlanDrafts.length > 0
         ? todayPlanDrafts
         : currentDistributionDrafts.length > 0
           ? currentDistributionDrafts
-          : [];
+          : []);
 
+    setTemplateSheetOrigin(nextOrigin);
     setTemplateEditorId(null);
-    setTemplateEditorLabel('');
-    setTemplateEditorDrafts(normalizeDraftCollection(seedDrafts));
+    setTemplateEditorLabel(label ?? '');
+    setTemplateEditorDrafts(normalizeDraftCollection(nextSeedDrafts));
     setTemplateSheetMode('create-template');
   };
 
@@ -1599,12 +1793,47 @@ export function HomeView() {
     setActionFeedback(`已删除${label}`);
   };
 
+  const handleToggleTemplatePinned = (template: Pick<PlanTemplate, 'id' | 'label' | 'pinned'>) => {
+    if (!togglePlanTemplatePinned(template.id)) {
+      setActionFeedback('模板置顶失败');
+      return;
+    }
+
+    setActionFeedback(template.pinned ? `已取消置顶${template.label}` : `已置顶${template.label}`);
+  };
+
+  const handleDuplicateTemplate = (template: Pick<PlanTemplate, 'id' | 'label'>) => {
+    if (!duplicatePlanTemplate(template.id)) {
+      setActionFeedback('模板复制失败');
+      return;
+    }
+
+    setActionFeedback(`已复制${template.label}`);
+  };
+
+  const handleSavePlanAsTemplate = () => {
+    if (todayPlanDrafts.length === 0) {
+      setActionFeedback('今天还没有计划可保存');
+      return;
+    }
+
+    handleOpenCreateTemplate({
+      seedDrafts: todayPlanDrafts,
+      label: buildUniqueLabel(
+        '今日计划模板',
+        planTemplates.map((template) => template.label),
+      ),
+      origin: 'plan',
+    });
+  };
+
   const handleUndoLast = () => {
     if (!removeLastUnusedAllocation(todayStr)) {
       setActionFeedback('没有可撤销的分配');
       return;
     }
 
+    setShowSecondaryActions(false);
     setActionFeedback('已撤销上次分配');
   };
 
@@ -1614,6 +1843,7 @@ export function HomeView() {
       return;
     }
 
+    setShowSecondaryActions(false);
     setActionFeedback('已清空未投喂分配');
   };
 
@@ -1874,6 +2104,135 @@ export function HomeView() {
       </header>
 
       <main className="relative z-0 px-5 space-y-4">
+        <section className="glass-card rounded-[26px] p-3.5 shadow-lg border-white/40">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-[15px] font-black leading-none text-slate-900">{recordStatus.title}</p>
+                {!actionFeedback && todayPlanDrafts.length > 0 ? (
+                  <span className="rounded-full bg-indigo-50 px-2 py-1 text-[10px] font-black leading-none text-indigo-600 whitespace-nowrap">
+                    已设计划
+                  </span>
+                ) : null}
+              </div>
+              <p className="mt-1 text-[11px] font-medium leading-5 text-slate-500">
+                已记录 {formatHours(totalAllocated)}h
+                {todayPlanDrafts.length > 0 ? ` · 计划 ${formatHours(planTotal)}h` : ''}
+                {remaining > 0.001 ? ` · 还差 ${formatHours(remaining)}h` : ' · 已完成'}
+              </p>
+            </div>
+
+            <div className="flex shrink-0 items-center gap-2">
+              {actionFeedback ? (
+                <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-black text-slate-600 whitespace-nowrap">
+                  {actionFeedback}
+                </span>
+              ) : null}
+              <div
+                className={cn(
+                  'flex h-8 w-8 items-center justify-center rounded-2xl shadow-sm',
+                  recordStatus.tone === 'emerald' && 'bg-emerald-100 text-emerald-600',
+                  recordStatus.tone === 'amber' && 'bg-amber-100 text-amber-600',
+                  recordStatus.tone === 'rose' && 'bg-rose-100 text-rose-600',
+                  recordStatus.tone === 'slate' && 'bg-white text-slate-500',
+                )}>
+                {recordStatus.tone === 'emerald' ? <BadgeCheck size={16} /> : <CircleAlert size={16} />}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-3">
+            <div className="mb-1.5 flex items-center justify-between text-[10px] font-semibold text-slate-500">
+              <span>今日完成度</span>
+              <span>{formatHours(totalAllocated)} / 24h</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-white/85 overflow-hidden">
+              <div
+                className={cn(
+                  'h-full rounded-full transition-all duration-700',
+                  recordStatus.tone === 'emerald' && 'bg-emerald-500',
+                  recordStatus.tone === 'amber' && 'bg-amber-500',
+                  recordStatus.tone === 'rose' && 'bg-rose-500',
+                  recordStatus.tone === 'slate' && 'bg-slate-400',
+                )}
+                style={{width: `${Math.min((Math.max(totalAllocated, 0) / 24) * 100, 100)}%`}}
+              />
+            </div>
+          </div>
+
+          <div className="mt-3 flex items-center gap-2">
+            {canCopyYesterday ? (
+              <button
+                onClick={handleCopyYesterday}
+                className="flex h-9 flex-1 items-center justify-center gap-2 rounded-xl border border-indigo-100 bg-white px-3 text-[11px] font-black text-indigo-700 shadow-sm transition-all active:scale-[0.97]">
+                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-50 text-indigo-500">
+                  <Copy size={12} />
+                </span>
+                复制昨天
+              </button>
+            ) : null}
+
+            <button
+              onClick={() => handleOpenTemplateSheet('apply')}
+              className={cn(
+                'flex h-9 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-[11px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]',
+                canCopyYesterday || hasSecondaryActions ? 'flex-1' : 'w-full',
+              )}>
+              <span className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-slate-500">
+                <LayoutGrid size={12} />
+              </span>
+              模板
+            </button>
+
+            {hasSecondaryActions ? (
+              <button
+                type="button"
+                onClick={() => setShowSecondaryActions((previous) => !previous)}
+                aria-expanded={showSecondaryActions}
+                className={cn(
+                  'flex h-9 items-center justify-center gap-1.5 rounded-xl border px-3 text-[11px] font-black shadow-sm transition-all active:scale-[0.97]',
+                  showSecondaryActions
+                    ? 'border-slate-300 bg-slate-900 text-white'
+                    : 'border-slate-200 bg-white text-slate-600',
+                )}>
+                <MoreHorizontal size={14} />
+                更多
+              </button>
+            ) : null}
+          </div>
+
+          <AnimatePresence>
+            {showSecondaryActions ? (
+              <motion.div
+                initial={{opacity: 0, y: -6}}
+                animate={{opacity: 1, y: 0}}
+                exit={{opacity: 0, y: -6}}
+                transition={{duration: 0.18, ease: 'easeOut'}}
+                className={cn(
+                  'mt-3 grid gap-2',
+                  canUndoLast && canClearToday ? 'grid-cols-2' : 'grid-cols-1',
+                )}>
+                {canUndoLast ? (
+                  <button
+                    onClick={handleUndoLast}
+                    className="flex h-9 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-[11px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
+                    <RotateCcw size={12} />
+                    撤销上次
+                  </button>
+                ) : null}
+                {canClearToday ? (
+                  <button
+                    onClick={handleClearToday}
+                    className="flex h-9 items-center justify-center gap-2 rounded-xl border border-rose-100 bg-rose-50 px-3 text-[11px] font-black text-rose-500 transition-all active:scale-[0.97]">
+                    <Trash2 size={12} />
+                    清空未投喂
+                  </button>
+                ) : null}
+              </motion.div>
+            ) : null}
+          </AnimatePresence>
+        </section>
+
         <section className="glass-card rounded-[28px] p-3.5 shadow-xl border-white/40">
           <div className="mb-3 flex items-start justify-between gap-3">
             <div>
@@ -1901,239 +2260,20 @@ export function HomeView() {
               allocations={allocations}
               simulatedDateOffset={simulatedDateOffset}
               variant="plain"
+              onDaySelect={setSelectedDetailDateKey}
+              selectedDateKey={selectedDetailDateKey}
             />
           ) : (
-            <div className="space-y-3">
-              <AllocationComposerPanel remaining={remaining} onAllocate={handleAllocate} />
-
-              <div
-                className={cn(
-                  'rounded-[26px] border p-4 shadow-sm',
-                  recordStatus.tone === 'emerald' && 'border-emerald-100 bg-emerald-50/75',
-                  recordStatus.tone === 'amber' && 'border-amber-100 bg-amber-50/75',
-                  recordStatus.tone === 'rose' && 'border-rose-100 bg-rose-50/75',
-                  recordStatus.tone === 'slate' && 'border-slate-100 bg-slate-50/90',
-                )}>
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-black text-slate-800">{recordStatus.title}</p>
-                    <p className="mt-1 text-[11px] font-medium text-slate-500">
-                      已记录 {formatHours(totalAllocated)}h
-                      {todayPlanDrafts.length > 0 ? ` · 计划 ${formatHours(planTotal)}h` : ''}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {actionFeedback ? (
-                      <span className="rounded-full bg-white/80 px-2.5 py-1 text-[10px] font-black text-emerald-600 whitespace-nowrap">
-                        {actionFeedback}
-                      </span>
-                    ) : null}
-                    <div
-                      className={cn(
-                        'flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl',
-                        recordStatus.tone === 'emerald' && 'bg-emerald-100 text-emerald-600',
-                        recordStatus.tone === 'amber' && 'bg-amber-100 text-amber-600',
-                        recordStatus.tone === 'rose' && 'bg-rose-100 text-rose-600',
-                        recordStatus.tone === 'slate' && 'bg-white text-slate-500',
-                      )}>
-                      {recordStatus.tone === 'emerald' ? <BadgeCheck size={18} /> : <CircleAlert size={18} />}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-3">
-                  <div className="mb-2 flex items-center justify-between text-[11px] font-semibold text-slate-500">
-                    <span>今日完成度</span>
-                    <span>{formatHours(totalAllocated)} / 24h</span>
-                  </div>
-                  <div className="h-2 rounded-full bg-white/80 overflow-hidden">
-                    <div
-                      className={cn(
-                        'h-full rounded-full transition-all duration-700',
-                        recordStatus.tone === 'emerald' && 'bg-emerald-500',
-                        recordStatus.tone === 'amber' && 'bg-amber-500',
-                        recordStatus.tone === 'rose' && 'bg-rose-500',
-                        recordStatus.tone === 'slate' && 'bg-slate-400',
-                      )}
-                      style={{width: `${Math.min((Math.max(totalAllocated, 0) / 24) * 100, 100)}%`}}
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={handleCopyYesterday}
-                  disabled={!canCopyYesterday}
-                  className={cn(
-                    'flex h-10 items-center gap-2 rounded-2xl border px-3 text-[11px] font-black transition-all',
-                    canCopyYesterday
-                      ? 'border-indigo-100 bg-white text-indigo-700 shadow-sm active:scale-[0.97]'
-                      : 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300',
-                  )}>
-                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-50 text-indigo-500">
-                    <Copy size={12} />
-                  </span>
-                  复制昨天
-                </button>
-                <button
-                  onClick={() => handleOpenTemplateSheet('apply')}
-                  className="flex h-10 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 text-[11px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
-                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-slate-500">
-                    <LayoutGrid size={12} />
-                  </span>
-                  模板库
-                </button>
-                <button
-                  onClick={handleUndoLast}
-                  disabled={!canUndoLast}
-                  className={cn(
-                    'flex h-10 items-center gap-2 rounded-2xl border px-3 text-[11px] font-black transition-all',
-                    canUndoLast
-                      ? 'border-slate-200 bg-white text-slate-700 shadow-sm active:scale-[0.97]'
-                      : 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300',
-                  )}>
-                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-slate-500">
-                    <RotateCcw size={12} />
-                  </span>
-                  撤销上次
-                </button>
-                <button
-                  onClick={handleClearToday}
-                  disabled={!canClearToday}
-                  className={cn(
-                    'flex h-10 items-center gap-2 rounded-2xl border px-3 text-[11px] font-black transition-all',
-                    canClearToday
-                      ? 'border-rose-100 bg-rose-50 text-rose-500 shadow-sm active:scale-[0.97]'
-                      : 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300',
-                  )}>
-                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-rose-100/80 text-rose-500">
-                    <Trash2 size={12} />
-                  </span>
-                  清空未投喂
-                </button>
-              </div>
-
-              {todayPlanDrafts.length > 0 ? (
-                <div className="mt-2 flex justify-end">
-                  <span className="inline-flex h-7 items-center whitespace-nowrap rounded-full bg-white/80 px-3 text-[11px] font-black text-indigo-600 shadow-sm">
-                    已设计划
-                  </span>
-                </div>
-              ) : null}
-
-              {!canQuickFill ? (
-                <div className="px-1 text-[11px] font-medium text-slate-400">
-                  今日已有投喂，模板不可整体覆盖。
-                </div>
-              ) : null}
-            </div>
+            <AllocationComposerPanel remaining={remaining} onAllocate={handleAllocate} />
           )}
         </section>
 
-        <section
-          className={cn(
-            'glass-card rounded-[32px] p-5 shadow-xl border-white/40 transition-all duration-500',
-            highlightDistribution && 'ring-2 ring-indigo-100 shadow-[0_18px_42px_rgba(99,102,241,0.14)]',
-          )}>
-          <div className="flex justify-between items-center mb-4">
-            <h2 className="font-semibold flex items-center gap-2 text-slate-800">
-              <TrendingUp size={18} className="text-indigo-500" />
-              今日时间分布
-            </h2>
-            <span className="text-xs text-slate-400">记录进度 {recordProgress}%</span>
-          </div>
-
-          <div className="flex items-center gap-5">
-            <div className="relative w-32 h-32 shrink-0 flex items-center justify-center">
-              <svg className="absolute inset-0 w-full h-full -rotate-90">
-                <circle
-                  cx="64"
-                  cy="64"
-                  r="56"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="12"
-                  className="text-slate-100"
-                />
-                {ringSegments.map((segment) => (
-                  <circle
-                    key={segment.key}
-                    cx="64"
-                    cy="64"
-                    r="56"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="12"
-                    strokeDasharray={segment.dashArray}
-                    strokeDashoffset={segment.dashOffset}
-                    className={segment.colorClassName}
-                    strokeLinecap="butt"
-                  />
-                ))}
-              </svg>
-              <div className="text-center">
-                <div className="text-2xl font-black tracking-tighter">{ringDisplayHours.toFixed(1)}</div>
-                <div className="text-[8px] font-black text-slate-400 uppercase tracking-widest">已分配 (h)</div>
-              </div>
-            </div>
-
-            <div className="min-w-0 flex-1 space-y-2">
-              {distributionRanking.map((activity, index) => {
-                const topBadgeStyle =
-                  index === 0
-                    ? 'bg-amber-400 text-white shadow-[0_8px_20px_rgba(251,191,36,0.25)]'
-                    : index === 1
-                      ? 'bg-slate-400 text-white shadow-[0_8px_20px_rgba(148,163,184,0.2)]'
-                      : index === 2
-                        ? 'bg-orange-400 text-white shadow-[0_8px_20px_rgba(251,146,60,0.22)]'
-                        : 'bg-slate-100 text-slate-400';
-                const fillPercent =
-                  maxDistributionHours === 0
-                    ? 0
-                    : (animatedDistribution[activity.type] / maxDistributionHours) * 100;
-
-                return (
-                  <motion.div
-                    key={activity.type}
-                    layout="position"
-                    transition={{type: 'spring', stiffness: 320, damping: 28, mass: 0.7}}
-                    className="relative overflow-hidden rounded-xl border border-slate-100 bg-white/90 px-3 py-1.5 shadow-sm">
-                    <div
-                      aria-hidden="true"
-                      className={cn('absolute inset-[1px] origin-left rounded-[11px]', activity.baseColor)}
-                      style={{
-                        transform: `scaleX(${fillPercent <= 0.1 ? 0 : Math.max(fillPercent, 12) / 100})`,
-                        opacity: fillPercent === 0 ? 0 : 0.12,
-                      }}
-                    />
-                    <div className="relative flex min-w-0 items-center gap-1.5">
-                      <span
-                        className={cn(
-                          'flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full text-[9px] font-black leading-none shadow-sm',
-                          topBadgeStyle,
-                        )}>
-                        {index + 1}
-                      </span>
-                      <div className={cn('h-2.5 w-2.5 shrink-0 rounded-full', activity.baseColor)} />
-                      <span className="text-[13px] font-black leading-none text-slate-700">
-                        {activity.label}
-                      </span>
-                      <span className="text-[13px] font-mono font-black leading-none tracking-tight text-slate-800">
-                        {animatedDistribution[activity.type].toFixed(1)}h
-                      </span>
-                    </div>
-                  </motion.div>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className={cn('mt-5 rounded-[24px] px-4 py-3', summaryInsight.background)}>
-            <div className={cn('text-sm font-black', summaryInsight.accent)}>{summaryInsight.title}</div>
-            <p className="mt-1 text-xs font-medium leading-5 text-slate-500">{summaryInsight.description}</p>
-          </div>
-        </section>
+        <TodayDistributionSection
+          distribution={distribution}
+          recordProgress={recordProgress}
+          summaryInsight={summaryInsight}
+          dayKey={todayStr}
+        />
 
         <section className="glass-card rounded-[32px] p-5 shadow-xl border-white/40">
           <div className="mb-4 flex items-start justify-between gap-3">
@@ -2205,11 +2345,16 @@ export function HomeView() {
 
               <p className="px-1 text-[11px] font-medium text-slate-400">{planMetric.description}</p>
 
-              <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
+              <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={handleOpenPlanEditor}
                   className="rounded-2xl border border-slate-200 bg-white px-3 py-3 text-[11px] font-black text-slate-700 shadow-sm transition-all active:scale-[0.97]">
                   编辑计划
+                </button>
+                <button
+                  onClick={handleSavePlanAsTemplate}
+                  className="rounded-2xl border border-slate-900/10 bg-slate-900 px-3 py-3 text-[11px] font-black text-white shadow-sm transition-all active:scale-[0.97]">
+                  另存模板
                 </button>
                 <button
                   onClick={() => handleOpenTemplateSheet('plan')}
@@ -2509,6 +2654,32 @@ export function HomeView() {
                     </button>
                   )}
 
+                  <div className="flex items-center justify-between gap-3 rounded-[24px] border border-white/80 bg-white/82 px-3 py-3 shadow-sm">
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">模板排序</p>
+                      <p className="mt-1 text-[11px] font-medium text-slate-400">始终优先展示置顶模板</p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5 rounded-full bg-slate-100 p-1">
+                      {([
+                        {value: 'recent', label: '最近'},
+                        {value: 'name', label: '名称'},
+                        {value: 'hours', label: '时长'},
+                      ] as Array<{value: TemplateSortMode; label: string}>).map((option) => (
+                        <button
+                          key={option.value}
+                          onClick={() => setTemplateSortMode(option.value)}
+                          className={cn(
+                            'rounded-full px-3 py-1.5 text-[11px] font-black transition-all whitespace-nowrap',
+                            templateSortMode === option.value
+                              ? 'bg-white text-slate-800 shadow-sm'
+                              : 'text-slate-500',
+                          )}>
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
                   {templateSheetMode === 'apply' && !canQuickFill ? (
                     <div className="rounded-[24px] border border-amber-100 bg-amber-50/80 px-4 py-3">
                       <p className="text-[11px] font-black text-amber-700">今天已有投喂记录</p>
@@ -2525,23 +2696,21 @@ export function HomeView() {
                         className="rounded-[28px] border border-white/90 bg-white/88 p-4 shadow-[0_12px_24px_rgba(15,23,42,0.06)]">
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
-                            <div className="text-sm font-black text-slate-800">{template.label}</div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="text-sm font-black text-slate-800">{template.label}</div>
+                              {template.pinned ? (
+                                <span className="rounded-full border border-amber-100 bg-amber-50 px-2 py-1 text-[10px] font-black text-amber-600">
+                                  置顶
+                                </span>
+                              ) : null}
+                            </div>
                             <p className="mt-1 text-xs font-medium leading-5 text-slate-400">
                               {template.summary}
                             </p>
                           </div>
-                          <div className="flex shrink-0 items-center gap-2">
-                            <button
-                              onClick={() => handleOpenEditTemplate(template)}
-                              className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 shadow-sm transition-all active:scale-[0.96]">
-                              <Pencil size={14} />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteTemplate(template.id, template.label)}
-                              className="flex h-9 w-9 items-center justify-center rounded-full border border-rose-100 bg-rose-50 text-rose-500 transition-all active:scale-[0.96]">
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
+                          <span className="shrink-0 rounded-full bg-slate-50 px-3 py-1.5 text-[10px] font-black text-slate-500">
+                            {formatHours(template.totalHours)}h
+                          </span>
                         </div>
 
                         <div className="mt-3 flex flex-wrap gap-2">
@@ -2558,15 +2727,58 @@ export function HomeView() {
                           })}
                         </div>
 
-                        <div className="mt-4 flex items-center justify-between gap-3">
+                        <div className="mt-4 flex flex-wrap items-center gap-2">
                           <span className="rounded-full bg-slate-50 px-3 py-1.5 text-[10px] font-black text-slate-500">
-                            模板总量 {formatHours(getDraftTotal(template.drafts))}h
+                            使用 {template.usageCount} 次
                           </span>
+                          <span className="rounded-full bg-slate-50 px-3 py-1.5 text-[10px] font-black text-slate-500">
+                            {template.lastUsedAt
+                              ? `最近 ${new Date(template.lastUsedAt).toLocaleDateString('zh-CN', {
+                                  month: 'numeric',
+                                  day: 'numeric',
+                                })}`
+                              : '暂未使用'}
+                          </span>
+                        </div>
+
+                        <div className="mt-4 grid grid-cols-4 gap-2">
+                          <button
+                            onClick={() => handleToggleTemplatePinned(template)}
+                            className={cn(
+                              'flex items-center justify-center gap-1.5 rounded-2xl border px-2 py-2.5 text-[11px] font-black transition-all active:scale-[0.97]',
+                              template.pinned
+                                ? 'border-amber-100 bg-amber-50 text-amber-600'
+                                : 'border-slate-200 bg-white text-slate-600',
+                            )}>
+                            <Pin size={12} />
+                            置顶
+                          </button>
+                          <button
+                            onClick={() => handleDuplicateTemplate(template)}
+                            className="flex items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white px-2 py-2.5 text-[11px] font-black text-slate-600 transition-all active:scale-[0.97]">
+                            <Copy size={12} />
+                            复制
+                          </button>
+                          <button
+                            onClick={() => handleOpenEditTemplate(template)}
+                            className="flex items-center justify-center gap-1.5 rounded-2xl border border-slate-200 bg-white px-2 py-2.5 text-[11px] font-black text-slate-600 transition-all active:scale-[0.97]">
+                            <Pencil size={12} />
+                            编辑
+                          </button>
+                          <button
+                            onClick={() => handleDeleteTemplate(template.id, template.label)}
+                            className="flex items-center justify-center gap-1.5 rounded-2xl border border-rose-100 bg-rose-50 px-2 py-2.5 text-[11px] font-black text-rose-500 transition-all active:scale-[0.97]">
+                            <Trash2 size={12} />
+                            删除
+                          </button>
+                        </div>
+
+                        <div className="mt-3 flex items-center justify-end">
                           <button
                             onClick={() =>
                               templateSheetMode === 'apply'
-                                ? handleApplyTemplate(template.drafts, template.label)
-                                : handleSetPlan(template.drafts, template.label)
+                                ? handleApplyTemplate(template)
+                                : handleSetPlan(template)
                             }
                             disabled={templateSheetMode === 'apply' && !canQuickFill}
                             className={cn(
@@ -2760,6 +2972,13 @@ export function HomeView() {
           </div>
         </div>
       ) : null}
+
+      <DayDetailSheet
+        open={selectedDetailDateKey !== null}
+        dateKey={selectedDetailDateKey}
+        allocations={allocations}
+        onClose={() => setSelectedDetailDateKey(null)}
+      />
     </div>
   );
 }

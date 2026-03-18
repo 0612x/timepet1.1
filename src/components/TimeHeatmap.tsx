@@ -25,6 +25,8 @@ interface TimeHeatmapProps {
   className?: string;
   title?: string;
   variant?: 'card' | 'plain';
+  onDaySelect?: (dateKey: string) => void;
+  selectedDateKey?: string | null;
 }
 
 function buildDaySummary(
@@ -61,6 +63,8 @@ export function TimeHeatmap({
   className,
   title = '时间热力图',
   variant = 'card',
+  onDaySelect,
+  selectedDateKey,
 }: TimeHeatmapProps) {
   const isPlain = variant === 'plain';
   const [heatmapView, setHeatmapView] = useState<HeatmapView>(isPlain ? 'week' : 'month');
@@ -235,15 +239,24 @@ export function TimeHeatmap({
     const hours =
       heatmapFilter === 'all' ? day.total : day.typeHours[heatmapFilter as ActivityType];
     const isToday = day.date === todayKey;
+    const isSelected = day.date === selectedDateKey;
 
     return (
-      <div
+      <button
         key={day.date}
+        type="button"
+        onClick={() => onDaySelect?.(day.date)}
         className={cn(
           'relative aspect-square rounded-xl border-2',
-          isToday ? 'border-indigo-500' : 'border-transparent',
+          isSelected
+            ? 'border-slate-900 shadow-[0_10px_22px_rgba(15,23,42,0.14)]'
+            : isToday
+              ? 'border-indigo-500'
+              : 'border-transparent',
           showInactiveMonth && day.isCurrentMonth === false && 'opacity-30',
-        )}>
+          onDaySelect ? 'cursor-pointer transition-transform active:scale-[0.96]' : 'cursor-default',
+        )}
+        disabled={!onDaySelect}>
         <div
           className={cn(
             'absolute inset-0 overflow-hidden rounded-xl border border-black/5 shadow-sm flex flex-col',
@@ -270,7 +283,7 @@ export function TimeHeatmap({
           )}>
           {day.dayOfMonth}
         </span>
-      </div>
+      </button>
     );
   };
 
