@@ -483,15 +483,16 @@
         <h3>使用说明（从单帧拼接）：</h3>
         <ol>
           <li><strong>上传多张图片</strong>：点击"选择多张单帧图片"按钮，选择多张单帧图片（PNG格式）</li>
-          <li><strong>调整顺序</strong>：图片会按照文件名顺序排列，可以删除不需要的图片</li>
+          <li><strong>确认顺序</strong>：图片会按你在文件选择器里的选择顺序排列，可以删除不需要的图片</li>
           <li><strong>选择布局</strong>：选择"单行"或"多行"拼接方式</li>
+          <li><strong>可选缩放</strong>：可开启统一帧尺寸，把所有单帧缩放到同一宽高再拼接</li>
           <li><strong>设置参数</strong>：如果选择多行，需要设置每行帧数</li>
           <li><strong>预览结果</strong>：右侧会实时显示拼接后的序列图</li>
           <li><strong>下载或测试</strong>：点击"下载序列图"保存结果，或点击"加载并测试"显示测试预览区域</li>
           <li><strong>配置测试参数</strong>：在测试预览区域配置帧宽度、帧高度、帧数、动画帧率等参数</li>
           <li><strong>开始测试</strong>：配置完成后点击"开始测试"按钮查看动画效果</li>
         </ol>
-        <p><strong>提示：</strong>图片会按照文件名排序，建议使用有序的文件名（如：frame_001.png, frame_002.png）</p>
+        <p><strong>提示：</strong>拼接顺序以本次文件选择顺序为准，不会再按文件名自动重排。</p>
       </div>
       
       <div class="controls">
@@ -518,6 +519,20 @@
             <div id="multiRowOptions" style="display: none; margin-top: 10px;">
               <label>每行帧数: <input type="number" id="framesPerRow" min="1" value="8" onchange="updateCombineResult()"></label>
               <p style="font-size: 12px; color: #aaa; margin: 5px 0;">当帧数超过每行帧数时，会自动换到下一行</p>
+            </div>
+          </div>
+
+          <div class="layout-options">
+            <h4>序列尺寸：</h4>
+            <label>
+              <input type="checkbox" id="useCustomFrameSize" onchange="updateCombineSizeControlState(); updateCombineResult();">
+              统一缩放到指定帧尺寸
+            </label>
+            <div id="customFrameSizeOptions" style="display: none; margin-top: 10px;">
+              <label>帧宽: <input type="number" id="combineOutputFrameWidth" min="1" value="32" onchange="updateCombineResult()"></label>
+              <label>帧高: <input type="number" id="combineOutputFrameHeight" min="1" value="32" onchange="updateCombineResult()"></label>
+              <button type="button" class="btn-purple" style="padding: 6px 12px; font-size: 12px;" onclick="applyFirstFrameSize()">使用首帧尺寸</button>
+              <p style="font-size: 12px; color: #aaa; margin: 8px 0 0;">开启后每张单帧都会按该尺寸缩放，再进行拼接与导出。</p>
             </div>
           </div>
           
@@ -2066,12 +2081,10 @@
       const fileInput = document.getElementById('multiImageInput');
       if (!fileInput.files || fileInput.files.length === 0) return;
       
+      // 保持用户在文件选择器里的选择顺序，不做文件名重排
       const files = Array.from(fileInput.files);
-      files.sort((a, b) => {
-        return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-      });
       
-      uploadedImages = [];
+      uploadedImages = new Array(files.length);
       let loadedCount = 0;
       
       files.forEach((file, index) => {
@@ -2079,16 +2092,20 @@
         reader.onload = function(e) {
           const img = new Image();
           img.onload = function() {
-            uploadedImages.push({
+            uploadedImages[index] = {
               index: index,
               name: file.name,
               img: img,
               width: img.width,
               height: img.height
-            });
+            };
             
             loadedCount++;
             if (loadedCount === files.length) {
+              uploadedImages = uploadedImages
+                .filter(Boolean)
+                .sort((a, b) => a.index - b.index);
+              applyFirstFrameSize(true);
               renderUploadedImages();
               updateCombineResult();
             }
@@ -2102,6 +2119,43 @@
       document.getElementById('imageCount').textContent = files.length;
     }
     
+    function updateCombineSizeControlState() {
+      const useCustom = document.getElementById('useCustomFrameSize');
+      const customOptions = document.getElementById('customFrameSizeOptions');
+      if (!useCustom || !customOptions) return;
+      customOptions.style.display = useCustom.checked ? 'block' : 'none';
+    }
+
+    function applyFirstFrameSize(silent = false) {
+      if (!uploadedImages.length) return;
+      const widthInput = document.getElementById('combineOutputFrameWidth');
+      const heightInput = document.getElementById('combineOutputFrameHeight');
+      if (!widthInput || !heightInput) return;
+      widthInput.value = uploadedImages[0].width;
+      heightInput.value = uploadedImages[0].height;
+      if (!silent) {
+        updateCombineResult();
+      }
+    }
+
+    function getCombineTargetFrameSize() {
+      if (uploadedImages.length === 0) {
+        return { width: 0, height: 0 };
+      }
+
+      const firstImg = uploadedImages[0];
+      const useCustom = document.getElementById('useCustomFrameSize')?.checked;
+      if (!useCustom) {
+        return { width: firstImg.width, height: firstImg.height };
+      }
+
+      const widthInput = document.getElementById('combineOutputFrameWidth');
+      const heightInput = document.getElementById('combineOutputFrameHeight');
+      const width = Math.max(1, parseInt(widthInput?.value, 10) || firstImg.width);
+      const height = Math.max(1, parseInt(heightInput?.value, 10) || firstImg.height);
+      return { width, height };
+    }
+
     function renderUploadedImages() {
       const container = document.getElementById('uploadedImages');
       container.innerHTML = '';
@@ -2178,9 +2232,9 @@
       const resultCanvas = document.getElementById('resultCanvas');
       const ctx = resultCanvas.getContext('2d');
       
-      const firstImg = uploadedImages[0];
-      const imgWidth = firstImg.width;
-      const imgHeight = firstImg.height;
+      const targetFrameSize = getCombineTargetFrameSize();
+      const imgWidth = targetFrameSize.width;
+      const imgHeight = targetFrameSize.height;
       
       let resultWidth, resultHeight;
       let rows = 1;
@@ -2233,7 +2287,7 @@
       resultCanvas.style.height = displayHeight + 'px';
 
       document.getElementById('resultStats').textContent = 
-        `结果尺寸: ${resultWidth} x ${resultHeight} 像素 (${uploadedImages.length}帧, ${rows}行×${cols}列) | 预览: ${displayWidth} x ${displayHeight} 像素`;
+        `结果尺寸: ${resultWidth} x ${resultHeight} 像素 (${uploadedImages.length}帧, ${rows}行×${cols}列, 单帧${imgWidth}x${imgHeight}) | 预览: ${displayWidth} x ${displayHeight} 像素`;
       document.getElementById('downloadBtn').disabled = false;
       document.getElementById('spriteTestBtn').disabled = false;
       document.getElementById('resultConfigBtn').disabled = false;
@@ -2402,7 +2456,7 @@
       if (mode === 'combine') {
         if (uploadedImages.length === 0) return null;
 
-        const firstImg = uploadedImages[0];
+        const targetFrameSize = getCombineTargetFrameSize();
         const totalFrames = uploadedImages.length;
         const layout = document.querySelector('input[name="layout"]:checked').value;
         let columns = totalFrames;
@@ -2415,8 +2469,8 @@
         }
 
         return {
-          frameWidth: firstImg.width,
-          frameHeight: firstImg.height,
+          frameWidth: targetFrameSize.width,
+          frameHeight: targetFrameSize.height,
           frameCount: totalFrames,
           columns: columns,
           rows: rows,
@@ -3414,6 +3468,10 @@
     document.getElementById('combineFrameCount').addEventListener('change', updateCombineTestSuggestedParams);
     document.getElementById('combineTestRows').addEventListener('change', updateCombineTestSuggestedParams);
     document.getElementById('combineTestCols').addEventListener('change', updateCombineTestSuggestedParams);
+
+    document.getElementById('combineOutputFrameWidth').addEventListener('input', updateCombineResult);
+    document.getElementById('combineOutputFrameHeight').addEventListener('input', updateCombineResult);
+    updateCombineSizeControlState();
   </script>
 </body>
 </html>

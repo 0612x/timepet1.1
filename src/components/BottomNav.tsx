@@ -4,12 +4,12 @@ import { useStore } from '../store/useStore';
 import { cn } from '../utils/cn';
 
 export function BottomNav() {
-  const { currentTab, setCurrentTab } = useStore();
+  const { currentTab, setCurrentTab, enterHomeTab } = useStore();
 
   return (
     <nav className="absolute bottom-0 z-50 grid w-full grid-cols-5 rounded-t-[32px] border-t border-white/20 px-3 py-3 glass-card shadow-lg">
       <button
-        onClick={() => setCurrentTab('home')}
+        onClick={enterHomeTab}
         className={cn(
           "flex flex-col items-center transition-colors",
           currentTab === 'home' ? "text-indigo-600" : "text-slate-400"

@@ -1,9 +1,21 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { ThemeType, PetState, PETS } from '../data/pets';
+import {ThemeType, PetState} from '../data/pets';
+import {
+  getPetSpriteOptionByKey,
+  PET_SPRITE_OPTIONS,
+  type PetSpriteScene,
+} from '../data/petSprites';
+import {
+  SCENE_SPAWN_Y_MAX,
+  SCENE_SPAWN_Y_MIN,
+  SCENE_X_MAX,
+  SCENE_X_MIN,
+} from '../constants/sceneBounds';
 
 export type TabType = 'home' | 'feed' | 'scene' | 'pokedex' | 'stats';
 export type ActivityType = 'work' | 'study' | 'entertainment' | 'rest' | 'exercise';
+export type PetQuality = 'common' | 'rare' | 'epic';
 
 export interface Allocation {
   id: string;
@@ -19,13 +31,16 @@ export interface EggState {
   petId: string | null;
   stage: 'egg' | 'base' | 'evolved';
   finalState: PetState | null;
+  quality: PetQuality | null;
 }
 
 export interface CompletedPet {
   instanceId: string;
   petId: string;
+  nickname?: string;
   theme: ThemeType;
   state: PetState;
+  quality: PetQuality;
   x: number;
   y: number;
   variant: number;
@@ -65,6 +80,8 @@ export interface AllocationUpdate {
 interface AppState {
   currentTab: TabType;
   setCurrentTab: (tab: TabType) => void;
+  homeTabEnterSignal: number;
+  enterHomeTab: () => void;
   
   currentTheme: ThemeType;
   setCurrentTheme: (theme: ThemeType) => void;
@@ -93,13 +110,18 @@ interface AppState {
   
   currentEgg: EggState;
   feedEgg: (date: string, allocationId: string) => boolean;
-  completeEgg: (customPet?: CustomPet) => void;
+  completeEgg: (customPet?: CustomPet, nickname?: string) => CompletedPet | null;
   
   unlockedPets: Record<string, PetState[]>;
   completedPets: CompletedPet[];
   customPets: CustomPet[];
   syncPetData: () => void;
   updatePetPosition: (instanceId: string, x: number, y: number) => void;
+  updatePetPositionsBatch: (updates: Array<{instanceId: string; x: number; y: number}>) => void;
+  renameCompletedPet: (instanceId: string, nickname: string) => boolean;
+  discardCompletedPet: (instanceId: string) => void;
+  clearScenePets: () => void;
+  spawnAllScenePets: () => void;
   
   simulatedDateOffset: number;
   advanceDay: () => void;
@@ -159,12 +181,115 @@ const DEFAULT_PLAN_TEMPLATES: PlanTemplate[] = [
 ];
 
 const getInitialEgg = (theme: ThemeType): EggState => ({
-  theme,
+  theme: theme === 'C' ? 'A' : theme,
   progress: { focus: 0, heal: 0, active: 0 },
   petId: null,
   stage: 'egg',
   finalState: null,
+  quality: null,
 });
+
+function getSpriteSceneByTheme(theme: ThemeType): PetSpriteScene {
+  if (theme === 'A') return 'farm';
+  if (theme === 'B') return 'ocean';
+  return 'draw';
+}
+
+function getHatchSpritePool(theme: ThemeType) {
+  const targetScene = getSpriteSceneByTheme(theme);
+  const sceneMatched = PET_SPRITE_OPTIONS.filter((option) => option.scene === targetScene);
+  if (sceneMatched.length > 0) return sceneMatched;
+
+  const farmFallback = PET_SPRITE_OPTIONS.filter((option) => option.scene === 'farm');
+  if (farmFallback.length > 0) return farmFallback;
+
+  return PET_SPRITE_OPTIONS;
+}
+
+function getEggQuality(progress: EggState['progress']): PetQuality {
+  const values = [progress.focus, progress.heal, progress.active];
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (total <= 0) return 'common';
+
+  const maxShare = Math.max(...values) / total;
+  const minShare = Math.min(...values) / total;
+
+  if (maxShare <= 0.52 && minShare >= 0.15) return 'epic';
+  if (maxShare <= 0.7) return 'rare';
+  return 'common';
+}
+
+function getThemeBySpriteScene(scene: PetSpriteScene): ThemeType {
+  if (scene === 'farm') return 'A';
+  if (scene === 'ocean') return 'B';
+  return 'custom';
+}
+
+function createSceneSeedPet(
+  petId: string,
+  theme: ThemeType,
+  spawnPosition?: {x: number; y: number},
+): CompletedPet {
+  return {
+    instanceId: Math.random().toString(36).substring(2, 9),
+    petId,
+    theme,
+    state: 'base',
+    quality: 'common',
+    x: spawnPosition?.x ?? Math.random() * 80 + 10,
+    y: spawnPosition?.y ?? Math.random() * 70 + 10,
+    variant: Math.floor(Math.random() * 4),
+    scale: 0.35 + Math.random() * 0.25,
+    jumpDelay: -Math.random() * 3,
+    moveDelay: -Math.random() * 12,
+    floatDelay: -Math.random() * 10,
+  };
+}
+
+function getHatchSpawnPosition(theme: ThemeType, existingPets: CompletedPet[]) {
+  const xMin = SCENE_X_MIN;
+  const xMax = SCENE_X_MAX;
+  const yMin = SCENE_SPAWN_Y_MIN;
+  const yMax = SCENE_SPAWN_Y_MAX;
+  const centerX = (xMin + xMax) / 2;
+  const centerY = (yMin + yMax) / 2;
+  const sameThemePets = existingPets.filter((pet) => pet.theme === theme);
+
+  const randomCandidate = () => ({
+    x: xMin + Math.random() * (xMax - xMin),
+    y: yMin + Math.random() * (yMax - yMin),
+  });
+
+  if (sameThemePets.length === 0) return randomCandidate();
+
+  let best = randomCandidate();
+  let bestScore = -Infinity;
+
+  for (let attempt = 0; attempt < 48; attempt += 1) {
+    const candidate = randomCandidate();
+    let minDistance = Infinity;
+
+    sameThemePets.forEach((pet) => {
+      const dx = (candidate.x - pet.x) / 1.1;
+      const dy = (candidate.y - pet.y) / 0.9;
+      const distance = Math.hypot(dx, dy);
+      if (distance < minDistance) minDistance = distance;
+    });
+
+    const centerDistance = Math.hypot(
+      (candidate.x - centerX) / (xMax - xMin),
+      (candidate.y - centerY) / (yMax - yMin),
+    );
+    const score = minDistance + centerDistance * 4.2;
+
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
 
 const createAllocation = (type: ActivityType, hours: number, offset = 0): Allocation => ({
   id: Math.random().toString(36).substring(2, 9),
@@ -271,9 +396,15 @@ export const useStore = create<AppState>()(
     (set, get) => ({
       currentTab: 'home',
       setCurrentTab: (tab) => set({ currentTab: tab }),
+      homeTabEnterSignal: 0,
+      enterHomeTab: () =>
+        set((state) => ({
+          currentTab: 'home',
+          homeTabEnterSignal: state.homeTabEnterSignal + 1,
+        })),
       
       currentTheme: 'A',
-      setCurrentTheme: (theme) => set({ currentTheme: theme }),
+      setCurrentTheme: (theme) => set({ currentTheme: theme === 'C' ? 'A' : theme }),
       
       allocations: {},
       dailyPlans: {},
@@ -617,18 +748,18 @@ export const useStore = create<AppState>()(
         
         // Check thresholds
         if (totalProgress >= 8 && egg.stage === 'egg') {
-          // Hatch into base pet
-          const themePets = PETS.filter(p => p.theme === egg.theme);
-          const randomPet = themePets[Math.floor(Math.random() * themePets.length)];
-          egg.petId = randomPet.id;
-          egg.stage = 'base';
-          
-          // Unlock base in pokedex
-          const currentUnlocked = state.unlockedPets[randomPet.id] || [];
-          if (!currentUnlocked.includes('base')) {
-            set(s => ({
-              unlockedPets: { ...s.unlockedPets, [randomPet.id]: [...currentUnlocked, 'base'] }
-            }));
+          const hatchPool = getHatchSpritePool(egg.theme);
+          const randomSprite = hatchPool[Math.floor(Math.random() * hatchPool.length)];
+          if (randomSprite) {
+            egg.petId = randomSprite.key;
+            egg.stage = 'base';
+
+            const currentUnlocked = state.unlockedPets[randomSprite.key] || [];
+            if (!currentUnlocked.includes('base')) {
+              set(s => ({
+                unlockedPets: { ...s.unlockedPets, [randomSprite.key]: [...currentUnlocked, 'base'] }
+              }));
+            }
           }
         }
         
@@ -641,6 +772,7 @@ export const useStore = create<AppState>()(
           
           egg.finalState = finalState;
           egg.stage = 'evolved';
+          egg.quality = getEggQuality(egg.progress);
           
           // Unlock evolved in pokedex
           if (egg.petId) {
@@ -661,27 +793,37 @@ export const useStore = create<AppState>()(
         return true;
       },
       
-      completeEgg: (customPet) => {
+      completeEgg: (customPet, nickname) => {
         const state = get();
         const egg = state.currentEgg;
         
-        if (egg.stage !== 'evolved' || !egg.petId || !egg.finalState) return;
+        if (egg.stage !== 'evolved' || !egg.petId || !egg.finalState) return null;
         
         let petId = egg.petId;
         let theme = egg.theme;
+        const quality = egg.quality ?? getEggQuality(egg.progress);
+        const normalizedNickname = nickname?.trim() || undefined;
         
         if (customPet) {
           petId = customPet.id;
           theme = 'custom';
+        } else {
+          const spriteOption = getPetSpriteOptionByKey(petId);
+          if (spriteOption?.scene === 'farm') theme = 'A';
+          if (spriteOption?.scene === 'ocean') theme = 'B';
+          if (spriteOption?.scene === 'draw') theme = 'custom';
         }
+        const spawnPosition = getHatchSpawnPosition(theme, state.completedPets);
 
         const newCompleted: CompletedPet = {
           instanceId: Math.random().toString(36).substring(2, 9),
           petId,
+          nickname: customPet ? customPet.name : normalizedNickname,
           theme,
           state: egg.finalState,
-          x: Math.random() * 80 + 10,
-          y: Math.random() * 70 + 10,
+          quality,
+          x: spawnPosition.x,
+          y: spawnPosition.y,
           variant: Math.floor(Math.random() * 4),
           scale: 0.35 + Math.random() * 0.25, // Reduced scale further
           jumpDelay: -Math.random() * 3, // Negative delay to start mid-animation
@@ -704,6 +846,7 @@ export const useStore = create<AppState>()(
         }
 
         set(updates);
+        return newCompleted;
       },
       
       unlockedPets: {}, // Start empty, unlock via hatching
@@ -713,31 +856,126 @@ export const useStore = create<AppState>()(
         const state = get();
         let changed = false;
         const updatedPets = state.completedPets.map(pet => {
-          if (pet.x === undefined) {
+          const patchedPet = {
+            ...pet,
+            quality: pet.quality ?? 'common',
+            x: pet.x ?? Math.random() * 80 + 10,
+            y: pet.y ?? Math.random() * 70 + 10,
+            variant: pet.variant ?? Math.floor(Math.random() * 4),
+            scale: pet.scale ?? 0.35 + Math.random() * 0.25,
+            jumpDelay: pet.jumpDelay ?? -Math.random() * 3,
+            moveDelay: pet.moveDelay ?? -Math.random() * 12,
+            floatDelay: pet.floatDelay ?? -Math.random() * 10,
+          };
+          const hasPatched =
+            patchedPet.quality !== pet.quality ||
+            patchedPet.x !== pet.x ||
+            patchedPet.y !== pet.y ||
+            patchedPet.variant !== pet.variant ||
+            patchedPet.scale !== pet.scale ||
+            patchedPet.jumpDelay !== pet.jumpDelay ||
+            patchedPet.moveDelay !== pet.moveDelay ||
+            patchedPet.floatDelay !== pet.floatDelay;
+
+          if (hasPatched) {
             changed = true;
-            return {
-              ...pet,
-              x: Math.random() * 80 + 10,
-              y: Math.random() * 70 + 10,
-              variant: Math.floor(Math.random() * 4),
-              scale: 0.35 + Math.random() * 0.25,
-              jumpDelay: -Math.random() * 3,
-              moveDelay: -Math.random() * 12,
-              floatDelay: -Math.random() * 10,
-            };
           }
-          return pet;
+
+          return patchedPet;
         });
         if (changed) {
           set({ completedPets: updatedPets });
         }
       },
       updatePetPosition: (instanceId, x, y) => {
-        set(state => ({
-          completedPets: state.completedPets.map(p => 
-            p.instanceId === instanceId ? { ...p, x, y } : p
-          )
+        get().updatePetPositionsBatch([{instanceId, x, y}]);
+      },
+      updatePetPositionsBatch: (updates) => {
+        if (updates.length === 0) return;
+
+        const updateMap = new Map<string, {x: number; y: number}>();
+        updates.forEach((item) => {
+          updateMap.set(item.instanceId, {x: item.x, y: item.y});
+        });
+        if (updateMap.size === 0) return;
+
+        const state = get();
+        let changed = false;
+        const nextPets = state.completedPets.map((pet) => {
+          const nextPos = updateMap.get(pet.instanceId);
+          if (!nextPos) return pet;
+
+          if (Math.abs(nextPos.x - pet.x) < 0.01 && Math.abs(nextPos.y - pet.y) < 0.01) {
+            return pet;
+          }
+
+          changed = true;
+          return {
+            ...pet,
+            x: nextPos.x,
+            y: nextPos.y,
+          };
+        });
+
+        if (!changed) return;
+        set({completedPets: nextPets});
+      },
+      renameCompletedPet: (instanceId, nickname) => {
+        const normalized = nickname.trim();
+        const state = get();
+        const target = state.completedPets.find((pet) => pet.instanceId === instanceId);
+        if (!target) return false;
+
+        const nextNickname = normalized.length > 0 ? normalized : undefined;
+        if ((target.nickname ?? undefined) === nextNickname) return false;
+
+        set({
+          completedPets: state.completedPets.map((pet) =>
+            pet.instanceId === instanceId
+              ? {
+                  ...pet,
+                  nickname: nextNickname,
+                }
+              : pet,
+          ),
+        });
+        return true;
+      },
+      discardCompletedPet: (instanceId) => {
+        set((state) => ({
+          completedPets: state.completedPets.filter((pet) => pet.instanceId !== instanceId),
         }));
+      },
+      clearScenePets: () => {
+        set((state) => {
+          const theme = state.currentTheme === 'C' ? 'A' : state.currentTheme;
+          return {
+            completedPets: state.completedPets.filter((pet) => pet.theme !== theme),
+          };
+        });
+      },
+      spawnAllScenePets: () => {
+        set((state) => {
+          const theme = state.currentTheme === 'C' ? 'A' : state.currentTheme;
+          const targetScene = getSpriteSceneByTheme(theme);
+          const sceneOptions = PET_SPRITE_OPTIONS.filter((option) => option.scene === targetScene);
+
+          if (sceneOptions.length === 0) {
+            return {};
+          }
+
+          const nonScenePets = state.completedPets.filter((pet) => pet.theme !== theme);
+          const seededPets: CompletedPet[] = [];
+          sceneOptions.forEach((option) => {
+            const optionTheme = getThemeBySpriteScene(option.scene);
+            const spawnPosition = getHatchSpawnPosition(optionTheme, [...nonScenePets, ...seededPets]);
+            seededPets.push(createSceneSeedPet(option.key, optionTheme, spawnPosition));
+          });
+
+          return {
+            completedPets: [...nonScenePets, ...seededPets],
+          };
+        });
       },
       
       simulatedDateOffset: 0,
@@ -751,10 +989,32 @@ export const useStore = create<AppState>()(
           typedPersistedState?.planTemplates && typedPersistedState.planTemplates.length > 0
             ? typedPersistedState.planTemplates
             : currentState.planTemplates;
+        const nextTheme =
+          typedPersistedState?.currentTheme && typedPersistedState.currentTheme !== 'C'
+            ? typedPersistedState.currentTheme
+            : currentState.currentTheme;
+        const nextEgg = typedPersistedState?.currentEgg
+          ? {
+              ...typedPersistedState.currentEgg,
+              theme:
+                typedPersistedState.currentEgg.theme === 'C'
+                  ? 'A'
+                  : typedPersistedState.currentEgg.theme,
+              quality: typedPersistedState.currentEgg.quality ?? null,
+            }
+          : currentState.currentEgg;
+        const completedPets =
+          typedPersistedState?.completedPets?.map((pet) => ({
+            ...pet,
+            quality: pet.quality ?? 'common',
+          })) ?? currentState.completedPets;
 
         return {
           ...currentState,
           ...typedPersistedState,
+          currentTheme: nextTheme,
+          currentEgg: nextEgg,
+          completedPets,
           planTemplates: rawTemplates.map((template, index) =>
             normalizePlanTemplate(template, Date.now() + index),
           ),

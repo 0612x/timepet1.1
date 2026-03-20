@@ -11,6 +11,7 @@ import { FeedView } from './views/FeedView';
 import { SceneView } from './views/SceneView';
 import { PokedexView } from './views/PokedexView';
 import { StatsView } from './views/StatsView';
+import { cn } from './utils/cn';
 
 export default function App() {
   const { currentTab } = useStore();
@@ -21,7 +22,15 @@ export default function App() {
         {/* Main Content Area */}
         {currentTab === 'home' && <HomeView />}
         {currentTab === 'feed' && <FeedView />}
-        {currentTab === 'scene' && <SceneView />}
+        <div
+          className={cn(
+            'absolute inset-0 h-full transition-none',
+            currentTab === 'scene'
+              ? 'z-20 opacity-100 pointer-events-auto'
+              : '-z-10 opacity-0 pointer-events-none',
+          )}>
+          <SceneView />
+        </div>
         {currentTab === 'pokedex' && <PokedexView />}
         {currentTab === 'stats' && <StatsView />}
 

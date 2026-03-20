@@ -1,11 +1,13 @@
 import React, { useState, useMemo } from 'react';
-import { useStore } from '../store/useStore';
-import { PETS } from '../data/pets';
+import {CompletedPet, PetQuality, useStore} from '../store/useStore';
+import {PETS} from '../data/pets';
 import { cn } from '../utils/cn';
 import { DrawingModal } from '../components/DrawingModal';
-import { Wand2, PenTool, Sparkles, Utensils } from 'lucide-react';
+import { CheckCircle2, Dice5, PenTool, Sparkles, Utensils, Wand2, X } from 'lucide-react';
 import {ACTIVITY_CONFIG, getActivityConfig} from '../constants/activities';
 import {formatZhDate, getDateKey, getSimulatedDate} from '../utils/date';
+import {getPetSpriteOptionByKey, hasPetSpriteAction, type PetSpriteAction} from '../data/petSprites';
+import {SpriteActor} from '../components/SpriteActor';
 
 export function FeedView() {
   const {
@@ -19,6 +21,9 @@ export function FeedView() {
   } = useStore();
   const [isShaking, setIsShaking] = useState(false);
   const [showDrawingModal, setShowDrawingModal] = useState(false);
+  const [showRandomHatchModal, setShowRandomHatchModal] = useState(false);
+  const [pendingRandomName, setPendingRandomName] = useState('');
+  const [hatchedPreview, setHatchedPreview] = useState<CompletedPet | null>(null);
 
   const today = useMemo(() => {
     return formatZhDate(getSimulatedDate(simulatedDateOffset));
@@ -40,10 +45,33 @@ export function FeedView() {
     feedEgg(todayStr, id);
   };
 
-  const handleRandomHatch = () => {
-    const hatchTheme = currentEgg.theme;
-    completeEgg();
-    setCurrentTheme(hatchTheme);
+  const RANDOM_NAME_PREFIX = ['小', '团', '星', '云', '糯', '暖', '泡', '栗', '豆', '阿'];
+  const RANDOM_NAME_SUFFIX = ['果', '团', '球', '糖', '芽', '咪', '宝', '仔', '丸', '可'];
+  const createRandomName = () => {
+    const left = RANDOM_NAME_PREFIX[Math.floor(Math.random() * RANDOM_NAME_PREFIX.length)];
+    const right = RANDOM_NAME_SUFFIX[Math.floor(Math.random() * RANDOM_NAME_SUFFIX.length)];
+    return `${left}${right}${Math.floor(Math.random() * 90 + 10)}`;
+  };
+
+  const handleOpenRandomHatchModal = () => {
+    setPendingRandomName('');
+    setShowRandomHatchModal(true);
+  };
+
+  const handleConfirmRandomHatch = () => {
+    const finalName = pendingRandomName.trim() || createRandomName();
+    const hatchedPet = completeEgg(undefined, finalName);
+    if (!hatchedPet) return;
+    setShowRandomHatchModal(false);
+    setPendingRandomName('');
+    setHatchedPreview(hatchedPet);
+  };
+
+  const handleGoToSceneAfterHatch = () => {
+    if (!hatchedPreview) return;
+    const hatchTheme = hatchedPreview.theme;
+    setHatchedPreview(null);
+    setCurrentTheme(hatchTheme === 'B' ? 'A' : hatchTheme);
     setCurrentTab('scene');
   };
 
@@ -59,20 +87,54 @@ export function FeedView() {
     setCurrentTab('scene');
   };
 
-  const getEggDisplay = () => {
-    if (currentEgg.stage === 'egg') return '🥚';
-    if (!currentEgg.petId) return '🥚';
-    
-    const pet = PETS.find(p => p.id === currentEgg.petId);
-    if (!pet) return '🥚';
-    
-    if (currentEgg.stage === 'base') return pet.base;
-    
-    if (currentEgg.finalState === 'focus') return pet.focus;
-    if (currentEgg.finalState === 'heal') return pet.heal;
-    if (currentEgg.finalState === 'active') return pet.active;
-    
-    return pet.base;
+  const getQualityLabel = (quality: PetQuality | null) => {
+    if (quality === 'epic') return '史诗';
+    if (quality === 'rare') return '稀有';
+    return '普通';
+  };
+
+  const getQualityClass = (quality: PetQuality | null) => {
+    if (quality === 'epic') {
+      return 'border-violet-200/90 bg-[radial-gradient(circle_at_top,rgba(167,139,250,0.38),rgba(255,255,255,0.82)_56%)] text-violet-600';
+    }
+    if (quality === 'rare') {
+      return 'border-amber-200/90 bg-[radial-gradient(circle_at_top,rgba(251,191,36,0.33),rgba(255,255,255,0.84)_56%)] text-amber-600';
+    }
+    return 'border-slate-200/90 bg-[radial-gradient(circle_at_top,rgba(148,163,184,0.26),rgba(255,255,255,0.84)_58%)] text-slate-600';
+  };
+
+  const getSpriteAction = (spriteKey: string): PetSpriteAction => {
+    const preferredAction: PetSpriteAction =
+      currentEgg.stage === 'base'
+        ? 'idle'
+        : currentEgg.finalState === 'focus'
+          ? 'move'
+          : currentEgg.finalState === 'heal'
+            ? 'feed'
+            : currentEgg.finalState === 'active'
+              ? 'happy'
+              : 'idle';
+    if (hasPetSpriteAction(spriteKey, preferredAction)) return preferredAction;
+    if (hasPetSpriteAction(spriteKey, 'move')) return 'move';
+    if (hasPetSpriteAction(spriteKey, 'happy')) return 'happy';
+    if (hasPetSpriteAction(spriteKey, 'feed')) return 'feed';
+    return 'idle';
+  };
+
+  const getSpriteActionByState = (spriteKey: string, state: CompletedPet['state']): PetSpriteAction => {
+    const preferredAction: PetSpriteAction =
+      state === 'focus'
+        ? 'move'
+        : state === 'heal'
+          ? 'feed'
+          : state === 'active'
+            ? 'happy'
+            : 'idle';
+    if (hasPetSpriteAction(spriteKey, preferredAction)) return preferredAction;
+    if (hasPetSpriteAction(spriteKey, 'move')) return 'move';
+    if (hasPetSpriteAction(spriteKey, 'happy')) return 'happy';
+    if (hasPetSpriteAction(spriteKey, 'feed')) return 'feed';
+    return 'idle';
   };
 
   const getActivityIcon = (type: string) => {
@@ -82,6 +144,11 @@ export function FeedView() {
   const getActivityColor = (type: string) => {
     return getActivityConfig(type as typeof ACTIVITY_CONFIG[number]['type'])?.baseColor ?? 'bg-slate-500';
   };
+
+  const spriteOption = currentEgg.petId ? getPetSpriteOptionByKey(currentEgg.petId) : null;
+  const legacyPet = currentEgg.petId ? PETS.find((pet) => pet.id === currentEgg.petId) : null;
+  const spriteScale = spriteOption ? Math.min(spriteOption.sceneScale ?? 2.3, 2.4) : 2.2;
+  const displayQuality = currentEgg.stage === 'evolved' ? currentEgg.quality : null;
 
   return (
     <div className="flex-1 flex flex-col bg-slate-50 overflow-y-auto scroll-hide pb-24">
@@ -99,12 +166,59 @@ export function FeedView() {
           </div>
 
           {/* Egg Display */}
-          <div className={cn(
-            "text-7xl mb-10 transition-all duration-300 drop-shadow-2xl filter",
-            isShaking && "animate-shake",
-            currentEgg.stage === 'evolved' && "animate-glow text-current scale-125"
-          )}>
-            {getEggDisplay()}
+          <div
+            className={cn(
+              'mb-10 transition-all duration-300',
+              isShaking && 'animate-shake',
+              currentEgg.stage === 'evolved' && 'animate-glow',
+            )}>
+            {currentEgg.stage === 'evolved' ? (
+              <div className="flex flex-col items-center gap-2">
+                <div className="text-7xl drop-shadow-2xl">🥚</div>
+                <span className="rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1 text-[11px] font-black text-indigo-600">
+                  待确认孵化
+                </span>
+              </div>
+            ) : currentEgg.stage === 'egg' ? (
+              <div className="text-7xl drop-shadow-2xl">🥚</div>
+            ) : !spriteOption && legacyPet ? (
+              <div className="text-7xl drop-shadow-2xl">
+                {currentEgg.stage === 'base'
+                  ? legacyPet.base
+                  : currentEgg.finalState === 'focus'
+                    ? legacyPet.focus
+                    : currentEgg.finalState === 'heal'
+                      ? legacyPet.heal
+                      : currentEgg.finalState === 'active'
+                        ? legacyPet.active
+                        : legacyPet.base}
+              </div>
+            ) : !spriteOption ? (
+              <div className="text-7xl drop-shadow-2xl">🥚</div>
+            ) : (
+              <div
+                className={cn(
+                  'relative rounded-[28px] border p-3 shadow-[0_14px_36px_rgba(15,23,42,0.14)] backdrop-blur-sm',
+                  getQualityClass(displayQuality),
+                )}>
+                <div className="flex min-h-[104px] min-w-[128px] items-center justify-center rounded-[20px] bg-white/75 px-4 py-3 shadow-inner shadow-white/80">
+                  <SpriteActor
+                    spriteKey={spriteOption.key}
+                    action={getSpriteAction(spriteOption.key)}
+                    scale={spriteScale}
+                    flipX={spriteOption.flipX}
+                    ariaLabel={spriteOption.label}
+                    className="drop-shadow-[0_10px_16px_rgba(15,23,42,0.24)]"
+                  />
+                </div>
+                <div className="mt-2 flex items-center justify-between px-1">
+                  <span className="text-[11px] font-black tracking-wide">{spriteOption.label}</span>
+                  <span className="rounded-full border border-current/20 bg-white/70 px-2 py-0.5 text-[10px] font-black">
+                    {currentEgg.stage === 'evolved' ? getQualityLabel(displayQuality) : '幼体'}
+                  </span>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Stats Grid */}
@@ -153,7 +267,7 @@ export function FeedView() {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <button
-                  onClick={handleRandomHatch}
+                  onClick={handleOpenRandomHatchModal}
                   className="flex flex-col items-center justify-center gap-2 p-4 font-black rounded-2xl bg-indigo-50 text-indigo-600 border border-indigo-100 active:scale-95 transition-all"
                 >
                   <Wand2 size={24} />
@@ -214,6 +328,112 @@ export function FeedView() {
           onClose={() => setShowDrawingModal(false)} 
           onSave={handleCustomHatch} 
         />
+      )}
+
+      {showRandomHatchModal && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-md">
+          <div className="glass-card w-full max-w-md rounded-3xl border border-white/50 bg-white p-5 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-black text-slate-900">随机孵化命名</h3>
+              <button
+                onClick={() => setShowRandomHatchModal(false)}
+                className="rounded-full p-2 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600">
+                <X size={16} />
+              </button>
+            </div>
+            <p className="mt-1 text-xs font-medium text-slate-500">
+              可以自定义名字；留空也会自动随机生成。
+            </p>
+
+            <div className="mt-4 space-y-2">
+              <input
+                type="text"
+                value={pendingRandomName}
+                onChange={(event) => setPendingRandomName(event.target.value)}
+                placeholder="给新宠物起个名字（可选）"
+                maxLength={16}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-300"
+              />
+              <button
+                onClick={() => setPendingRandomName(createRandomName())}
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-indigo-100 bg-indigo-50 px-3 text-[11px] font-black text-indigo-600 transition-all hover:bg-indigo-100 active:scale-[0.98]">
+                <Dice5 size={14} />
+                随机名字
+              </button>
+            </div>
+
+            <div className="mt-5 flex gap-2">
+              <button
+                onClick={() => setShowRandomHatchModal(false)}
+                className="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-xs font-black text-slate-500 transition-colors hover:bg-slate-50">
+                取消
+              </button>
+              <button
+                onClick={handleConfirmRandomHatch}
+                className="flex-1 rounded-xl bg-indigo-600 px-3 py-2.5 text-xs font-black text-white shadow-lg shadow-indigo-200 transition-colors hover:bg-indigo-700">
+                确认随机孵化
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {hatchedPreview && (
+        <div className="fixed inset-0 z-[111] flex items-center justify-center p-4 bg-slate-900/55 backdrop-blur-md">
+          <div className="glass-card w-full max-w-md rounded-3xl border border-white/50 bg-white p-6 shadow-2xl">
+            <div className="flex items-center gap-2 text-emerald-600">
+              <CheckCircle2 size={18} />
+              <p className="text-sm font-black">孵化成功</p>
+            </div>
+            <h3 className="mt-1 text-xl font-black text-slate-900">
+              {hatchedPreview.nickname || '新宠物'} 已加入
+            </h3>
+            <p className="mt-1 text-xs font-medium text-slate-500">
+              品质 · {getQualityLabel(hatchedPreview.quality)}
+            </p>
+
+            <div className="mt-4 rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
+              {(() => {
+                const option = getPetSpriteOptionByKey(hatchedPreview.petId);
+                const legacy = PETS.find((pet) => pet.id === hatchedPreview.petId);
+                return option ? (
+                  <div className="flex min-h-[96px] items-center justify-center">
+                    <SpriteActor
+                      spriteKey={option.key}
+                      action={getSpriteActionByState(option.key, hatchedPreview.state)}
+                      scale={Math.min(option.sceneScale ?? 2.3, 2.35)}
+                      flipX={option.flipX}
+                      ariaLabel={option.label}
+                    />
+                  </div>
+                ) : (
+                  <div className="flex min-h-[96px] items-center justify-center text-6xl">
+                    {hatchedPreview.state === 'focus'
+                      ? legacy?.focus
+                      : hatchedPreview.state === 'heal'
+                        ? legacy?.heal
+                        : hatchedPreview.state === 'active'
+                          ? legacy?.active
+                          : legacy?.base || '🐾'}
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="mt-5 flex gap-2">
+              <button
+                onClick={() => setHatchedPreview(null)}
+                className="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-xs font-black text-slate-500 transition-colors hover:bg-slate-50">
+                先留在这里
+              </button>
+              <button
+                onClick={handleGoToSceneAfterHatch}
+                className="flex-1 rounded-xl bg-indigo-600 px-3 py-2.5 text-xs font-black text-white shadow-lg shadow-indigo-200 transition-colors hover:bg-indigo-700">
+                前往场景
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -33,10 +33,19 @@ import {
   ActivityType,
   Allocation,
   AllocationDraft,
+  CompletedPet,
   PlanTemplate,
 } from '../store/useStore';
 import {cn} from '../utils/cn';
 import {formatZhDate, getDateKey, getSimulatedDate} from '../utils/date';
+import {PETS} from '../data/pets';
+import {
+  getPetSpriteOptionByKey,
+  hasPetSpriteAction,
+  isPetSpriteKey,
+  type PetSpriteAction,
+} from '../data/petSprites';
+import {SpriteActor} from '../components/SpriteActor';
 
 const RING_CIRCUMFERENCE = 352;
 const EMPTY_ALLOCATIONS: Allocation[] = [];
@@ -61,6 +70,27 @@ interface SummaryInsightConfig {
   description: string;
   accent: string;
   background: string;
+}
+
+interface HomePasser {
+  id: string;
+  pet: CompletedPet;
+  customImage?: string;
+  startX: number;
+  endX: number;
+  topOffset: number;
+  duration: number;
+  delay: number;
+  action: PetSpriteAction;
+  flipX?: boolean;
+}
+
+function resolveHomePasserAction(petId: string): PetSpriteAction {
+  if (hasPetSpriteAction(petId, 'move')) return 'move';
+  if (hasPetSpriteAction(petId, 'idle')) return 'idle';
+  if (hasPetSpriteAction(petId, 'happy')) return 'happy';
+  if (hasPetSpriteAction(petId, 'feed')) return 'feed';
+  return 'idle';
 }
 
 function getDistributionTotal(totals: Record<ActivityType, number>) {
@@ -859,6 +889,8 @@ const TodayDistributionSection = React.memo(function TodayDistributionSection({
 export function HomeView() {
   const {
     allocations,
+    completedPets,
+    customPets,
     planTemplates,
     allocateTime,
     applyAllocationDrafts,
@@ -876,6 +908,7 @@ export function HomeView() {
     togglePlanTemplatePinned,
     updatePlanTemplate,
     updateUnusedAllocation,
+    homeTabEnterSignal,
   } = useStore();
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [selectedDetailDateKey, setSelectedDetailDateKey] = useState<string | null>(null);
@@ -890,7 +923,10 @@ export function HomeView() {
   const [editType, setEditType] = useState<ActivityType>('work');
   const [editHours, setEditHours] = useState(0.5);
   const [showAvatarInsight, setShowAvatarInsight] = useState(false);
+  const [homePassers, setHomePassers] = useState<HomePasser[]>([]);
   const avatarInsightRef = useRef<HTMLDivElement | null>(null);
+  const homeSignalRef = useRef<number>(-1);
+  const homePasserTimerRef = useRef<number | null>(null);
 
   const todayDate = useMemo(() => getSimulatedDate(simulatedDateOffset), [simulatedDateOffset]);
   const today = useMemo(() => formatZhDate(todayDate), [todayDate]);
@@ -929,6 +965,59 @@ export function HomeView() {
     return data;
   }, [todayAllocations]);
 
+  const triggerHomePassers = useCallback(() => {
+    if (homePasserTimerRef.current !== null) {
+      window.clearTimeout(homePasserTimerRef.current);
+      homePasserTimerRef.current = null;
+    }
+
+    const farmPets = completedPets.filter((pet) => pet.theme === 'A');
+
+    if (farmPets.length === 0) {
+      setHomePassers([]);
+      return;
+    }
+
+    const sampleCount = Math.min(farmPets.length, 1 + Math.floor(Math.random() * 3));
+    const pickedPets = [...farmPets]
+      .sort(() => Math.random() - 0.5)
+      .slice(0, sampleCount);
+    const moveLeftToRight = Math.random() > 0.3;
+    const startX = moveLeftToRight ? -22 : 106;
+    const endX = moveLeftToRight ? 106 : -22;
+
+    const nextPassers: HomePasser[] = pickedPets.map((pet, index) => {
+      const customImage = pet.theme === 'custom'
+        ? customPets.find((item) => item.id === pet.petId)?.image
+        : undefined;
+      const spriteOption = isPetSpriteKey(pet.petId)
+        ? getPetSpriteOptionByKey(pet.petId)
+        : null;
+      const baseFlip = Boolean(spriteOption?.flipX);
+      return {
+        id: `${pet.instanceId}-${Date.now()}-${index}`,
+        pet,
+        customImage,
+        startX,
+        endX,
+        topOffset: 9,
+        duration: 4,
+        delay: index * 0.42,
+        action: resolveHomePasserAction(pet.petId),
+        flipX: moveLeftToRight ? baseFlip : !baseFlip,
+      };
+    });
+
+    setHomePassers(nextPassers);
+
+    const maxDurationMs =
+      Math.max(...nextPassers.map((passer) => (passer.duration + passer.delay) * 1000), 0) + 260;
+    homePasserTimerRef.current = window.setTimeout(() => {
+      setHomePassers([]);
+      homePasserTimerRef.current = null;
+    }, maxDurationMs);
+  }, [completedPets, customPets]);
+
   useEffect(() => {
     if (!editingAllocationId) return;
 
@@ -946,6 +1035,23 @@ export function HomeView() {
     const timer = window.setTimeout(() => setActionFeedback(null), 1800);
     return () => window.clearTimeout(timer);
   }, [actionFeedback]);
+
+  useEffect(() => {
+    if (homeSignalRef.current === homeTabEnterSignal) return;
+    const shouldTrigger = homeTabEnterSignal > 0;
+    homeSignalRef.current = homeTabEnterSignal;
+    if (!shouldTrigger) return;
+    triggerHomePassers();
+  }, [homeTabEnterSignal, triggerHomePassers]);
+
+  useEffect(
+    () => () => {
+      if (homePasserTimerRef.current !== null) {
+        window.clearTimeout(homePasserTimerRef.current);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     setShowSecondaryActions(false);
@@ -1886,7 +1992,82 @@ export function HomeView() {
       </header>
 
       <main className="relative z-0 px-5 space-y-4">
-        <section className="glass-card rounded-[26px] p-3.5 shadow-lg border-white/40">
+        <div className="relative">
+          <AnimatePresence>
+            {homePassers.length > 0 ? (
+              <div className="pointer-events-none absolute inset-x-2 -top-12 z-[300] h-14">
+                {homePassers.map((passer) => {
+                  const spriteOption = isPetSpriteKey(passer.pet.petId)
+                    ? getPetSpriteOptionByKey(passer.pet.petId)
+                    : null;
+                  const legacyPet = !spriteOption
+                    ? PETS.find((pet) => pet.id === passer.pet.petId)
+                    : null;
+                  const legacyEmoji = passer.pet.state === 'focus'
+                    ? legacyPet?.focus
+                    : passer.pet.state === 'heal'
+                      ? legacyPet?.heal
+                      : passer.pet.state === 'active'
+                        ? legacyPet?.active
+                        : legacyPet?.base;
+
+                  return (
+                    <motion.div
+                      key={passer.id}
+                      initial={{left: `${passer.startX}%`, opacity: 0, scale: 0.88}}
+                      animate={{
+                        left: `${passer.endX}%`,
+                        opacity: [0, 1, 1, 0],
+                        scale: [0.88, 1, 1, 0.97],
+                      }}
+                      exit={{opacity: 0}}
+                      transition={{
+                        left: {
+                          duration: passer.duration,
+                          delay: passer.delay,
+                          ease: 'linear',
+                        },
+                        opacity: {
+                          duration: passer.duration,
+                          delay: passer.delay,
+                          times: [0, 0.06, 0.92, 1],
+                          ease: 'linear',
+                        },
+                        scale: {
+                          duration: passer.duration,
+                          delay: passer.delay,
+                          times: [0, 0.06, 0.9, 1],
+                          ease: 'easeOut',
+                        },
+                      }}
+                      className="absolute z-[301]"
+                      style={{top: `${passer.topOffset}px`}}>
+                      {spriteOption ? (
+                        <SpriteActor
+                          spriteKey={spriteOption.key}
+                          action={passer.action}
+                          scale={Math.min((spriteOption.sceneScale ?? 2.3) * 0.58, 1.55)}
+                          flipX={passer.flipX}
+                          ariaLabel={spriteOption.label}
+                          className="drop-shadow-[0_4px_8px_rgba(15,23,42,0.22)]"
+                        />
+                      ) : passer.customImage ? (
+                        <img
+                          src={passer.customImage}
+                          alt={passer.pet.nickname || '宠物'}
+                          className="h-9 w-9 object-contain drop-shadow-[0_4px_8px_rgba(15,23,42,0.22)]"
+                        />
+                      ) : (
+                        <span className="text-[28px] leading-none drop-shadow-[0_4px_8px_rgba(15,23,42,0.2)]">{legacyEmoji ?? '🐾'}</span>
+                      )}
+                    </motion.div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </AnimatePresence>
+
+          <section className="relative overflow-visible glass-card rounded-[26px] p-3.5 shadow-lg border-white/40">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
@@ -2025,7 +2206,8 @@ export function HomeView() {
               </motion.div>
             ) : null}
           </AnimatePresence>
-        </section>
+          </section>
+        </div>
 
         <section className="glass-card rounded-[28px] p-3.5 shadow-xl border-white/40">
           <div className="mb-3 flex items-start justify-between gap-3">
@@ -2105,12 +2287,12 @@ export function HomeView() {
                 </h4>
                 <p className="text-xs opacity-60 font-medium">
                   {currentEgg.theme === 'A'
-                    ? '云朵农场'
+                    ? '农场'
                     : currentEgg.theme === 'B'
-                      ? '深海水族箱'
-                      : currentEgg.theme === 'C'
-                        ? '霓虹机房'
-                        : '手绘乐园'}{' '}
+                      ? '深海（暂未开放）'
+                      : currentEgg.theme === 'custom'
+                        ? '手绘乐园'
+                        : '农场'}{' '}
                   · {currentEgg.stage === 'egg' ? '幼体期' : '成长期'}
                 </p>
               </div>

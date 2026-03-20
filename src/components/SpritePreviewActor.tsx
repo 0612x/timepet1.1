@@ -14,6 +14,7 @@ interface SpritePreviewActorProps {
   action: PetSpriteAction;
   actionSeed: number;
   sceneScale?: number;
+  flipX?: boolean;
 }
 
 export function SpritePreviewActor({
@@ -23,6 +24,7 @@ export function SpritePreviewActor({
   action,
   actionSeed,
   sceneScale,
+  flipX,
 }: SpritePreviewActorProps) {
   const config = getPetSpriteConfigByKey(spriteKey, action);
   const [frameIndex, setFrameIndex] = useState(0);
@@ -96,6 +98,7 @@ export function SpritePreviewActor({
                 backgroundPosition: `-${columnIndex * width}px -${rowIndex * height}px`,
                 backgroundSize: `${config.columns * width}px ${config.rows * height}px`,
                 imageRendering: 'pixelated',
+                transform: flipX ? 'scaleX(-1)' : undefined,
               }}
             />
           </div>
