@@ -12,6 +12,7 @@ import {
   SCENE_X_MAX,
   SCENE_X_MIN,
 } from '../constants/sceneBounds';
+import {PET_STATUS_DEFAULTS, clampMetric, getPetMetric, roundMetric} from '../utils/petStatus';
 
 export type TabType = 'home' | 'feed' | 'scene' | 'pokedex' | 'stats';
 export type ActivityType = 'work' | 'study' | 'entertainment' | 'rest' | 'exercise';
@@ -48,6 +49,13 @@ export interface CompletedPet {
   jumpDelay: number;
   moveDelay: number;
   floatDelay: number;
+  health?: number;
+  satiety?: number;
+  mood?: number;
+  hygiene?: number;
+  wasteLevel?: number;
+  digestionLoad?: number;
+  statusUpdatedAt?: number;
 }
 
 export interface CustomPet {
@@ -116,6 +124,9 @@ interface AppState {
   completedPets: CompletedPet[];
   customPets: CustomPet[];
   syncPetData: () => void;
+  feedCompletedPet: (instanceId: string) => boolean;
+  cheerCompletedPet: (instanceId: string) => boolean;
+  cleanSceneWaste: (theme: ThemeType) => number;
   updatePetPosition: (instanceId: string, x: number, y: number) => void;
   updatePetPositionsBatch: (updates: Array<{instanceId: string; x: number; y: number}>) => void;
   renameCompletedPet: (instanceId: string, nickname: string) => boolean;
@@ -230,6 +241,7 @@ function createSceneSeedPet(
   theme: ThemeType,
   spawnPosition?: {x: number; y: number},
 ): CompletedPet {
+  const now = Date.now();
   return {
     instanceId: Math.random().toString(36).substring(2, 9),
     petId,
@@ -243,6 +255,13 @@ function createSceneSeedPet(
     jumpDelay: -Math.random() * 3,
     moveDelay: -Math.random() * 12,
     floatDelay: -Math.random() * 10,
+    health: roundMetric(PET_STATUS_DEFAULTS.health + (Math.random() - 0.5) * 8),
+    satiety: roundMetric(PET_STATUS_DEFAULTS.satiety + (Math.random() - 0.5) * 10),
+    mood: roundMetric(PET_STATUS_DEFAULTS.mood + (Math.random() - 0.5) * 12),
+    hygiene: roundMetric(PET_STATUS_DEFAULTS.hygiene + (Math.random() - 0.5) * 10),
+    wasteLevel: roundMetric(PET_STATUS_DEFAULTS.wasteLevel + (Math.random() - 0.5) * 8),
+    digestionLoad: roundMetric(Math.random() * 8),
+    statusUpdatedAt: now,
   };
 }
 
@@ -289,6 +308,124 @@ function getHatchSpawnPosition(theme: ThemeType, existingPets: CompletedPet[]) {
   }
 
   return best;
+}
+
+type PetCareAction = 'feed' | 'cheer' | 'clean';
+const BASE_WASTE_GAIN_PER_HOUR = 1.9;
+const DIGESTION_TO_WASTE_PER_HOUR = 18;
+const FEED_BLOCK_SATIETY = 92;
+
+function getDigestionLoad(value: number | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0;
+  return clampMetric(value);
+}
+
+function withPetStatus(pet: CompletedPet, fallbackNow: number): CompletedPet {
+  return {
+    ...pet,
+    health: getPetMetric(pet, 'health'),
+    satiety: getPetMetric(pet, 'satiety'),
+    mood: getPetMetric(pet, 'mood'),
+    hygiene: getPetMetric(pet, 'hygiene'),
+    wasteLevel: getPetMetric(pet, 'wasteLevel'),
+    digestionLoad: getDigestionLoad(pet.digestionLoad),
+    statusUpdatedAt: pet.statusUpdatedAt ?? fallbackNow,
+  };
+}
+
+function getHealthTarget(satiety: number, mood: number, hygiene: number, wasteLevel: number) {
+  const cleanlinessScore = clampMetric(hygiene - Math.max(0, wasteLevel - 45) * 0.72);
+  return clampMetric(satiety * 0.34 + mood * 0.31 + cleanlinessScore * 0.35);
+}
+
+function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
+  const normalized = withPetStatus(pet, now);
+  const elapsedHours = Math.max(0, (now - (normalized.statusUpdatedAt ?? now)) / 3_600_000);
+
+  if (elapsedHours < 1 / 120) return normalized;
+
+  const satiety = roundMetric(normalized.satiety! - elapsedHours * 5.4);
+  const moodLoss = elapsedHours * (2 + (satiety < 35 ? 1.25 : 0));
+  const mood = roundMetric(normalized.mood! - moodLoss);
+  const hygiene = roundMetric(normalized.hygiene! - elapsedHours * 3.7);
+  const digestionConverted = Math.min(
+    normalized.digestionLoad!,
+    elapsedHours * DIGESTION_TO_WASTE_PER_HOUR,
+  );
+  const digestionLoad = roundMetric(normalized.digestionLoad! - digestionConverted);
+  const wasteLevel = roundMetric(
+    normalized.wasteLevel! + elapsedHours * BASE_WASTE_GAIN_PER_HOUR + digestionConverted,
+  );
+
+  let health = normalized.health!;
+  const targetHealth = getHealthTarget(satiety, mood, hygiene, wasteLevel);
+  health = roundMetric(health + (targetHealth - health) * Math.min(0.9, elapsedHours * 0.34));
+
+  if (satiety < 24) {
+    health = roundMetric(health - elapsedHours * 1.35);
+  }
+  if (wasteLevel > 74) {
+    health = roundMetric(health - elapsedHours * 1.2);
+  }
+
+  return {
+    ...normalized,
+    satiety,
+    mood,
+    hygiene,
+    wasteLevel,
+    digestionLoad,
+    health,
+    statusUpdatedAt: now,
+  };
+}
+
+function applyPetCareAction(pet: CompletedPet, action: PetCareAction, now: number): CompletedPet {
+  const base = applyPetPassiveStatus(pet, now);
+  let satiety = base.satiety!;
+  let mood = base.mood!;
+  let hygiene = base.hygiene!;
+  let wasteLevel = base.wasteLevel!;
+  let digestionLoad = base.digestionLoad!;
+  let health = base.health!;
+
+  if (action === 'feed') {
+    satiety = roundMetric(satiety + 14);
+    mood = roundMetric(mood + 4);
+    hygiene = roundMetric(hygiene - 1.2);
+    digestionLoad = roundMetric(digestionLoad + 10);
+    wasteLevel = roundMetric(wasteLevel + 1.1);
+    health = roundMetric(health + 2);
+  }
+
+  if (action === 'cheer') {
+    satiety = roundMetric(satiety + 1.2);
+    mood = roundMetric(mood + 11);
+    hygiene = roundMetric(hygiene - 0.8);
+    wasteLevel = roundMetric(wasteLevel + 0.25);
+    health = roundMetric(health + 1.6);
+  }
+
+  if (action === 'clean') {
+    hygiene = roundMetric(hygiene + 36);
+    wasteLevel = roundMetric(wasteLevel - 78);
+    mood = roundMetric(mood + 4.5);
+    health = roundMetric(health + 2.2);
+  }
+
+  const targetHealth = getHealthTarget(satiety, mood, hygiene, wasteLevel);
+  health = roundMetric(health + (targetHealth - health) * 0.28);
+
+  return {
+    ...base,
+    satiety,
+    mood,
+    hygiene,
+    wasteLevel,
+    digestionLoad,
+    health,
+    statusUpdatedAt: now,
+  };
 }
 
 const createAllocation = (type: ActivityType, hours: number, offset = 0): Allocation => ({
@@ -829,6 +966,13 @@ export const useStore = create<AppState>()(
           jumpDelay: -Math.random() * 3, // Negative delay to start mid-animation
           moveDelay: -Math.random() * 12,
           floatDelay: -Math.random() * 10,
+          health: roundMetric(PET_STATUS_DEFAULTS.health + (Math.random() - 0.5) * 8),
+          satiety: roundMetric(PET_STATUS_DEFAULTS.satiety + (Math.random() - 0.5) * 10),
+          mood: roundMetric(PET_STATUS_DEFAULTS.mood + (Math.random() - 0.5) * 12),
+          hygiene: roundMetric(PET_STATUS_DEFAULTS.hygiene + (Math.random() - 0.5) * 10),
+          wasteLevel: roundMetric(PET_STATUS_DEFAULTS.wasteLevel + (Math.random() - 0.5) * 8),
+          digestionLoad: roundMetric(Math.random() * 8),
+          statusUpdatedAt: Date.now(),
         };
         
         const updates: Partial<AppState> = {
@@ -854,9 +998,10 @@ export const useStore = create<AppState>()(
       customPets: [],
       syncPetData: () => {
         const state = get();
+        const now = Date.now();
         let changed = false;
         const updatedPets = state.completedPets.map(pet => {
-          const patchedPet = {
+          const patchedBase = {
             ...pet,
             quality: pet.quality ?? 'common',
             x: pet.x ?? Math.random() * 80 + 10,
@@ -867,6 +1012,7 @@ export const useStore = create<AppState>()(
             moveDelay: pet.moveDelay ?? -Math.random() * 12,
             floatDelay: pet.floatDelay ?? -Math.random() * 10,
           };
+          const patchedPet = applyPetPassiveStatus(patchedBase, now);
           const hasPatched =
             patchedPet.quality !== pet.quality ||
             patchedPet.x !== pet.x ||
@@ -875,7 +1021,14 @@ export const useStore = create<AppState>()(
             patchedPet.scale !== pet.scale ||
             patchedPet.jumpDelay !== pet.jumpDelay ||
             patchedPet.moveDelay !== pet.moveDelay ||
-            patchedPet.floatDelay !== pet.floatDelay;
+            patchedPet.floatDelay !== pet.floatDelay ||
+            patchedPet.health !== pet.health ||
+            patchedPet.satiety !== pet.satiety ||
+            patchedPet.mood !== pet.mood ||
+            patchedPet.hygiene !== pet.hygiene ||
+            patchedPet.wasteLevel !== pet.wasteLevel ||
+            patchedPet.digestionLoad !== pet.digestionLoad ||
+            patchedPet.statusUpdatedAt !== pet.statusUpdatedAt;
 
           if (hasPatched) {
             changed = true;
@@ -886,6 +1039,113 @@ export const useStore = create<AppState>()(
         if (changed) {
           set({ completedPets: updatedPets });
         }
+      },
+      feedCompletedPet: (instanceId) => {
+        const state = get();
+        const now = Date.now();
+        let changed = false;
+        let found = false;
+        let fed = false;
+
+        const nextPets = state.completedPets.map((pet) => {
+          const passivePet = applyPetPassiveStatus(pet, now);
+          let nextPet = passivePet;
+
+          if (pet.instanceId === instanceId) {
+            found = true;
+            if ((passivePet.satiety ?? 0) < FEED_BLOCK_SATIETY) {
+              nextPet = applyPetCareAction(passivePet, 'feed', now);
+              fed = true;
+            }
+          }
+
+          if (
+            nextPet.health !== pet.health ||
+            nextPet.satiety !== pet.satiety ||
+            nextPet.mood !== pet.mood ||
+            nextPet.hygiene !== pet.hygiene ||
+            nextPet.wasteLevel !== pet.wasteLevel ||
+            nextPet.digestionLoad !== pet.digestionLoad ||
+            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
+          ) {
+            changed = true;
+          }
+          return nextPet;
+        });
+
+        if (!found) return false;
+        if (changed) set({completedPets: nextPets});
+        return fed;
+      },
+      cheerCompletedPet: (instanceId) => {
+        const state = get();
+        const now = Date.now();
+        let changed = false;
+        let found = false;
+
+        const nextPets = state.completedPets.map((pet) => {
+          const passivePet = applyPetPassiveStatus(pet, now);
+          let nextPet = passivePet;
+
+          if (pet.instanceId === instanceId) {
+            found = true;
+            nextPet = applyPetCareAction(passivePet, 'cheer', now);
+          }
+
+          if (
+            nextPet.health !== pet.health ||
+            nextPet.satiety !== pet.satiety ||
+            nextPet.mood !== pet.mood ||
+            nextPet.hygiene !== pet.hygiene ||
+            nextPet.wasteLevel !== pet.wasteLevel ||
+            nextPet.digestionLoad !== pet.digestionLoad ||
+            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
+          ) {
+            changed = true;
+          }
+          return nextPet;
+        });
+
+        if (!found) return false;
+        if (changed) set({completedPets: nextPets});
+        return true;
+      },
+      cleanSceneWaste: (theme) => {
+        const normalizedTheme = theme === 'C' ? 'A' : theme;
+        const state = get();
+        const now = Date.now();
+        let changed = false;
+        let cleanedCount = 0;
+
+        const nextPets = state.completedPets.map((pet) => {
+          const passivePet = applyPetPassiveStatus(pet, now);
+          let nextPet = passivePet;
+
+          if (
+            passivePet.theme === normalizedTheme
+            && (passivePet.wasteLevel ?? 0) > 6
+          ) {
+            cleanedCount += 1;
+            nextPet = applyPetCareAction(passivePet, 'clean', now);
+          }
+
+          if (
+            nextPet.health !== pet.health ||
+            nextPet.satiety !== pet.satiety ||
+            nextPet.mood !== pet.mood ||
+            nextPet.hygiene !== pet.hygiene ||
+            nextPet.wasteLevel !== pet.wasteLevel ||
+            nextPet.digestionLoad !== pet.digestionLoad ||
+            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
+          ) {
+            changed = true;
+          }
+
+          return nextPet;
+        });
+
+        if (changed) set({completedPets: nextPets});
+        return cleanedCount;
       },
       updatePetPosition: (instanceId, x, y) => {
         get().updatePetPositionsBatch([{instanceId, x, y}]);
@@ -1003,11 +1263,18 @@ export const useStore = create<AppState>()(
               quality: typedPersistedState.currentEgg.quality ?? null,
             }
           : currentState.currentEgg;
+        const now = Date.now();
         const completedPets =
-          typedPersistedState?.completedPets?.map((pet) => ({
-            ...pet,
-            quality: pet.quality ?? 'common',
-          })) ?? currentState.completedPets;
+          typedPersistedState?.completedPets?.map((pet) =>
+            applyPetPassiveStatus(
+              {
+                ...pet,
+                quality: pet.quality ?? 'common',
+                statusUpdatedAt: pet.statusUpdatedAt ?? now,
+              },
+              now,
+            ),
+          ) ?? currentState.completedPets;
 
         return {
           ...currentState,

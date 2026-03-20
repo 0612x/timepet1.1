@@ -1,6 +1,11 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {Archive, Cloud, Lock, MoonStar, Palette, Sparkles, Sun, Sunset, Waves, X} from 'lucide-react';
-import {PetScene} from '../components/PetScene';
+import {
+  PetScene,
+  type SceneFeedDrop,
+  type ScenePetActionRequest,
+  type ScenePetFeedMoveRequest,
+} from '../components/PetScene';
 import {PetBoardSheet} from '../components/PetBoardSheet';
 import {SpriteActor} from '../components/SpriteActor';
 import {cn} from '../utils/cn';
@@ -8,6 +13,13 @@ import {useStore, type CompletedPet} from '../store/useStore';
 import {PETS, type ThemeType} from '../data/pets';
 import {getPetSpriteOptionByKey, hasPetSpriteAction, isPetSpriteKey, type PetSpriteAction} from '../data/petSprites';
 import {formatZhDate, getSimulatedDate} from '../utils/date';
+import {SCENE_BOTTOM_MAX, SCENE_BOTTOM_MIN, SCENE_X_MAX, SCENE_X_MIN} from '../constants/sceneBounds';
+import {
+  getHealthLabel,
+  getMoodLabel,
+  getPetMetric,
+  getSatietyLabel,
+} from '../utils/petStatus';
 
 const SCENE_TABS: Array<{theme: ThemeType; label: string; locked?: boolean}> = [
   {theme: 'A', label: '农场'},
@@ -15,23 +27,26 @@ const SCENE_TABS: Array<{theme: ThemeType; label: string; locked?: boolean}> = [
   {theme: 'custom', label: '手绘'},
 ];
 
-type FarmSkyPhase = 'day' | 'dusk' | 'night';
+type FarmSkyPhase = 'day' | 'noon' | 'dusk' | 'night';
 
 const FARM_BACKGROUND_PATHS: Record<FarmSkyPhase, string> = {
   day: '/images/scenes/farm/farm_day.png',
+  noon: '/images/scenes/farm/farm_noon.png',
   dusk: '/images/scenes/farm/farm_dusk.png',
   night: '/images/scenes/farm/farm_night.png',
 };
 
 const getFarmSkyPhase = (hour: number): FarmSkyPhase => {
-  if (hour >= 17 && hour < 19) return 'dusk';
-  if (hour >= 6 && hour < 17) return 'day';
+  if (hour >= 16 && hour < 19) return 'dusk';
+  if (hour >= 11 && hour < 16) return 'noon';
+  if (hour >= 6 && hour < 11) return 'day';
   return 'night';
 };
 
-const FARM_SKY_TEST_ORDER: Array<FarmSkyPhase | null> = [null, 'day', 'dusk', 'night'];
+const FARM_SKY_TEST_ORDER: Array<FarmSkyPhase | null> = [null, 'day', 'noon', 'dusk', 'night'];
 const FARM_SKY_PHASE_LABELS: Record<FarmSkyPhase, string> = {
   day: '白天',
+  noon: '正午',
   dusk: '傍晚',
   night: '夜晚',
 };
@@ -55,14 +70,28 @@ const STATE_TONE: Record<CompletedPet['state'], string> = {
   heal: 'border-emerald-200 bg-emerald-100 text-emerald-700',
   active: 'border-amber-200 bg-amber-100 text-amber-700',
 };
-const ACTION_LABELS: Record<PetSpriteAction, string> = {
-  idle: '待机',
-  move: '移动',
-  feed: '喂食',
-  happy: '开心',
-};
 const CARD_TRANSITION_MS = 180;
+const FARM_SCENE_TRANSITION_MS = 420;
 const SCENE_DEBUG_HIT_AREAS = false;
+const FEED_DROP_TTL_MS = 20_000;
+const FEED_BLOCK_SATIETY = 92;
+const FEED_SCATTER_RADIUS = 18;
+const FEED_SCATTER_MAX_TARGETS = 6;
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+function getFarmSkyOverlayClass(phase: FarmSkyPhase) {
+  if (phase === 'night') {
+    return 'bg-[linear-gradient(180deg,rgba(2,6,23,0.18),rgba(2,6,23,0.34)_58%,rgba(2,6,23,0.18))]';
+  }
+  if (phase === 'noon') {
+    return 'bg-[linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.03)_60%,rgba(255,255,255,0.02))]';
+  }
+  if (phase === 'dusk') {
+    return 'bg-[linear-gradient(180deg,rgba(15,23,42,0.06),rgba(15,23,42,0.2)_60%,rgba(15,23,42,0.08))]';
+  }
+  return 'bg-[linear-gradient(180deg,rgba(255,255,255,0.04),rgba(255,255,255,0.1)_62%,rgba(255,255,255,0.02))]';
+}
 
 function resolveSceneCardAction(petId: string, state: CompletedPet['state']): PetSpriteAction {
   const preferredByState: Record<CompletedPet['state'], PetSpriteAction> = {
@@ -90,12 +119,23 @@ export function SceneView() {
     discardCompletedPet,
     clearScenePets,
     spawnAllScenePets,
+    feedCompletedPet,
+    cheerCompletedPet,
+    cleanSceneWaste,
   } = useStore();
   const [showPetBoard, setShowPetBoard] = useState(false);
   const [farmSkyPhaseOverride, setFarmSkyPhaseOverride] = useState<FarmSkyPhase | null>(null);
   const [selectedPetInstanceId, setSelectedPetInstanceId] = useState<string | null>(null);
   const [cardPetSnapshot, setCardPetSnapshot] = useState<CompletedPet | null>(null);
   const [cardVisible, setCardVisible] = useState(false);
+  const [farmOutgoingBackgroundPath, setFarmOutgoingBackgroundPath] = useState<string | null>(null);
+  const [farmOutgoingSkyPhase, setFarmOutgoingSkyPhase] = useState<FarmSkyPhase | null>(null);
+  const [sceneActionRequest, setSceneActionRequest] = useState<ScenePetActionRequest | null>(null);
+  const [sceneFeedMoveRequest, setSceneFeedMoveRequest] = useState<ScenePetFeedMoveRequest | null>(null);
+  const [sceneFeedDrops, setSceneFeedDrops] = useState<SceneFeedDrop[]>([]);
+  const [isScatterFeedMode, setIsScatterFeedMode] = useState(false);
+  const sceneFeedDropTimersRef = useRef<number[]>([]);
+  const feedingPetIdsRef = useRef(new Set<string>());
 
   const today = useMemo(
     () => formatZhDate(getSimulatedDate(simulatedDateOffset)),
@@ -106,6 +146,11 @@ export function SceneView() {
     [farmSkyPhaseOverride],
   );
   const farmBackgroundPath = FARM_BACKGROUND_PATHS[farmSkyPhase];
+  const farmVisualRef = useRef<{backgroundPath: string; skyPhase: FarmSkyPhase}>({
+    backgroundPath: farmBackgroundPath,
+    skyPhase: farmSkyPhase,
+  });
+  const farmVisualTimerRef = useRef<number | null>(null);
 
   const isOceanLocked = currentTheme === 'B';
   const effectiveTheme: ThemeType = currentTheme === 'C' ? 'A' : currentTheme;
@@ -200,6 +245,8 @@ export function SceneView() {
   const sceneTimeBadgeClass = effectiveTheme === 'A'
     ? farmSkyPhase === 'day'
       ? (isDarkBackdrop ? 'border-amber-200/30 bg-amber-200/18 text-amber-100' : 'border-amber-200 bg-amber-100 text-amber-700')
+      : farmSkyPhase === 'noon'
+        ? (isDarkBackdrop ? 'border-yellow-200/30 bg-yellow-200/18 text-yellow-100' : 'border-yellow-200 bg-yellow-100 text-yellow-700')
       : farmSkyPhase === 'dusk'
         ? (isDarkBackdrop ? 'border-orange-200/30 bg-orange-200/18 text-orange-100' : 'border-orange-200 bg-orange-100 text-orange-700')
         : (isDarkBackdrop ? 'border-indigo-200/35 bg-indigo-200/20 text-indigo-100' : 'border-indigo-200 bg-indigo-100 text-indigo-700')
@@ -209,6 +256,8 @@ export function SceneView() {
   const sceneTimeIcon = effectiveTheme === 'A'
     ? farmSkyPhase === 'day'
       ? <Sun size={11} />
+      : farmSkyPhase === 'noon'
+        ? <Sun size={11} />
       : farmSkyPhase === 'dusk'
         ? <Sunset size={11} />
         : <MoonStar size={11} />
@@ -226,6 +275,50 @@ export function SceneView() {
       setSelectedPetInstanceId(null);
     }
   }, [petsInTheme, selectedPetInstanceId]);
+  useEffect(() => {
+    const previousVisual = farmVisualRef.current;
+    const hasVisualChanged =
+      previousVisual.backgroundPath !== farmBackgroundPath
+      || previousVisual.skyPhase !== farmSkyPhase;
+    farmVisualRef.current = {
+      backgroundPath: farmBackgroundPath,
+      skyPhase: farmSkyPhase,
+    };
+
+    if (effectiveTheme !== 'A') {
+      if (farmVisualTimerRef.current !== null) {
+        window.clearTimeout(farmVisualTimerRef.current);
+        farmVisualTimerRef.current = null;
+      }
+      setFarmOutgoingBackgroundPath(null);
+      setFarmOutgoingSkyPhase(null);
+      return;
+    }
+
+    if (!hasVisualChanged) return;
+
+    if (farmVisualTimerRef.current !== null) {
+      window.clearTimeout(farmVisualTimerRef.current);
+    }
+
+    setFarmOutgoingBackgroundPath(previousVisual.backgroundPath);
+    setFarmOutgoingSkyPhase(previousVisual.skyPhase);
+    farmVisualTimerRef.current = window.setTimeout(() => {
+      setFarmOutgoingBackgroundPath(null);
+      setFarmOutgoingSkyPhase(null);
+      farmVisualTimerRef.current = null;
+    }, FARM_SCENE_TRANSITION_MS);
+  }, [effectiveTheme, farmBackgroundPath, farmSkyPhase]);
+  useEffect(() => {
+    return () => {
+      if (farmVisualTimerRef.current !== null) {
+        window.clearTimeout(farmVisualTimerRef.current);
+      }
+      sceneFeedDropTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      sceneFeedDropTimersRef.current = [];
+      feedingPetIdsRef.current.clear();
+    };
+  }, []);
   useEffect(() => {
     if (selectedPet && !isOceanLocked) {
       setCardPetSnapshot(selectedPet);
@@ -245,6 +338,129 @@ export function SceneView() {
   const selectedSpriteAction = cardPet
     ? resolveSceneCardAction(cardPet.petId, cardPet.state)
     : 'idle';
+  const cardHealth = cardPet ? getPetMetric(cardPet, 'health') : 0;
+  const cardSatiety = cardPet ? getPetMetric(cardPet, 'satiety') : 0;
+  const cardMood = cardPet ? getPetMetric(cardPet, 'mood') : 0;
+  const isSelectedPetFull = cardSatiety >= FEED_BLOCK_SATIETY;
+
+  const queueSceneAction = (instanceId: string, action: ScenePetActionRequest['action']) => {
+    setSceneActionRequest((previous) => ({
+      instanceId,
+      action,
+      nonce: (previous?.nonce ?? 0) + 1,
+    }));
+  };
+  const queueSceneFeedMoveRequest = (instanceId: string, drop: Pick<SceneFeedDrop, 'id' | 'x' | 'y'>) => {
+    setSceneFeedMoveRequest((previous) => ({
+      instanceId,
+      dropId: drop.id,
+      x: drop.x,
+      y: drop.y,
+      nonce: (previous?.nonce ?? 0) + 1,
+    }));
+  };
+
+  const handlePetSelect = (pet: CompletedPet) => {
+    setSelectedPetInstanceId(pet.instanceId);
+    cheerCompletedPet(pet.instanceId);
+    queueSceneAction(pet.instanceId, 'happy');
+  };
+
+  const spawnFeedDrop = (x: number, y: number, ttlMs = FEED_DROP_TTL_MS) => {
+    const dropId = `feed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const createdAt = Date.now();
+    const drop: SceneFeedDrop = {id: dropId, x, y, createdAt, ttlMs};
+
+    setSceneFeedDrops((previous) => ([
+      ...previous.filter((drop) => Date.now() - drop.createdAt < drop.ttlMs).slice(-8),
+      drop,
+    ]));
+    const removeFeedDropTimer = window.setTimeout(() => {
+      setSceneFeedDrops((previous) => previous.filter((drop) => drop.id !== dropId));
+      sceneFeedDropTimersRef.current = sceneFeedDropTimersRef.current.filter((timer) => timer !== removeFeedDropTimer);
+    }, ttlMs);
+    sceneFeedDropTimersRef.current.push(removeFeedDropTimer);
+    return drop;
+  };
+
+  const scheduleFeedForPet = (instanceId: string, drop: Pick<SceneFeedDrop, 'id' | 'x' | 'y'>, actionDelay: number) => {
+    if (feedingPetIdsRef.current.has(instanceId)) return false;
+    feedingPetIdsRef.current.add(instanceId);
+
+    const queueFeedMoveTimer = window.setTimeout(() => {
+      queueSceneFeedMoveRequest(instanceId, drop);
+      sceneFeedDropTimersRef.current = sceneFeedDropTimersRef.current.filter((timer) => timer !== queueFeedMoveTimer);
+    }, actionDelay);
+
+    sceneFeedDropTimersRef.current.push(queueFeedMoveTimer);
+    return true;
+  };
+
+  const handleFeedSelectedPet = () => {
+    if (!cardPet) return;
+    if (cardSatiety >= FEED_BLOCK_SATIETY) return;
+
+    const dropX = clamp(cardPet.x + (Math.random() - 0.5) * 5.5, SCENE_X_MIN + 1.5, SCENE_X_MAX - 1.5);
+    const dropY = clamp(cardPet.y + 5 + Math.random() * 2, SCENE_BOTTOM_MIN + 1.2, SCENE_BOTTOM_MAX + 2.5);
+    const drop = spawnFeedDrop(dropX, dropY);
+    scheduleFeedForPet(
+      cardPet.instanceId,
+      drop,
+      90 + Math.random() * 80,
+    );
+  };
+
+  const handleSceneScatterFeed = (point: {x: number; y: number}) => {
+    if (!isScatterFeedMode || effectiveTheme !== 'A') return;
+
+    const centerX = clamp(point.x, SCENE_X_MIN + 1.5, SCENE_X_MAX - 1.5);
+    const centerY = clamp(point.y, SCENE_BOTTOM_MIN + 1.2, SCENE_BOTTOM_MAX + 2.5);
+
+    const candidates = petsInTheme
+      .map((pet) => {
+        const dx = pet.x - centerX;
+        const dy = (pet.y - centerY) * 1.35;
+        const distance = Math.hypot(dx, dy);
+        return {pet, distance, satiety: getPetMetric(pet, 'satiety')};
+      })
+      .filter((item) => item.satiety < FEED_BLOCK_SATIETY)
+      .filter((item) => !feedingPetIdsRef.current.has(item.pet.instanceId))
+      .sort((left, right) => left.distance - right.distance);
+
+    const targetPool = (
+      candidates.filter((item) => item.distance <= FEED_SCATTER_RADIUS).length > 0
+        ? candidates.filter((item) => item.distance <= FEED_SCATTER_RADIUS)
+        : candidates
+    ).slice(0, FEED_SCATTER_MAX_TARGETS);
+
+    targetPool.forEach((item, index) => {
+      const drop = spawnFeedDrop(
+        clamp(centerX + (Math.random() - 0.5) * 3.6, SCENE_X_MIN + 1.5, SCENE_X_MAX - 1.5),
+        clamp(centerY + (Math.random() - 0.5) * 2.8, SCENE_BOTTOM_MIN + 1.2, SCENE_BOTTOM_MAX + 2.5),
+        1800 + index * 90,
+      );
+      scheduleFeedForPet(
+        item.pet.instanceId,
+        drop,
+        120 + index * 90 + Math.random() * 60,
+      );
+    });
+  };
+
+  useEffect(() => {
+    if (effectiveTheme === 'A') return;
+    setIsScatterFeedMode(false);
+  }, [effectiveTheme]);
+
+  const handlePetFeedArrived = ({instanceId, dropId}: {instanceId: string; dropId: string}) => {
+    feedCompletedPet(instanceId);
+    feedingPetIdsRef.current.delete(instanceId);
+    setSceneFeedDrops((previous) => previous.filter((drop) => drop.id !== dropId));
+  };
+
+  const handleCleanCurrentScene = () => {
+    cleanSceneWaste(effectiveTheme);
+  };
 
   return (
     <div
@@ -255,24 +471,34 @@ export function SceneView() {
       {effectiveTheme === 'A' && (
         <>
           <div
-            className="pointer-events-none absolute inset-0 z-0 bg-no-repeat"
-            style={{
-              backgroundImage: `url(${farmBackgroundPath})`,
-              backgroundSize: 'cover',
-              backgroundPosition: 'center bottom',
-              imageRendering: 'pixelated',
-            }}
-          />
-          <div
-            className={cn(
-              'pointer-events-none absolute inset-0 z-0',
-              farmSkyPhase === 'night'
-                ? 'bg-[linear-gradient(180deg,rgba(2,6,23,0.18),rgba(2,6,23,0.34)_58%,rgba(2,6,23,0.18))]'
-                : farmSkyPhase === 'dusk'
-                  ? 'bg-[linear-gradient(180deg,rgba(15,23,42,0.06),rgba(15,23,42,0.2)_60%,rgba(15,23,42,0.08))]'
-                  : 'bg-[linear-gradient(180deg,rgba(255,255,255,0.04),rgba(255,255,255,0.1)_62%,rgba(255,255,255,0.02))]',
+            className="pointer-events-none absolute inset-0 z-0 overflow-hidden">
+            <div
+              className="absolute inset-0 bg-no-repeat"
+              style={{
+                backgroundImage: `url(${farmBackgroundPath})`,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center bottom',
+                imageRendering: 'pixelated',
+              }}
+            />
+            {farmOutgoingBackgroundPath && (
+              <div
+                className="scene-fade-out absolute inset-0 bg-no-repeat"
+                style={{
+                  backgroundImage: `url(${farmOutgoingBackgroundPath})`,
+                  backgroundSize: 'cover',
+                  backgroundPosition: 'center bottom',
+                  imageRendering: 'pixelated',
+                }}
+              />
             )}
-          />
+          </div>
+          <div className="pointer-events-none absolute inset-0 z-0 overflow-hidden">
+            <div className={cn('absolute inset-0 transition-colors duration-300', getFarmSkyOverlayClass(farmSkyPhase))} />
+            {farmOutgoingSkyPhase && (
+              <div className={cn('scene-fade-out absolute inset-0', getFarmSkyOverlayClass(farmOutgoingSkyPhase))} />
+            )}
+          </div>
         </>
       )}
 
@@ -281,7 +507,7 @@ export function SceneView() {
           <div className="flex max-w-full items-center gap-1.5">
             <div
               className={cn(
-                'inline-flex h-7 shrink-0 items-center gap-2 rounded-full px-3 text-[10px] font-semibold leading-none',
+                'inline-flex h-7 shrink-0 items-center gap-2 rounded-full px-3 text-[10px] font-semibold leading-none transition-colors duration-300',
                 sceneTimeBadgeClass,
               )}>
               {sceneTimeIcon}
@@ -373,6 +599,30 @@ export function SceneView() {
               一键全宠
             </button>
             <button
+              onClick={() => setIsScatterFeedMode((previous) => !previous)}
+              className={cn(
+                'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
+                isScatterFeedMode
+                  ? (isDarkBackdrop
+                    ? 'border-amber-200/45 bg-amber-300/20 text-amber-100 hover:bg-amber-300/24'
+                    : 'border-amber-200 bg-amber-100 text-amber-700 hover:bg-amber-200')
+                  : (isDarkBackdrop
+                    ? 'border-white/18 bg-black/28 text-white hover:bg-black/34'
+                    : 'border-slate-200 bg-white/90 text-slate-700 hover:bg-white'),
+              )}>
+              撒饲料：{isScatterFeedMode ? '开' : '关'}
+            </button>
+            <button
+              onClick={handleCleanCurrentScene}
+              className={cn(
+                'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
+                isDarkBackdrop
+                  ? 'border-emerald-200/30 bg-emerald-300/10 text-emerald-100 hover:bg-emerald-300/15'
+                  : 'border-emerald-200 bg-emerald-50 text-emerald-600 hover:bg-emerald-100',
+              )}>
+              清理便便
+            </button>
+            <button
               onClick={clearScenePets}
               className={cn(
                 'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
@@ -415,8 +665,17 @@ export function SceneView() {
         ) : (
           <div className="absolute -left-[7%] -right-[7%] -top-[15%] -bottom-[25%]">
             <PetScene
-              onPetSelect={(pet) => setSelectedPetInstanceId(pet.instanceId)}
-              onSceneBlankClick={() => setSelectedPetInstanceId(null)}
+              onPetSelect={handlePetSelect}
+              onSceneBlankClick={() => {
+                if (!isScatterFeedMode) {
+                  setSelectedPetInstanceId(null);
+                }
+              }}
+              onSceneBlankPointer={handleSceneScatterFeed}
+              actionRequest={sceneActionRequest}
+              feedMoveRequest={sceneFeedMoveRequest}
+              onPetFeedArrived={handlePetFeedArrived}
+              feedDrops={sceneFeedDrops}
               debugHitArea={SCENE_DEBUG_HIT_AREAS}
             />
           </div>
@@ -427,12 +686,12 @@ export function SceneView() {
         <div className="pointer-events-none absolute inset-x-0 bottom-24 z-[5000] flex justify-end px-3">
           <section
             className={cn(
-              'pointer-events-auto relative w-[214px] rounded-2xl border p-2.5 backdrop-blur-md',
+              'pointer-events-auto relative w-[192px] rounded-xl border p-2 backdrop-blur-[2px]',
               'transform-gpu transition-all duration-150 ease-out',
               cardVisible ? 'translate-y-0 scale-100 opacity-100' : 'translate-y-2 scale-[0.985] opacity-0',
               isDarkBackdrop
-                ? 'border-white/14 bg-black/30 text-white shadow-[0_8px_20px_rgba(2,6,23,0.28)]'
-                : 'border-slate-200/75 bg-white/78 text-slate-700 shadow-[0_8px_18px_rgba(15,23,42,0.14)]',
+                ? 'border-white/12 bg-black/24 text-white shadow-[0_6px_16px_rgba(2,6,23,0.24)]'
+                : 'border-slate-200/75 bg-white/82 text-slate-700 shadow-[0_6px_14px_rgba(15,23,42,0.12)]',
             )}>
             <div className="flex items-start justify-between gap-2 pr-1">
               <div className="min-w-0 pr-8">
@@ -466,7 +725,7 @@ export function SceneView() {
 
             <div
               className={cn(
-                'mt-2 flex h-[72px] items-center justify-center rounded-xl border',
+                'mt-1.5 flex h-[64px] items-center justify-center rounded-lg border',
                 isDarkBackdrop
                   ? 'border-white/10 bg-white/[0.05]'
                   : 'border-slate-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.92),rgba(238,242,255,0.76))]',
@@ -477,17 +736,17 @@ export function SceneView() {
                   action={selectedSpriteAction}
                   scale={Math.min(selectedSpriteOption.sceneScale ?? 2.2, 2.35)}
                   flipX={selectedSpriteOption.flipX}
-                  ariaLabel={selectedDisplayName}
-                  className="drop-shadow-[0_8px_18px_rgba(15,23,42,0.24)]"
-                />
-              ) : selectedCustomPet ? (
-                <img
-                  src={selectedCustomPet.image}
-                  alt={selectedCustomPet.name}
-                  className="h-16 w-16 object-contain drop-shadow-[0_8px_16px_rgba(15,23,42,0.2)]"
-                />
-              ) : selectedLegacyPet ? (
-                <span className="text-4xl drop-shadow-[0_8px_16px_rgba(15,23,42,0.16)]">
+                    ariaLabel={selectedDisplayName}
+                    className="drop-shadow-[0_8px_18px_rgba(15,23,42,0.24)]"
+                  />
+                ) : selectedCustomPet ? (
+                  <img
+                    src={selectedCustomPet.image}
+                    alt={selectedCustomPet.name}
+                    className="h-14 w-14 object-contain drop-shadow-[0_8px_16px_rgba(15,23,42,0.2)]"
+                  />
+                ) : selectedLegacyPet ? (
+                <span className="text-3xl drop-shadow-[0_8px_16px_rgba(15,23,42,0.16)]">
                   {cardPet.state === 'focus'
                     ? selectedLegacyPet.focus
                     : cardPet.state === 'heal'
@@ -503,10 +762,10 @@ export function SceneView() {
               )}
             </div>
 
-            <div className="mt-2 grid grid-cols-3 gap-1.5">
+            <div className="mt-1.5 grid grid-cols-2 gap-1">
               <div
                 className={cn(
-                  'rounded-lg border px-1.5 py-1 text-center',
+                  'rounded-lg border px-1.5 py-0.5 text-center',
                   isDarkBackdrop ? 'border-white/15 bg-white/[0.05]' : 'border-slate-200 bg-white/85',
                 )}>
                 <p className={cn('text-[9px] font-semibold', isDarkBackdrop ? 'text-white/55' : 'text-slate-400')}>品质</p>
@@ -514,25 +773,15 @@ export function SceneView() {
                   {QUALITY_LABELS[cardPet.quality]}
                 </p>
               </div>
-              <div className={cn('rounded-lg border px-1.5 py-1 text-center', STATE_TONE[cardPet.state])}>
+              <div className={cn('rounded-lg border px-1.5 py-0.5 text-center', STATE_TONE[cardPet.state])}>
                 <p className="text-[9px] font-semibold opacity-70">状态</p>
                 <p className="text-[10px] font-black">{STATE_LABELS[cardPet.state]}</p>
-              </div>
-              <div
-                className={cn(
-                  'rounded-lg border px-1.5 py-1 text-center',
-                  isDarkBackdrop ? 'border-white/15 bg-white/[0.05]' : 'border-slate-200 bg-white/85',
-                )}>
-                <p className={cn('text-[9px] font-semibold', isDarkBackdrop ? 'text-white/55' : 'text-slate-400')}>场景</p>
-                <p className={cn('text-[10px] font-black', isDarkBackdrop ? 'text-white' : 'text-slate-700')}>
-                  {currentThemeLabel}
-                </p>
               </div>
             </div>
 
             <div
               className={cn(
-                'mt-2 space-y-1 rounded-lg border px-2 py-1.5 text-[10px]',
+                'mt-1.5 space-y-1 rounded-lg border px-2 py-1.5 text-[10px]',
                 isDarkBackdrop
                   ? 'border-white/15 bg-white/[0.05] text-white/85'
                   : 'border-slate-200 bg-white/85 text-slate-600',
@@ -541,16 +790,81 @@ export function SceneView() {
                 <span className={cn('font-semibold', isDarkBackdrop ? 'text-white/60' : 'text-slate-400')}>品种</span>
                 <span className="truncate font-bold">{selectedSpeciesName}</span>
               </div>
-              <div className="flex items-center justify-between gap-2">
-                <span className={cn('font-semibold', isDarkBackdrop ? 'text-white/60' : 'text-slate-400')}>动作</span>
-                <span className="font-bold">{ACTION_LABELS[selectedSpriteAction]}</span>
+              <div className="space-y-1.5 pt-0.5">
+                {[
+                  {
+                    label: '健康',
+                    value: cardHealth,
+                    tip: getHealthLabel(cardHealth),
+                    tone: isDarkBackdrop ? 'bg-emerald-300' : 'bg-emerald-500',
+                  },
+                  {
+                    label: '饱腹',
+                    value: cardSatiety,
+                    tip: getSatietyLabel(cardSatiety),
+                    tone: isDarkBackdrop ? 'bg-amber-300' : 'bg-amber-500',
+                  },
+                  {
+                    label: '心情',
+                    value: cardMood,
+                    tip: getMoodLabel(cardMood),
+                    tone: isDarkBackdrop ? 'bg-violet-300' : 'bg-violet-500',
+                  },
+                ].map((metric) => {
+                  const value = Math.max(0, Math.min(100, Math.round(metric.value)));
+                  return (
+                    <div key={metric.label} className="space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className={cn('text-[9px] font-semibold', isDarkBackdrop ? 'text-white/65' : 'text-slate-500')}>
+                          {metric.label} · {metric.tip}
+                        </span>
+                        <span className={cn('text-[9px] font-black tabular-nums', isDarkBackdrop ? 'text-white/90' : 'text-slate-700')}>
+                          {value}
+                        </span>
+                      </div>
+                      <div className={cn('h-1.5 overflow-hidden rounded-full', isDarkBackdrop ? 'bg-white/15' : 'bg-slate-200')}>
+                        <div
+                          className={cn('h-full rounded-full transition-[width] duration-300', metric.tone)}
+                          style={{width: `${value}%`}}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-              <div className="flex items-center justify-between gap-2">
-                <span className={cn('font-semibold', isDarkBackdrop ? 'text-white/60' : 'text-slate-400')}>坐标</span>
-                <span className="font-bold tabular-nums">
-                  {Math.round(cardPet.x)}%, {Math.round(cardPet.y)}%
-                </span>
-              </div>
+            </div>
+            <div className="mt-1.5 grid grid-cols-2 gap-1">
+              <button
+                type="button"
+                disabled={isSelectedPetFull}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={handleFeedSelectedPet}
+                className={cn(
+                  'inline-flex h-7 items-center justify-center rounded-lg border text-[10px] font-black transition-all active:scale-[0.98]',
+                  isSelectedPetFull &&
+                    (isDarkBackdrop
+                      ? 'cursor-not-allowed border-white/12 bg-white/8 text-white/45 active:scale-100'
+                      : 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 active:scale-100'),
+                  !isSelectedPetFull && isDarkBackdrop
+                    ? 'border-amber-200/35 bg-amber-200/15 text-amber-100 hover:bg-amber-200/20'
+                    : !isSelectedPetFull
+                      ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
+                      : '',
+                )}>
+                {isSelectedPetFull ? '已饱' : '喂食'}
+              </button>
+              <button
+                type="button"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={handleCleanCurrentScene}
+                className={cn(
+                  'inline-flex h-7 items-center justify-center rounded-lg border text-[10px] font-black transition-all active:scale-[0.98]',
+                  isDarkBackdrop
+                    ? 'border-emerald-200/35 bg-emerald-200/15 text-emerald-100 hover:bg-emerald-200/20'
+                    : 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100',
+                )}>
+                清理
+              </button>
             </div>
           </section>
         </div>

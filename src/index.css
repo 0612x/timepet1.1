@@ -174,3 +174,16 @@ body {
     0 0 0 7px var(--slider-shadow, rgba(99, 102, 241, 0.24)),
     0 10px 24px var(--slider-shadow, rgba(99, 102, 241, 0.24));
 }
+
+@keyframes scene-fade-out {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.scene-fade-out {
+  animation: scene-fade-out 420ms ease-out forwards;
+}

@@ -38,15 +38,47 @@ interface SpritePetInstanceProps {
   mini: boolean;
   onMove: (id: string, x: number, y: number) => void;
   onSelect?: (pet: CompletedPet) => void;
+  actionRequest?: ScenePetActionRequest | null;
+  feedMoveRequest?: ScenePetFeedMoveRequest | null;
+  onFeedArrived?: (payload: {instanceId: string; dropId: string}) => void;
+  onFeedChaseFailed?: (payload: {instanceId: string; dropId: string}) => void;
   debugHitArea?: boolean;
   sceneSize: {width: number; height: number};
   sceneSpritePetsRef: React.MutableRefObject<SceneSpritePetLite[]>;
+}
+
+export interface ScenePetActionRequest {
+  instanceId: string;
+  action: 'happy' | 'feed';
+  nonce: number;
+}
+
+export interface SceneFeedDrop {
+  id: string;
+  x: number;
+  y: number;
+  createdAt: number;
+  ttlMs: number;
+}
+
+export interface ScenePetFeedMoveRequest {
+  instanceId: string;
+  dropId: string;
+  x: number;
+  y: number;
+  nonce: number;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const SPRITE_ACTIONS: PetSpriteAction[] = ['idle', 'move', 'feed', 'happy'];
 const getLayerZIndex = (y: number) => 100 + Math.round(y * 10);
 const SHOW_SCENE_MOVE_BOUNDS = false;
+const SCENE_POOP_ICON_PATHS = [
+  '/images/pets/farm/farm_poop.png',
+  '/images/pets/farm/poop.png',
+  '/images/pets/farm/farm_waste.png',
+] as const;
+const WASTE_VISIBLE_THRESHOLD = 28;
 const SPECIES_SIZE_FACTOR: Record<string, number> = {
   farm_frog: 0.74,
   farm_littlefox: 0.62,
@@ -118,6 +150,72 @@ const hashToUnit = (input: string) => {
   return (hash >>> 0) / 4294967295;
 };
 
+const WasteIcon: React.FC<{mini?: boolean}> = ({mini = false}) => {
+  const [imageError, setImageError] = useState(false);
+  const [iconPathIndex, setIconPathIndex] = useState(0);
+
+  const size = mini ? 10 : 14;
+  const iconPath = SCENE_POOP_ICON_PATHS[iconPathIndex];
+
+  return (
+    <div className="pointer-events-none">
+      {!imageError && iconPath ? (
+        <img
+          src={iconPath}
+          alt="waste"
+          width={size}
+          height={size}
+          onError={() => {
+            if (iconPathIndex < SCENE_POOP_ICON_PATHS.length - 1) {
+              setIconPathIndex((previous) => previous + 1);
+              return;
+            }
+            setImageError(true);
+          }}
+          className="block opacity-90 [image-rendering:pixelated]"
+        />
+      ) : (
+        <span className="text-[12px] leading-none opacity-90">💩</span>
+      )}
+    </div>
+  );
+};
+
+function getPetWasteDropPosition(
+  pet: CompletedPet,
+  mini: boolean,
+  sceneSize: {width: number; height: number},
+) {
+  const jitterX = (hashToUnit(`${pet.instanceId}:waste:x`) - 0.5) * (mini ? 1.2 : 1.8);
+  const jitterY = (hashToUnit(`${pet.instanceId}:waste:y`) - 0.5) * (mini ? 0.7 : 1.1);
+
+  if (isPetSpriteKey(pet.petId)) {
+    const idleConfig = getPetSpriteConfigByKey(pet.petId, 'idle')
+      ?? getPetSpriteConfigByKey(pet.petId, 'move');
+    const frameWidth = idleConfig?.frameWidth ?? 32;
+    const frameHeight = idleConfig?.frameHeight ?? 32;
+    const speciesSizeFactor = SPECIES_SIZE_FACTOR[pet.petId] ?? 1;
+    const targetVisualHeight = (mini ? 46 : 72) * speciesSizeFactor;
+    const normalizedScale = targetVisualHeight / frameHeight;
+    const scale = normalizedScale * (mini ? 1 : 1.02);
+    const visualScale = mini ? 0.92 : 1.06;
+    const spriteWidthPx = frameWidth * scale * visualScale;
+    const spriteHeightPx = frameHeight * scale * visualScale;
+    const widthPercent = sceneSize.width > 0 ? (spriteWidthPx / sceneSize.width) * 100 : (mini ? 8 : 10);
+    const heightPercent = sceneSize.height > 0 ? (spriteHeightPx / sceneSize.height) * 100 : (mini ? 10 : 13);
+
+    return {
+      x: clamp(pet.x + widthPercent * 0.5 + jitterX, SCENE_X_MIN, SCENE_X_MAX),
+      y: clamp(pet.y + heightPercent + jitterY, SCENE_BOTTOM_MIN, SCENE_BOTTOM_MAX + 6),
+    };
+  }
+
+  return {
+    x: clamp(pet.x + (mini ? 2.2 : 2.8) + jitterX, SCENE_X_MIN, SCENE_X_MAX),
+    y: clamp(pet.y + (mini ? 4.8 : 6.2) + jitterY, SCENE_BOTTOM_MIN, SCENE_BOTTOM_MAX + 6),
+  };
+}
+
 const BasicPetInstance: React.FC<BasicPetInstanceProps> = ({pet, mini, theme, onSelect, children}) => {
   const getAnimationClass = (variant: number, currentTheme: ThemeType) => {
     if (currentTheme === 'custom') return 'animate-float';
@@ -154,6 +252,10 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   mini,
   onMove,
   onSelect,
+  actionRequest,
+  feedMoveRequest,
+  onFeedArrived,
+  onFeedChaseFailed,
   debugHitArea = false,
   sceneSize,
   sceneSpritePetsRef,
@@ -174,6 +276,17 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   const faceRightRef = useRef(true);
   const moveCooldownRef = useRef(0);
   const blockedStreakRef = useRef(0);
+  const forcedActionUntilRef = useRef(0);
+  const forcedActionNonceRef = useRef(-1);
+  const feedMoveNonceRef = useRef(-1);
+  const feedMoveTargetRef = useRef<{x: number; y: number; dropId: string} | null>(null);
+  const feedCommitTimerRef = useRef<number | null>(null);
+  const feedStuckAttemptsRef = useRef(0);
+  const onFeedArrivedRef = useRef(onFeedArrived);
+  const onFeedChaseFailedRef = useRef(onFeedChaseFailed);
+  const forcedIdleTimerRef = useRef<number | null>(null);
+  const movingUntilRef = useRef(0);
+  const queuedActionIntentRef = useRef<'happy' | 'feed' | null>(null);
   const directionRef = useRef<{x: -1 | 1; y: -1 | 1}>({
     x: Math.random() > 0.5 ? 1 : -1,
     y: Math.random() > 0.5 ? 1 : -1,
@@ -306,6 +419,61 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   const [action, setAction] = useState<PetSpriteAction>(defaultAction);
   const actionRef = useRef<PetSpriteAction>(defaultAction);
 
+  const playForcedAction = (requestedAction: PetSpriteAction) => {
+    if (forcedIdleTimerRef.current !== null) {
+      window.clearTimeout(forcedIdleTimerRef.current);
+      forcedIdleTimerRef.current = null;
+    }
+
+    actionRef.current = requestedAction;
+    setAction(requestedAction);
+    setActionSeed((previous) => previous + 1);
+
+    const actionConfig = getPetSpriteConfigByKey(pet.petId, requestedAction);
+    const frameCount = actionConfig?.frameCount ?? 4;
+    const fps = actionConfig?.fps ?? 4;
+    const holdMs = requestedAction === 'idle'
+      ? 460
+      : clamp(Math.round((frameCount / Math.max(1, fps)) * 1000 + 220), 520, 1700);
+    forcedActionUntilRef.current = Date.now() + holdMs;
+
+    if (requestedAction !== 'idle' && availableActions.includes('idle')) {
+      forcedIdleTimerRef.current = window.setTimeout(() => {
+        actionRef.current = 'idle';
+        setAction('idle');
+      }, holdMs);
+    }
+  };
+
+  const triggerAction = (intent: 'happy' | 'feed') => {
+    let requestedAction: PetSpriteAction | null = null;
+
+    if (intent === 'happy') {
+      requestedAction = availableActions.includes('happy') ? 'happy' : null;
+    } else {
+      requestedAction = availableActions.includes('feed')
+        ? 'feed'
+        : availableActions.includes('idle')
+          ? 'idle'
+          : defaultAction;
+    }
+
+    if (!requestedAction) return;
+
+    const now = Date.now();
+    if (forcedActionUntilRef.current > now) {
+      if (actionRef.current === requestedAction) return;
+      queuedActionIntentRef.current = intent;
+      return;
+    }
+    if (movingUntilRef.current > now) {
+      queuedActionIntentRef.current = intent;
+      return;
+    }
+
+    playForcedAction(requestedAction);
+  };
+
   useEffect(() => {
     posRef.current = pos;
   }, [pos]);
@@ -315,12 +483,35 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   }, [action]);
 
   useEffect(() => {
+    onFeedArrivedRef.current = onFeedArrived;
+  }, [onFeedArrived]);
+
+  useEffect(() => {
+    onFeedChaseFailedRef.current = onFeedChaseFailed;
+  }, [onFeedChaseFailed]);
+
+  useEffect(() => {
     faceRightRef.current = faceRight;
   }, [faceRight]);
 
   useEffect(() => {
     const id = window.requestAnimationFrame(() => setMotionReady(true));
     return () => window.cancelAnimationFrame(id);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (forcedIdleTimerRef.current !== null) {
+        window.clearTimeout(forcedIdleTimerRef.current);
+      }
+      if (feedCommitTimerRef.current !== null) {
+        window.clearTimeout(feedCommitTimerRef.current);
+      }
+      queuedActionIntentRef.current = null;
+      movingUntilRef.current = 0;
+      feedMoveTargetRef.current = null;
+      feedStuckAttemptsRef.current = 0;
+    };
   }, []);
 
   useEffect(() => {
@@ -363,6 +554,25 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
     actionRef.current = defaultAction;
     setActionSeed((previous) => previous + 1);
   }, [defaultAction, pet.instanceId]);
+
+  useEffect(() => {
+    if (!actionRequest || actionRequest.instanceId !== pet.instanceId) return;
+    if (forcedActionNonceRef.current === actionRequest.nonce) return;
+    forcedActionNonceRef.current = actionRequest.nonce;
+    triggerAction(actionRequest.action);
+  }, [actionRequest, pet.instanceId]);
+
+  useEffect(() => {
+    if (!feedMoveRequest || feedMoveRequest.instanceId !== pet.instanceId) return;
+    if (feedMoveNonceRef.current === feedMoveRequest.nonce) return;
+    feedMoveNonceRef.current = feedMoveRequest.nonce;
+    feedMoveTargetRef.current = {
+      x: clamp(feedMoveRequest.x, bounds.xMin, bounds.xMax),
+      y: clamp(feedMoveRequest.y, bounds.yMin, bounds.yMax),
+      dropId: feedMoveRequest.dropId,
+    };
+    feedStuckAttemptsRef.current = 0;
+  }, [bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, feedMoveRequest, pet.instanceId]);
 
   useEffect(() => {
     let timer: number;
@@ -713,9 +923,152 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       return nearEdge ? 1600 + Math.random() * 600 : 2000 + Math.random() * 800;
     };
 
+    const getTravelDistance = (
+      from: {x: number; y: number},
+      to: {x: number; y: number},
+    ) => Math.hypot(to.x - from.x, (to.y - from.y) * 1.22);
+
+    const hasEnoughDisplacement = (
+      from: {x: number; y: number},
+      to: {x: number; y: number},
+    ) => getTravelDistance(from, to) >= (mini ? 0.72 : 0.95);
+
     const run = () => {
       if (!alive) return;
+      const now = Date.now();
+      if (now < forcedActionUntilRef.current) {
+        timer = schedule(run, 130 + Math.random() * 120);
+        return;
+      }
+      if (queuedActionIntentRef.current && now >= movingUntilRef.current) {
+        const queuedIntent = queuedActionIntentRef.current;
+        queuedActionIntentRef.current = null;
+        triggerAction(queuedIntent);
+        timer = schedule(run, 120 + Math.random() * 140);
+        return;
+      }
       const currentAtStart = posRef.current;
+      const feedTarget = feedMoveTargetRef.current;
+      if (feedTarget) {
+        const deltaX = feedTarget.x - currentAtStart.x;
+        const deltaY = feedTarget.y - currentAtStart.y;
+        const distance = Math.hypot(deltaX, deltaY * 1.28);
+
+        if (distance <= 1.35) {
+          feedStuckAttemptsRef.current = 0;
+          feedMoveTargetRef.current = null;
+          movingUntilRef.current = 0;
+          const feedAction = availableActions.includes('feed')
+            ? 'feed'
+            : availableActions.includes('idle')
+              ? 'idle'
+              : defaultAction;
+          playForcedAction(feedAction);
+
+          if (feedCommitTimerRef.current !== null) {
+            window.clearTimeout(feedCommitTimerRef.current);
+          }
+          feedCommitTimerRef.current = window.setTimeout(() => {
+            onFeedArrivedRef.current?.({
+              instanceId: pet.instanceId,
+              dropId: feedTarget.dropId,
+            });
+            feedCommitTimerRef.current = null;
+          }, 220 + Math.random() * 120);
+
+          timer = schedule(run, 180 + Math.random() * 100);
+          return;
+        }
+
+        const stepX = Math.min(Math.abs(deltaX), mini ? 3.2 : 4.2);
+        const stepY = Math.min(Math.abs(deltaY), mini ? 1.2 : 1.6);
+        let nextX = clamp(
+          currentAtStart.x + Math.sign(deltaX || 1) * stepX,
+          bounds.xMin,
+          bounds.xMax,
+        );
+        let nextY = clamp(
+          currentAtStart.y + Math.sign(deltaY || 1) * stepY,
+          bounds.yMin,
+          bounds.yMax,
+        );
+
+        if (isPositionBlocked(nextX, nextY) && distance > 2.4) {
+          const sidestepY = clamp(
+            currentAtStart.y + (Math.random() > 0.5 ? 1 : -1) * (mini ? 0.8 : 1.1),
+            bounds.yMin,
+            bounds.yMax,
+          );
+          if (!isPositionBlocked(nextX, sidestepY)) {
+            nextY = sidestepY;
+          } else {
+            const sidestepX = clamp(
+              currentAtStart.x + (Math.random() > 0.5 ? 1 : -1) * (mini ? 1.8 : 2.6),
+              bounds.xMin,
+              bounds.xMax,
+            );
+            if (!isPositionBlocked(sidestepX, nextY)) {
+              nextX = sidestepX;
+            }
+          }
+        }
+
+        if (isPositionBlocked(nextX, nextY)) {
+          feedStuckAttemptsRef.current += 1;
+          if (feedStuckAttemptsRef.current >= 2) {
+            const failedDropId = feedTarget.dropId;
+            feedMoveTargetRef.current = null;
+            movingUntilRef.current = 0;
+            setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
+            onFeedChaseFailedRef.current?.({
+              instanceId: pet.instanceId,
+              dropId: failedDropId,
+            });
+            timer = schedule(run, 130 + Math.random() * 110);
+            return;
+          }
+          setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
+          movingUntilRef.current = 0;
+          timer = schedule(run, 120 + Math.random() * 100);
+          return;
+        }
+
+        if (!hasEnoughDisplacement(currentAtStart, {x: nextX, y: nextY})) {
+          feedStuckAttemptsRef.current += 1;
+          if (feedStuckAttemptsRef.current >= 2) {
+            const failedDropId = feedTarget.dropId;
+            feedMoveTargetRef.current = null;
+            movingUntilRef.current = 0;
+            setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
+            onFeedChaseFailedRef.current?.({
+              instanceId: pet.instanceId,
+              dropId: failedDropId,
+            });
+            timer = schedule(run, 130 + Math.random() * 110);
+            return;
+          }
+          setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
+          timer = schedule(run, 120 + Math.random() * 90);
+          return;
+        }
+        feedStuckAttemptsRef.current = 0;
+
+        const nextPos = {x: nextX, y: nextY};
+        posRef.current = nextPos;
+        setPos(nextPos);
+        onMove(pet.instanceId, nextX, nextY);
+        setFacingDirection(nextX >= currentAtStart.x);
+        setNextAction(availableActions.includes('move') ? 'move' : defaultAction);
+
+        const chaseDuration = mini ? 900 : 1200;
+        movingUntilRef.current = Date.now() + chaseDuration;
+        schedule(() => {
+          if (!alive) return;
+          movingUntilRef.current = 0;
+          timer = schedule(run, 90 + Math.random() * 90);
+        }, chaseDuration);
+        return;
+      }
       const edgeTouchTolerance = 0.15;
       const atLeftEdge = currentAtStart.x <= bounds.xMin + edgeTouchTolerance;
       const atRightEdge = currentAtStart.x >= bounds.xMax - edgeTouchTolerance;
@@ -744,18 +1097,23 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
           current.y >= bounds.yMax - edgeGuardY;
         const chosenCandidate = pickMoveCandidate(current, nearEdge);
         if (chosenCandidate) {
-          nextX = chosenCandidate.x;
-          nextY = chosenCandidate.y;
-          moved = true;
+          const candidatePos = {x: chosenCandidate.x, y: chosenCandidate.y};
+          if (hasEnoughDisplacement(current, candidatePos)) {
+            nextX = candidatePos.x;
+            nextY = candidatePos.y;
+            moved = true;
+          }
         }
 
         if (!moved) {
           blockedStreakRef.current += 1;
           const emergencyCandidate = findEmergencyMoveCandidate(current);
           if (emergencyCandidate) {
-            nextX = emergencyCandidate.x;
-            nextY = emergencyCandidate.y;
-            moved = true;
+            if (hasEnoughDisplacement(current, emergencyCandidate)) {
+              nextX = emergencyCandidate.x;
+              nextY = emergencyCandidate.y;
+              moved = true;
+            }
           }
         }
 
@@ -768,6 +1126,13 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
         }
 
         if (moved) {
+          if (isPositionBlocked(nextX, nextY)) {
+            blockedStreakRef.current += 1;
+            setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
+            movingUntilRef.current = 0;
+            timer = schedule(run, 120 + Math.random() * 120);
+            return;
+          }
           blockedStreakRef.current = 0;
           moveCooldownRef.current = nearEdge ? 0 : Math.random() < 0.6 ? 0 : 1;
           const deltaX = nextX - current.x;
@@ -782,9 +1147,18 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
           setPos(nextPos);
           onMove(pet.instanceId, nextX, nextY);
           setNextAction('move');
+          movingUntilRef.current = Date.now() + moveDuration + 60;
 
           schedule(() => {
             if (!alive) return;
+            movingUntilRef.current = 0;
+            if (queuedActionIntentRef.current) {
+              const queuedIntent = queuedActionIntentRef.current;
+              queuedActionIntentRef.current = null;
+              triggerAction(queuedIntent);
+              timer = schedule(run, 120 + Math.random() * 120);
+              return;
+            }
             const nextRestAction = pickRestAction();
             setNextAction(nextRestAction);
             timer = schedule(run, getRestDelay(nextRestAction, nearEdge));
@@ -848,7 +1222,11 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
-              onSelect(pet);
+              if (onSelect) {
+                onSelect(pet);
+                return;
+              }
+              triggerAction('happy');
             }}>
             {debugHitArea && (
               <span className="pointer-events-none absolute -top-4 left-1/2 -translate-x-1/2 rounded bg-black/55 px-1 py-[1px] text-[8px] font-semibold leading-none text-white">
@@ -866,6 +1244,12 @@ interface PetSceneProps {
   mini?: boolean;
   onPetSelect?: (pet: CompletedPet) => void;
   onSceneBlankClick?: () => void;
+  onSceneBlankPointer?: (point: {x: number; y: number}) => void;
+  actionRequest?: ScenePetActionRequest | null;
+  feedMoveRequest?: ScenePetFeedMoveRequest | null;
+  onPetFeedArrived?: (payload: {instanceId: string; dropId: string}) => void;
+  onPetFeedChaseFailed?: (payload: {instanceId: string; dropId: string}) => void;
+  feedDrops?: SceneFeedDrop[];
   debugHitArea?: boolean;
 }
 
@@ -873,6 +1257,12 @@ export function PetScene({
   mini = false,
   onPetSelect,
   onSceneBlankClick,
+  onSceneBlankPointer,
+  actionRequest,
+  feedMoveRequest,
+  onPetFeedArrived,
+  onPetFeedChaseFailed,
+  feedDrops = [],
   debugHitArea = false,
 }: PetSceneProps) {
   const currentTheme = useStore((state) => state.currentTheme);
@@ -883,6 +1273,7 @@ export function PetScene({
   const sceneRef = useRef<HTMLDivElement | null>(null);
   const [sceneSize, setSceneSize] = useState({width: 0, height: 0});
   const [spriteAssetsReady, setSpriteAssetsReady] = useState(false);
+  const [sceneWasteSpots, setSceneWasteSpots] = useState<Record<string, {x: number; y: number}>>({});
   const runtimeSceneSpritePetsRef = useRef<SceneSpritePetLite[]>([]);
   const runtimeSceneSpriteIndexRef = useRef(new Map<string, number>());
   const pendingPositionUpdatesRef = useRef(new Map<string, {x: number; y: number}>());
@@ -890,6 +1281,13 @@ export function PetScene({
 
   useEffect(() => {
     syncPetData();
+  }, [syncPetData]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      syncPetData();
+    }, 60_000);
+    return () => window.clearInterval(timer);
   }, [syncPetData]);
 
   useEffect(() => {
@@ -914,6 +1312,37 @@ export function PetScene({
     () => completedPets.filter((pet) => pet.theme === currentTheme),
     [completedPets, currentTheme],
   );
+
+  useEffect(() => {
+    setSceneWasteSpots((previous) => {
+      const next = {...previous};
+      let changed = false;
+      const currentIds = new Set(petsInTheme.map((pet) => pet.instanceId));
+
+      Object.keys(next).forEach((instanceId) => {
+        if (currentIds.has(instanceId)) return;
+        delete next[instanceId];
+        changed = true;
+      });
+
+      petsInTheme.forEach((pet) => {
+        const wasteLevel = pet.wasteLevel ?? 0;
+        if (wasteLevel >= WASTE_VISIBLE_THRESHOLD) {
+          if (!next[pet.instanceId]) {
+            next[pet.instanceId] = getPetWasteDropPosition(pet, mini, sceneSize);
+            changed = true;
+          }
+          return;
+        }
+        if (wasteLevel < WASTE_VISIBLE_THRESHOLD && next[pet.instanceId]) {
+          delete next[pet.instanceId];
+          changed = true;
+        }
+      });
+
+      return changed ? next : previous;
+    });
+  }, [mini, petsInTheme, sceneSize]);
   const sceneSpritePets = useMemo(
     () =>
       petsInTheme
@@ -1036,7 +1465,15 @@ export function PetScene({
       <div
         ref={sceneRef}
         className="absolute inset-x-0 top-0 bottom-24 overflow-hidden pointer-events-auto"
-        onClick={() => onSceneBlankClick?.()}>
+        onClick={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            const x = clamp(((event.clientX - rect.left) / rect.width) * 100, 0, 100);
+            const y = clamp(((event.clientY - rect.top) / rect.height) * 100, 0, 100);
+            onSceneBlankPointer?.({x, y});
+          }
+          onSceneBlankClick?.();
+        }}>
         {SHOW_SCENE_MOVE_BOUNDS && (
           <div
             className="pointer-events-none absolute z-[9999] rounded-md border-2 border-rose-500/85"
@@ -1049,6 +1486,38 @@ export function PetScene({
             }}
           />
         )}
+        {Object.entries(sceneWasteSpots).map(([instanceId, position]) => (
+          <div
+            key={`waste-${instanceId}`}
+            className="pointer-events-none absolute -translate-x-1/2 -translate-y-full"
+            style={{
+              left: `${position.x}%`,
+              top: `${position.y}%`,
+              zIndex: getLayerZIndex(position.y) - 1,
+            }}>
+            <WasteIcon mini={mini} />
+          </div>
+        ))}
+        {feedDrops.map((drop) => (
+          (() => {
+            const lifeProgress = clamp((Date.now() - drop.createdAt) / Math.max(1, drop.ttlMs), 0, 1);
+            return (
+              <div
+                key={drop.id}
+                className="pointer-events-none absolute -translate-x-1/2 -translate-y-full transition-opacity duration-200"
+                style={{
+                  left: `${drop.x}%`,
+                  top: `${drop.y}%`,
+                  zIndex: getLayerZIndex(drop.y) - 1,
+                  opacity: 1 - lifeProgress * 0.45,
+                }}>
+                <div className="inline-flex items-center rounded-full border border-amber-300/70 bg-amber-100/95 px-1.5 py-0.5 text-[10px] leading-none text-amber-700 shadow-[0_2px_6px_rgba(15,23,42,0.14)]">
+                  🌾
+                </div>
+              </div>
+            );
+          })()
+        ))}
         {petsInTheme.map((pet) => {
           if (isPetSpriteKey(pet.petId)) {
             if (!spriteAssetsReady) return null;
@@ -1059,6 +1528,10 @@ export function PetScene({
                 mini={mini}
                 onMove={handleSpriteMove}
                 onSelect={onPetSelect}
+                actionRequest={actionRequest}
+                feedMoveRequest={feedMoveRequest}
+                onFeedArrived={onPetFeedArrived}
+                onFeedChaseFailed={onPetFeedChaseFailed}
                 debugHitArea={debugHitArea}
                 sceneSize={sceneSize}
                 sceneSpritePetsRef={runtimeSceneSpritePetsRef}
@@ -1076,8 +1549,8 @@ export function PetScene({
                 pet={pet}
                 mini={mini}
                 theme={currentTheme}
-                onSelect={onPetSelect}>
-                <div className="flex flex-col items-center">
+              onSelect={onPetSelect}>
+                <div className="relative flex flex-col items-center">
                   <img
                     src={customPet.image}
                     alt={customPet.name}
@@ -1103,7 +1576,9 @@ export function PetScene({
               mini={mini}
               theme={currentTheme}
               onSelect={onPetSelect}>
-              <span className={cn('drop-shadow-md', mini ? 'text-lg' : 'text-2xl')}>{emoji}</span>
+              <div className="relative">
+                <span className={cn('drop-shadow-md', mini ? 'text-lg' : 'text-2xl')}>{emoji}</span>
+              </div>
             </BasicPetInstance>
           );
         })}

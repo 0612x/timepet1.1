@@ -13,6 +13,12 @@ import {
   type PetSpriteAction,
 } from '../data/petSprites';
 import {SpriteActor} from './SpriteActor';
+import {
+  getHealthLabel,
+  getMoodLabel,
+  getPetMetric,
+  getSatietyLabel,
+} from '../utils/petStatus';
 
 interface PetBoardSheetProps {
   open: boolean;
@@ -30,6 +36,12 @@ interface BoardItem {
   speciesName: string;
   stateLabel: string;
   sceneLabel: string;
+  health: number;
+  satiety: number;
+  mood: number;
+  healthLabel: string;
+  satietyLabel: string;
+  moodLabel: string;
 }
 
 const STATE_LABEL: Record<CompletedPet['state'], string> = {
@@ -102,6 +114,12 @@ export function PetBoardSheet({
               speciesName,
               stateLabel: STATE_LABEL[pet.state],
               sceneLabel: THEME_LABEL[pet.theme],
+              health: Math.round(getPetMetric(pet, 'health')),
+              satiety: Math.round(getPetMetric(pet, 'satiety')),
+              mood: Math.round(getPetMetric(pet, 'mood')),
+              healthLabel: getHealthLabel(getPetMetric(pet, 'health')),
+              satietyLabel: getSatietyLabel(getPetMetric(pet, 'satiety')),
+              moodLabel: getMoodLabel(getPetMetric(pet, 'mood')),
             };
           }
 
@@ -114,6 +132,12 @@ export function PetBoardSheet({
               speciesName,
               stateLabel: STATE_LABEL[pet.state],
               sceneLabel: THEME_LABEL[pet.theme],
+              health: Math.round(getPetMetric(pet, 'health')),
+              satiety: Math.round(getPetMetric(pet, 'satiety')),
+              mood: Math.round(getPetMetric(pet, 'mood')),
+              healthLabel: getHealthLabel(getPetMetric(pet, 'health')),
+              satietyLabel: getSatietyLabel(getPetMetric(pet, 'satiety')),
+              moodLabel: getMoodLabel(getPetMetric(pet, 'mood')),
             };
           }
 
@@ -125,6 +149,12 @@ export function PetBoardSheet({
             speciesName,
             stateLabel: STATE_LABEL[pet.state],
             sceneLabel: THEME_LABEL[pet.theme],
+            health: Math.round(getPetMetric(pet, 'health')),
+            satiety: Math.round(getPetMetric(pet, 'satiety')),
+            mood: Math.round(getPetMetric(pet, 'mood')),
+            healthLabel: getHealthLabel(getPetMetric(pet, 'health')),
+            satietyLabel: getSatietyLabel(getPetMetric(pet, 'satiety')),
+            moodLabel: getMoodLabel(getPetMetric(pet, 'mood')),
           };
         }),
     [completedPets, customPets],
@@ -271,6 +301,31 @@ export function PetBoardSheet({
                               <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-bold text-indigo-500">
                                 形态 · {item.stateLabel}
                               </span>
+                            </div>
+                            <div className="mt-1.5 space-y-1.5 rounded-xl border border-slate-100 bg-slate-50/75 px-2 py-1.5">
+                              {[
+                                {label: '健康', value: item.health, tip: item.healthLabel, tone: 'bg-emerald-500'},
+                                {label: '饱腹', value: item.satiety, tip: item.satietyLabel, tone: 'bg-amber-500'},
+                                {label: '心情', value: item.mood, tip: item.moodLabel, tone: 'bg-violet-500'},
+                              ].map((metric) => {
+                                const value = Math.max(0, Math.min(100, metric.value));
+                                return (
+                                  <div key={metric.label} className="space-y-1">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="text-[10px] font-semibold text-slate-500">
+                                        {metric.label} · {metric.tip}
+                                      </span>
+                                      <span className="text-[10px] font-black tabular-nums text-slate-700">{value}</span>
+                                    </div>
+                                    <div className="h-1.5 overflow-hidden rounded-full bg-slate-200">
+                                      <div
+                                        className={cn('h-full rounded-full transition-[width] duration-300', metric.tone)}
+                                        style={{width: `${value}%`}}
+                                      />
+                                    </div>
+                                  </div>
+                                );
+                              })}
                             </div>
                             {editingId === item.pet.instanceId && (
                               <div className="mt-2 flex items-center gap-1.5">
