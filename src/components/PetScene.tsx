@@ -11,12 +11,15 @@ import {
 } from '../data/petSprites';
 import {getSpriteActionLoopMs, SpriteActor} from './SpriteActor';
 import {ensureSpritePathLoaded, preloadSpritePaths} from '../utils/spriteAssetLoader';
+import {GraveSprite} from './GraveSprite';
+import {FoodSprite} from './FoodSprite';
 import {
   SCENE_BOTTOM_MAX,
   SCENE_BOTTOM_MIN,
   SCENE_X_MAX,
   SCENE_X_MIN,
 } from '../constants/sceneBounds';
+import {type FoodId} from '../data/foods';
 
 interface BasicPetInstanceProps {
   pet: CompletedPet;
@@ -73,6 +76,7 @@ export interface ScenePetActionRequest {
 
 export interface SceneFeedDrop {
   id: string;
+  foodId: FoodId;
   x: number;
   y: number;
   createdAt: number;
@@ -88,10 +92,15 @@ export interface ScenePetFeedMoveRequest {
 }
 
 export interface SceneWasteSpot {
+  id: string;
   instanceId: string;
   x: number;
   y: number;
-  count: number;
+}
+
+export interface SceneWasteCleanupRequest {
+  id: string;
+  nonce: number;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
@@ -136,6 +145,15 @@ const SPECIES_SIZE_FACTOR: Record<string, number> = {
   farm_miniTabbycat: 1.18,
   farm_miniragdollcat: 1.18,
   farm_minicivetcat: 1.18,
+};
+const SPECIES_VISUAL_VERTICAL_OFFSET_RATIO: Record<string, number> = {
+  farm_Akita: 0.18,
+  farm_goose: 0.06,
+  farm_miniyellowcat: 0.045,
+  farm_miniblackwcat: 0.045,
+  farm_miniragdollcat: 0.045,
+  farm_miniTabbycat: 0.045,
+  farm_minicivetcat: 0.045,
 };
 const SPECIES_HIT_VERTICAL_OFFSET_RATIO: Record<string, number> = {
   farm_cat: 0.09,
@@ -184,7 +202,7 @@ const hashToUnit = (input: string) => {
   return (hash >>> 0) / 4294967295;
 };
 
-const WasteIcon: React.FC<{mini?: boolean; count?: number}> = ({mini = false, count = 1}) => {
+const WasteIcon: React.FC<{mini?: boolean}> = ({mini = false}) => {
   const [imageError, setImageError] = useState(false);
   const [iconPathIndex, setIconPathIndex] = useState(0);
 
@@ -211,49 +229,62 @@ const WasteIcon: React.FC<{mini?: boolean; count?: number}> = ({mini = false, co
       ) : (
         <span className="text-[12px] leading-none opacity-90">💩</span>
       )}
-      {count > 1 && (
-        <span className="absolute -right-2 -top-1 inline-flex min-w-4 items-center justify-center rounded-full border border-white/80 bg-amber-400 px-1 text-[8px] font-black leading-4 text-amber-950 shadow-[0_2px_5px_rgba(15,23,42,0.18)]">
-          {count}
-        </span>
-      )}
     </div>
   );
 };
 
-function getPetWasteDropPosition(
-  pet: CompletedPet,
-  mini: boolean,
-  sceneSize: {width: number; height: number},
-) {
-  const jitterX = (hashToUnit(`${pet.instanceId}:waste:x`) - 0.5) * (mini ? 1.2 : 1.8);
-  const jitterY = (hashToUnit(`${pet.instanceId}:waste:y`) - 0.5) * (mini ? 0.7 : 1.1);
+const GraveIcon: React.FC<{mini?: boolean}> = ({mini = false}) => {
+  const size = mini ? 22 : 30;
 
-  if (isPetSpriteKey(pet.petId)) {
-    const idleConfig = getPetSpriteConfigByKey(pet.petId, 'idle')
-      ?? getPetSpriteConfigByKey(pet.petId, 'move');
-    const frameWidth = idleConfig?.frameWidth ?? 32;
-    const frameHeight = idleConfig?.frameHeight ?? 32;
-    const speciesSizeFactor = SPECIES_SIZE_FACTOR[pet.petId] ?? 1;
-    const targetVisualHeight = (mini ? 46 : 72) * speciesSizeFactor;
-    const normalizedScale = targetVisualHeight / frameHeight;
-    const scale = normalizedScale * (mini ? 1 : 1.02);
-    const visualScale = mini ? 0.92 : 1.06;
-    const spriteWidthPx = frameWidth * scale * visualScale;
-    const spriteHeightPx = frameHeight * scale * visualScale;
-    const widthPercent = sceneSize.width > 0 ? (spriteWidthPx / sceneSize.width) * 100 : (mini ? 8 : 10);
-    const heightPercent = sceneSize.height > 0 ? (spriteHeightPx / sceneSize.height) * 100 : (mini ? 10 : 13);
+  return (
+    <div className="pointer-events-none relative">
+      <GraveSprite size={size} className="opacity-95" />
+    </div>
+  );
+};
 
-    return {
-      x: clamp(pet.x + widthPercent * 0.5 + jitterX, SCENE_X_MIN, SCENE_X_MAX),
-      y: clamp(pet.y + heightPercent + jitterY, SCENE_BOTTOM_MIN, SCENE_BOTTOM_MAX + 6),
-    };
-  }
-
-  return {
-    x: clamp(pet.x + (mini ? 2.2 : 2.8) + jitterX, SCENE_X_MIN, SCENE_X_MAX),
-    y: clamp(pet.y + (mini ? 4.8 : 6.2) + jitterY, SCENE_BOTTOM_MIN, SCENE_BOTTOM_MAX + 6),
-  };
-}
+const DeadPetInstance: React.FC<{
+  pet: CompletedPet;
+  mini: boolean;
+  onSelect?: (pet: CompletedPet) => void;
+}> = ({pet, mini, onSelect}) => (
+  <div
+    className={cn(
+      'absolute whitespace-nowrap',
+      onSelect ? 'pointer-events-auto' : 'pointer-events-none',
+    )}
+    style={{
+      left: `${pet.x}%`,
+      top: `${pet.y}%`,
+      zIndex: 95,
+      transform: `scale(${mini ? 0.92 : 1})`,
+    }}>
+    <button
+      type="button"
+      aria-label={`查看${pet.nickname ?? '已离世宠物'}`}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onSelect?.(pet);
+      }}
+      className={cn(
+        'relative -translate-x-1/2 -translate-y-full border-0 bg-transparent p-0 text-left',
+        onSelect ? 'cursor-pointer touch-manipulation' : 'pointer-events-none',
+      )}>
+      <div className="absolute inset-x-0 top-[78%] mx-auto h-3.5 w-8 rounded-full bg-[radial-gradient(ellipse_at_center,rgba(15,23,42,0.18)_0%,rgba(15,23,42,0.06)_60%,rgba(15,23,42,0)_100%)]" />
+      <div className="relative flex flex-col items-center">
+        <GraveIcon mini={mini} />
+        <span className="absolute left-1/2 top-[72%] -translate-x-1/2 whitespace-nowrap rounded-full border border-slate-300/90 bg-white/92 px-1.5 py-0.5 text-[8px] font-black text-slate-500 shadow-[0_2px_6px_rgba(15,23,42,0.08)]">
+          已离世
+        </span>
+      </div>
+    </button>
+  </div>
+);
 
 const BasicPetInstance: React.FC<BasicPetInstanceProps> = ({pet, mini, theme, onSelect, children}) => {
   const getAnimationClass = (variant: number, currentTheme: ThemeType) => {
@@ -378,6 +409,7 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   const visualScale = mini ? 0.92 : 1.06;
   const actorWidthPx = frameWidth * scale;
   const actorHeightPx = frameHeight * scale;
+  const speciesVisualOffsetPx = actorHeightPx * (SPECIES_VISUAL_VERTICAL_OFFSET_RATIO[pet.petId] ?? 0);
   const spriteWidthPx = actorWidthPx * visualScale;
   const spriteHeightPx = actorHeightPx * visualScale;
   const spriteWidthPercent = sceneSize.width > 0 ? (spriteWidthPx / sceneSize.width) * 100 : (mini ? 8 : 10);
@@ -1719,7 +1751,14 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
         transitionDuration: motionReady ? `${motionTransitionMs}ms` : '0ms',
         transitionTimingFunction: motionTimingFunction,
       }}>
-      <div className="relative">
+      <div
+        className="relative"
+        style={speciesVisualOffsetPx
+          ? {
+              transform: `translateY(${speciesVisualOffsetPx}px)`,
+            }
+          : undefined}
+      >
         {feedProgress !== null && (
           <div
             className="pointer-events-none absolute z-30"
@@ -1832,7 +1871,8 @@ interface PetSceneProps {
   onSceneBlankClick?: () => void;
   onSceneBlankPointer?: (point: {x: number; y: number}) => void;
   onWasteSpotsChange?: (spots: SceneWasteSpot[]) => void;
-  highlightedWasteInstanceId?: string | null;
+  highlightedWasteId?: string | null;
+  cleanedWasteRequest?: SceneWasteCleanupRequest | null;
   onRuntimePetPointChange?: (
     instanceId: string,
     points: {
@@ -1865,7 +1905,8 @@ export function PetScene({
   onSceneBlankClick,
   onSceneBlankPointer,
   onWasteSpotsChange,
-  highlightedWasteInstanceId = null,
+  highlightedWasteId = null,
+  cleanedWasteRequest = null,
   onRuntimePetPointChange,
   actionRequest,
   feedMoveRequests = {},
@@ -1883,7 +1924,7 @@ export function PetScene({
   const sceneRef = useRef<HTMLDivElement | null>(null);
   const [sceneSize, setSceneSize] = useState({width: 0, height: 0});
   const [spriteAssetsReady, setSpriteAssetsReady] = useState(false);
-  const [sceneWasteSpots, setSceneWasteSpots] = useState<Record<string, {x: number; y: number; count: number}>>({});
+  const [sceneWasteSpots, setSceneWasteSpots] = useState<SceneWasteSpot[]>([]);
   const runtimeSceneSpritePetsRef = useRef<SceneSpritePetLite[]>([]);
   const runtimeSceneSpriteIndexRef = useRef(new Map<string, number>());
   const pendingPositionUpdatesRef = useRef(new Map<string, {x: number; y: number}>());
@@ -1930,42 +1971,42 @@ export function PetScene({
   );
 
   useEffect(() => {
+    if (!cleanedWasteRequest) return;
     setSceneWasteSpots((previous) => {
-      const next = {...previous};
-      let changed = false;
-      const currentIds = new Set(petsInTheme.map((pet) => pet.instanceId));
-
-      Object.keys(next).forEach((instanceId) => {
-        if (currentIds.has(instanceId)) return;
-        delete next[instanceId];
-        changed = true;
-      });
-
-      petsInTheme.forEach((pet) => {
-        const wasteCount = Math.max(0, Math.round(pet.wasteCount ?? 0));
-        if (wasteCount > 0) {
-          const existing = next[pet.instanceId];
-          if (!existing || existing.count !== wasteCount) {
-            next[pet.instanceId] = {
-              ...getPetWasteDropPosition(pet, mini, sceneSize),
-              count: wasteCount,
-            };
-            changed = true;
-          }
-          return;
-        }
-        if (next[pet.instanceId]) {
-          delete next[pet.instanceId];
-          changed = true;
-        }
-      });
-
-      return changed ? next : previous;
+      const next = previous.filter((spot) => spot.id !== cleanedWasteRequest.id);
+      return next.length === previous.length ? previous : next;
     });
-  }, [mini, petsInTheme, sceneSize]);
+  }, [cleanedWasteRequest]);
+
+  useEffect(() => {
+    const next = petsInTheme.flatMap((pet) =>
+      (pet.wasteSpots ?? []).map((spot) => ({
+        id: spot.id,
+        instanceId: pet.instanceId,
+        x: spot.x,
+        y: spot.y,
+      })),
+    );
+
+    setSceneWasteSpots((previous) => {
+      if (
+        previous.length === next.length
+        && previous.every((spot, index) =>
+          spot.id === next[index]?.id
+          && spot.instanceId === next[index]?.instanceId
+          && Math.abs(spot.x - (next[index]?.x ?? 0)) < 0.001
+          && Math.abs(spot.y - (next[index]?.y ?? 0)) < 0.001,
+        )
+      ) {
+        return previous;
+      }
+      return next;
+    });
+  }, [petsInTheme]);
   const sceneSpritePets = useMemo(
     () =>
       petsInTheme
+        .filter((pet) => !pet.isDead)
         .filter((pet) => isPetSpriteKey(pet.petId))
         .map((pet) => ({
           instanceId: pet.instanceId,
@@ -2033,20 +2074,9 @@ export function PetScene({
     () => new Set(feedDrops.map((drop) => drop.id)),
     [feedDrops],
   );
-  const sceneWasteEntries = useMemo(
-    () => Object.entries(sceneWasteSpots) as Array<[string, {x: number; y: number; count: number}]>,
-    [sceneWasteSpots],
-  );
   useEffect(() => {
-    onWasteSpotsChange?.(
-      sceneWasteEntries.map(([instanceId, position]) => ({
-        instanceId,
-        x: position.x,
-        y: position.y,
-        count: position.count,
-      })),
-    );
-  }, [onWasteSpotsChange, sceneWasteEntries]);
+    onWasteSpotsChange?.(sceneWasteSpots);
+  }, [onWasteSpotsChange, sceneWasteSpots]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2124,24 +2154,24 @@ export function PetScene({
             }}
           />
         )}
-        {sceneWasteEntries.map(([instanceId, position]) => (
+        {sceneWasteSpots.map((spot) => (
           <div
-            key={`waste-${instanceId}`}
+            key={spot.id}
             className="pointer-events-none absolute -translate-x-1/2 -translate-y-full"
             style={{
-              left: `${position.x}%`,
-              top: `${position.y}%`,
-              zIndex: getLayerZIndex(position.y) - 1,
+              left: `${spot.x}%`,
+              top: `${spot.y}%`,
+              zIndex: getLayerZIndex(spot.y) - 1,
             }}>
             <div
               className={cn(
                 'relative transition-all duration-150',
-                highlightedWasteInstanceId === instanceId ? 'scale-[1.08] -translate-y-0.5' : '',
+                highlightedWasteId === spot.id ? 'scale-[1.08] -translate-y-0.5' : '',
               )}>
-              {highlightedWasteInstanceId === instanceId && (
+              {highlightedWasteId === spot.id && (
                 <div className="absolute left-1/2 top-1/2 h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full border border-emerald-200/90 bg-emerald-200/25 shadow-[0_0_0_3px_rgba(110,231,183,0.2)]" />
               )}
-              <WasteIcon mini={mini} count={position.count} />
+              <WasteIcon mini={mini} />
             </div>
           </div>
         ))}
@@ -2158,14 +2188,22 @@ export function PetScene({
                   zIndex: getLayerZIndex(drop.y) - 1,
                   opacity: 1 - lifeProgress * 0.45,
                 }}>
-                <div className="inline-flex items-center rounded-full border border-amber-300/70 bg-amber-100/95 px-1.5 py-0.5 text-[10px] leading-none text-amber-700 shadow-[0_2px_6px_rgba(15,23,42,0.14)]">
-                  🌾
+                <div className="inline-flex items-center">
+                  <FoodSprite
+                    foodId={drop.foodId}
+                    size={16}
+                    className="drop-shadow-[0_2px_4px_rgba(15,23,42,0.2)]"
+                  />
                 </div>
               </div>
             );
           })()
         ))}
         {petsInTheme.map((pet) => {
+          if (pet.isDead) {
+            return <DeadPetInstance key={pet.instanceId} pet={pet} mini={mini} onSelect={onPetSelect} />;
+          }
+
           if (isPetSpriteKey(pet.petId)) {
             if (!spriteAssetsReady) return null;
             return (

@@ -1,18 +1,25 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {Archive, ChevronLeft, ChevronRight, Cloud, Lock, MoonStar, Palette, Sparkles, Sun, Sunset, Waves, Wheat, X} from 'lucide-react';
+import React, {startTransition, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {Archive, ChevronLeft, ChevronRight, Cloud, Lock, MoonStar, Palette, Sparkles, Store, Sun, Sunset, Waves, Wheat, X} from 'lucide-react';
 import {
   PetScene,
   type SceneFeedDrop,
   type ScenePetActionRequest,
   type ScenePetFeedMoveRequest,
+  type SceneWasteCleanupRequest,
   type SceneWasteSpot,
 } from '../components/PetScene';
 import {PetBoardSheet} from '../components/PetBoardSheet';
+import {GraveSprite} from '../components/GraveSprite';
+import {FoodSprite} from '../components/FoodSprite';
+import {SceneShopSheet} from '../components/SceneShopSheet';
 import {SpriteActor} from '../components/SpriteActor';
+import {UiTextureLayer} from '../components/UiTextureLayer';
 import {cn} from '../utils/cn';
 import {useStore, type CompletedPet} from '../store/useStore';
+import {FOOD_ITEMS, getFoodItemById, type FoodId} from '../data/foods';
 import {PETS, type ThemeType} from '../data/pets';
 import {getPetSpriteOptionByKey, hasPetSpriteAction, isPetSpriteKey, type PetSpriteAction} from '../data/petSprites';
+import {getSceneUiAssetPath} from '../data/sceneUiAssets';
 import {formatZhDate, getSimulatedDate} from '../utils/date';
 import {SCENE_BOTTOM_MAX, SCENE_BOTTOM_MIN, SCENE_X_MAX, SCENE_X_MIN} from '../constants/sceneBounds';
 import {assignFeedTargets} from '../utils/feedSystem';
@@ -81,7 +88,14 @@ const SCENE_DEBUG_HIT_AREAS = false;
 const FEED_DROP_TTL_MS = 30_000;
 const FEED_DROP_BURST_COUNT = 3;
 const FEED_BLOCK_SATIETY = 100;
+const FEED_TOOL_LONG_PRESS_MS = 260;
+const FEED_TOOL_DRAG_START_DISTANCE = 12;
+const FOOD_SELECTOR_RADIUS = 94;
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const FLOATING_PANEL_ASSET_PATH = getSceneUiAssetPath('floatingPanel');
+const SHOP_BUTTON_ASSET_PATH = getSceneUiAssetPath('shopButton');
+const TOGGLE_HANDLE_ASSET_PATH = getSceneUiAssetPath('toggleHandle');
+const FEED_PLACEMENT_ASSET_PATH = getSceneUiAssetPath('feedPlacement');
 
 interface RuntimePetPoints {
   interactionX: number;
@@ -98,6 +112,8 @@ interface RuntimePetPoints {
 
 interface CardFeedSession {
   instanceId: string;
+  foodId: FoodId;
+  satietyGain: number;
   startedAt: number;
   endsAt: number;
 }
@@ -128,7 +144,17 @@ interface SceneToolDragState {
   overScene: boolean;
   sceneX: number | null;
   sceneY: number | null;
-  hoveredWasteInstanceId: string | null;
+  hoveredWasteId: string | null;
+}
+
+interface FoodSelectorAnchor {
+  x: number;
+  y: number;
+}
+
+interface FloatingPanelAnchor {
+  x: number;
+  y: number;
 }
 
 function getFarmSkyOverlayClass(phase: FarmSkyPhase) {
@@ -164,17 +190,25 @@ export function SceneView() {
     currentTheme,
     setCurrentTheme,
     simulatedDateOffset,
+    coins,
     completedPets,
     customPets,
+    foodInventory,
+    selectedFoodId,
     renameCompletedPet,
     discardCompletedPet,
     clearScenePets,
     spawnAllScenePets,
+    buyFood,
+    consumeFood,
     feedCompletedPet,
     cheerCompletedPet,
     cleanCompletedPetWaste,
+    debugKillCompletedPet,
+    setSelectedFood,
   } = useStore();
   const [showPetBoard, setShowPetBoard] = useState(false);
+  const [showSceneShop, setShowSceneShop] = useState(false);
   const [farmSkyPhaseOverride, setFarmSkyPhaseOverride] = useState<FarmSkyPhase | null>(null);
   const [currentHour, setCurrentHour] = useState(() => new Date().getHours());
   const [selectedPetInstanceId, setSelectedPetInstanceId] = useState<string | null>(null);
@@ -186,8 +220,14 @@ export function SceneView() {
   const [sceneFeedMoveRequests, setSceneFeedMoveRequests] = useState<Record<string, ScenePetFeedMoveRequest>>({});
   const [sceneFeedDrops, setSceneFeedDrops] = useState<SceneFeedDrop[]>([]);
   const [sceneWasteSpots, setSceneWasteSpots] = useState<SceneWasteSpot[]>([]);
+  const [sceneWasteCleanupRequest, setSceneWasteCleanupRequest] = useState<SceneWasteCleanupRequest | null>(null);
   const [toolDragState, setToolDragState] = useState<SceneToolDragState | null>(null);
   const [sceneToolDockOpen, setSceneToolDockOpen] = useState(false);
+  const [sceneShopDockOpen, setSceneShopDockOpen] = useState(false);
+  const [showFoodSelector, setShowFoodSelector] = useState(false);
+  const [foodSelectorAnchor, setFoodSelectorAnchor] = useState<FoodSelectorAnchor | null>(null);
+  const [foodSelectorHoverId, setFoodSelectorHoverId] = useState<FoodId | null>(null);
+  const [shopPanelAnchor, setShopPanelAnchor] = useState<FloatingPanelAnchor | null>(null);
   const [cardFeedSession, setCardFeedSession] = useState<CardFeedSession | null>(null);
   const [cardFeedProgress, setCardFeedProgress] = useState<number | null>(null);
   const [cardCheerSession, setCardCheerSession] = useState<CardFeedSession | null>(null);
@@ -203,14 +243,25 @@ export function SceneView() {
   const sceneFeedbackItemsRef = useRef<SceneFeedbackItem[]>([]);
   const sceneSurfaceRef = useRef<HTMLDivElement | null>(null);
   const sceneToolDockRef = useRef<HTMLDivElement | null>(null);
+  const feedToolButtonRef = useRef<HTMLButtonElement | null>(null);
+  const shopToolButtonRef = useRef<HTMLButtonElement | null>(null);
   const sceneWasteSpotsRef = useRef<SceneWasteSpot[]>([]);
   const toolDragStateRef = useRef<SceneToolDragState | null>(null);
+  const feedToolPressRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    rect: DOMRect;
+    selectorOpened: boolean;
+  } | null>(null);
+  const feedToolLongPressTimerRef = useRef<number | null>(null);
   const runtimePetPointsRef = useRef(new Map<string, RuntimePetPoints>());
   const feedingPetIdsRef = useRef(new Set<string>());
   const feedDropAssignmentsRef = useRef(new Map<string, string>());
   const petFeedAssignmentsRef = useRef(new Map<string, string>());
   const feedDropClaimRef = useRef(new Map<string, string>());
   const sceneFeedMoveNonceRef = useRef(0);
+  const cardDismissUntilRef = useRef(0);
 
   const today = useMemo(
     () => formatZhDate(getSimulatedDate(simulatedDateOffset)),
@@ -232,6 +283,10 @@ export function SceneView() {
   const petsInTheme = useMemo(
     () => completedPets.filter((pet) => pet.theme === effectiveTheme),
     [completedPets, effectiveTheme],
+  );
+  const livingPetsInTheme = useMemo(
+    () => petsInTheme.filter((pet) => !pet.isDead),
+    [petsInTheme],
   );
   const selectedPet = useMemo(
     () => petsInTheme.find((pet) => pet.instanceId === selectedPetInstanceId) ?? null,
@@ -272,6 +327,17 @@ export function SceneView() {
       ?? selectedLegacyPet?.name
       ?? cardPet.petId
     : '';
+  const selectedFood = useMemo(
+    () => getFoodItemById(selectedFoodId),
+    [selectedFoodId],
+  );
+  const selectedFoodStock = foodInventory[selectedFoodId] ?? 0;
+  const totalFoodStock = useMemo(
+    () => FOOD_ITEMS.reduce((sum, food) => sum + (foodInventory[food.id] ?? 0), 0),
+    [foodInventory],
+  );
+  const hasAnyFoodStock = totalFoodStock > 0;
+  const sceneFeedBurstCount = Math.max(0, Math.min(FEED_DROP_BURST_COUNT, selectedFoodStock));
   const currentThemeLabel = SCENE_TABS.find((item) => item.theme === effectiveTheme)?.label ?? '农场';
 
   const getThemeIcon = (theme: ThemeType) => {
@@ -302,12 +368,25 @@ export function SceneView() {
 
   const isFarmDark = effectiveTheme === 'A' && (farmSkyPhase === 'dusk' || farmSkyPhase === 'night');
   const isDarkBackdrop = effectiveTheme === 'B' || isFarmDark;
-  const sceneWasteTotal = useMemo(
-    () => sceneWasteSpots.reduce((total, spot) => total + spot.count, 0),
-    [sceneWasteSpots],
-  );
+  const sceneWasteTotal = sceneWasteSpots.length;
   const isSceneToolDragging = toolDragState !== null;
   const isSceneToolDockExpanded = sceneToolDockOpen || isSceneToolDragging;
+  const isSceneShopDockExpanded = sceneShopDockOpen || showSceneShop;
+  const isSelectedFoodEmpty = selectedFoodStock <= 0;
+  const foodSelectorItems = useMemo(() => {
+    const startAngle = -105;
+    const endAngle = 75;
+    return FOOD_ITEMS.map((food, index) => {
+      const progress = FOOD_ITEMS.length === 1 ? 0.5 : index / (FOOD_ITEMS.length - 1);
+      const angleDeg = startAngle + (endAngle - startAngle) * progress;
+      const angleRad = (angleDeg * Math.PI) / 180;
+      return {
+        ...food,
+        offsetX: Math.cos(angleRad) * FOOD_SELECTOR_RADIUS,
+        offsetY: Math.sin(angleRad) * FOOD_SELECTOR_RADIUS,
+      };
+    });
+  }, []);
   const handleSwitchTheme = (theme: ThemeType, locked?: boolean) => {
     if (locked) return;
     setCurrentTheme(theme);
@@ -351,6 +430,62 @@ export function SceneView() {
   const topInfoPillToneClass = isDarkBackdrop
     ? 'border border-white/16 bg-black/28 text-white/90'
     : 'border border-slate-200/70 bg-white/82 text-slate-600';
+  const suppressPetSelection = useCallback((duration = CARD_TRANSITION_MS + 80) => {
+    cardDismissUntilRef.current = Date.now() + duration;
+  }, []);
+  const closeSelectedPetCard = useCallback((collapseDock = false) => {
+    suppressPetSelection();
+    setSelectedPetInstanceId(null);
+    if (collapseDock) {
+      setSceneToolDockOpen(false);
+      setSceneShopDockOpen(false);
+    }
+  }, [suppressPetSelection]);
+  const clearFeedToolLongPress = useCallback(() => {
+    if (feedToolLongPressTimerRef.current !== null) {
+      window.clearTimeout(feedToolLongPressTimerRef.current);
+      feedToolLongPressTimerRef.current = null;
+    }
+  }, []);
+  const closeShopPanel = useCallback(() => {
+    startTransition(() => {
+      setShowSceneShop(false);
+      setShopPanelAnchor(null);
+    });
+  }, []);
+  const closeFoodSelector = useCallback(() => {
+    setShowFoodSelector(false);
+    setFoodSelectorAnchor(null);
+    setFoodSelectorHoverId(null);
+  }, []);
+  const handleOpenSceneShop = useCallback(() => {
+    const trigger = shopToolButtonRef.current;
+    if (showSceneShop) {
+      closeShopPanel();
+      return;
+    }
+    closeSelectedPetCard();
+    closeFoodSelector();
+    setSceneShopDockOpen(true);
+    if (!trigger) {
+      setShopPanelAnchor({
+        x: 76,
+        y: window.innerHeight - 148,
+      });
+      startTransition(() => {
+        setShowSceneShop(true);
+      });
+      return;
+    }
+    const rect = trigger.getBoundingClientRect();
+    setShopPanelAnchor({
+      x: rect.right + 10,
+      y: rect.top + rect.height * 0.52,
+    });
+    startTransition(() => {
+      setShowSceneShop(true);
+    });
+  }, [closeFoodSelector, closeSelectedPetCard, closeShopPanel, showSceneShop]);
   const clearCardFeedTimers = useCallback(() => {
     if (cardFeedTickTimerRef.current !== null) {
       window.clearTimeout(cardFeedTickTimerRef.current);
@@ -568,6 +703,7 @@ export function SceneView() {
       if (farmVisualTimerRef.current !== null) {
         window.clearTimeout(farmVisualTimerRef.current);
       }
+      clearFeedToolLongPress();
       clearCardFeedTimers();
       clearCardCheerTimers();
       sceneFeedDropTimersRef.current.forEach((timer) => window.clearTimeout(timer));
@@ -579,7 +715,7 @@ export function SceneView() {
       petFeedAssignmentsRef.current.clear();
       feedDropClaimRef.current.clear();
     };
-  }, [clearCardCheerTimers, clearCardFeedTimers]);
+  }, [clearCardCheerTimers, clearCardFeedTimers, clearFeedToolLongPress]);
   useEffect(() => {
     if (selectedPet && !isOceanLocked) {
       setCardPetSnapshot(selectedPet);
@@ -604,7 +740,7 @@ export function SceneView() {
     }
 
     clearCardFeedTimers();
-    const {instanceId, startedAt, endsAt} = cardFeedSession;
+    const {instanceId, satietyGain, startedAt, endsAt} = cardFeedSession;
     const totalMs = Math.max(1, endsAt - startedAt);
     const updateProgress = () => {
       setCardFeedProgress(clamp((Date.now() - startedAt) / totalMs, 0, 1));
@@ -620,7 +756,7 @@ export function SceneView() {
 
     cardFeedCompleteTimerRef.current = window.setTimeout(() => {
       const beforePet = useStore.getState().completedPets.find((pet) => pet.instanceId === instanceId);
-      const fed = feedCompletedPet(instanceId);
+      const fed = feedCompletedPet(instanceId, {satietyGain});
       const afterPet = useStore.getState().completedPets.find((pet) => pet.instanceId === instanceId);
       if (fed && beforePet && afterPet) {
         pushSceneFeedback(
@@ -710,19 +846,38 @@ export function SceneView() {
   const isSelectedPetCardCheering = cardPet
     ? cardCheerSession?.instanceId === cardPet.instanceId
     : false;
+  const isCardPetDead = Boolean(cardPet?.isDead);
+  useEffect(() => {
+    if (!cardPet?.isDead) return;
+
+    if (cardFeedSession?.instanceId === cardPet.instanceId) {
+      clearCardFeedTimers();
+      setCardFeedSession(null);
+      setCardFeedProgress(null);
+    }
+
+    if (cardCheerSession?.instanceId === cardPet.instanceId) {
+      clearCardCheerTimers();
+      setCardCheerSession(null);
+      setCardCheerProgress(null);
+    }
+  }, [cardCheerSession, cardFeedSession, cardPet, clearCardCheerTimers, clearCardFeedTimers]);
   const selectedSpriteAction = cardPet
     ? (
-      isSelectedPetCardFeeding && hasPetSpriteAction(cardPet.petId, 'feed')
+      isCardPetDead
+        ? 'idle'
+        : isSelectedPetCardFeeding && hasPetSpriteAction(cardPet.petId, 'feed')
         ? 'feed'
         : isSelectedPetCardCheering && hasPetSpriteAction(cardPet.petId, 'happy')
           ? 'happy'
-        : resolveSceneCardAction(cardPet.petId, cardPet.state)
+          : resolveSceneCardAction(cardPet.petId, cardPet.state)
     )
     : 'idle';
   const cardHealth = cardPet ? getPetMetric(cardPet, 'health') : 0;
   const cardSatiety = cardPet ? getPetMetric(cardPet, 'satiety') : 0;
   const cardMood = cardPet ? getPetMetric(cardPet, 'mood') : 0;
   const isSelectedPetFull = cardSatiety >= FEED_BLOCK_SATIETY;
+  const isSelectedFoodUnavailable = isSelectedFoodEmpty;
   const activeCardCheerAnchor = cardCheerSession
     ? getFeedbackAnchor(cardCheerSession.instanceId, 'interaction')
     : null;
@@ -755,6 +910,7 @@ export function SceneView() {
   }, []);
   const triggerCardCheer = useCallback((pet: CompletedPet | null) => {
     if (!pet) return false;
+    if (pet.isDead) return false;
     if (cardFeedSession || cardCheerSession) return false;
 
     const startedAt = Date.now();
@@ -782,10 +938,22 @@ export function SceneView() {
   };
 
   const handlePetSelect = (pet: CompletedPet) => {
+    if (Date.now() < cardDismissUntilRef.current) return;
     setSelectedPetInstanceId(pet.instanceId);
     setSceneToolDockOpen(false);
-    triggerCardCheer(pet);
+    if (!pet.isDead) {
+      triggerCardCheer(pet);
+    }
   };
+  const handleDebugKillPet = useCallback(() => {
+    const targetPet = selectedPet && !selectedPet.isDead
+      ? selectedPet
+      : livingPetsInTheme[0] ?? null;
+    if (!targetPet) return;
+    debugKillCompletedPet(targetPet.instanceId);
+    setSelectedPetInstanceId(targetPet.instanceId);
+    setSceneToolDockOpen(false);
+  }, [debugKillCompletedPet, livingPetsInTheme, selectedPet]);
 
   const releasePetFeedAssignment = (instanceId: string) => {
     const assignedDropId = petFeedAssignmentsRef.current.get(instanceId);
@@ -817,11 +985,12 @@ export function SceneView() {
     }
   };
 
-  const spawnFeedDrop = (x: number, y: number, ttlMs = FEED_DROP_TTL_MS) => {
+  const spawnFeedDrop = (x: number, y: number, foodId: FoodId, ttlMs = FEED_DROP_TTL_MS) => {
     const dropId = `feed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const createdAt = Date.now();
     return {
       id: dropId,
+      foodId,
       x,
       y,
       createdAt,
@@ -859,18 +1028,35 @@ export function SceneView() {
 
     return nextDrops;
   }, []);
-  const spawnFeedBurst = useCallback((x: number, y: number, ttlMs = FEED_DROP_TTL_MS) => {
-    const spreadOffsets = [
-      {x: -2.3, y: 0.4},
-      {x: 0, y: -0.45},
-      {x: 2.3, y: 0.3},
-    ].slice(0, FEED_DROP_BURST_COUNT);
+  const spawnFeedBurst = useCallback((
+    x: number,
+    y: number,
+    foodId: FoodId,
+    count = FEED_DROP_BURST_COUNT,
+    ttlMs = FEED_DROP_TTL_MS,
+  ) => {
+    if (count <= 0) return sceneFeedDropsRef.current;
+
+    const spreadOffsetsByCount: Record<number, Array<{x: number; y: number}>> = {
+      1: [{x: 0, y: 0}],
+      2: [
+        {x: -1.45, y: 0.15},
+        {x: 1.45, y: 0.15},
+      ],
+      3: [
+        {x: -2.3, y: 0.4},
+        {x: 0, y: -0.45},
+        {x: 2.3, y: 0.3},
+      ],
+    };
+    const spreadOffsets = spreadOffsetsByCount[Math.min(FEED_DROP_BURST_COUNT, count)] ?? spreadOffsetsByCount[1];
     const burstDrops = spreadOffsets.map((offset, index) => {
       const jitterX = (Math.random() - 0.5) * 0.7;
       const jitterY = (Math.random() - 0.5) * 0.45;
       return spawnFeedDrop(
         clamp(x + offset.x + jitterX, SCENE_X_MIN + 1.2, SCENE_X_MAX - 1.2),
         clamp(y + offset.y + jitterY + index * 0.03, SCENE_BOTTOM_MIN + 1, SCENE_BOTTOM_MAX + 2.5),
+        foodId,
         ttlMs,
       );
     });
@@ -910,6 +1096,7 @@ export function SceneView() {
           feedRightY: pet.y,
         },
       }))
+      .filter((item) => !item.pet.isDead)
       .filter((item) => item.satiety < FEED_BLOCK_SATIETY)
       .filter((item) => !feedingPetIdsRef.current.has(item.pet.instanceId));
     if (availablePets.length === 0) return;
@@ -991,14 +1178,14 @@ export function SceneView() {
       y: rect.top + (sceneY / 100) * rect.height,
     };
   }, []);
-  const findHoveredWasteInstanceId = useCallback((clientX: number, clientY: number) => {
+  const findHoveredWasteId = useCallback((clientX: number, clientY: number) => {
     const sceneElement = sceneSurfaceRef.current;
     if (!sceneElement) return null;
     const rect = sceneElement.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
 
     const snapRadius = Math.max(28, Math.min(54, rect.width * 0.055));
-    let matchedInstanceId: string | null = null;
+    let matchedWasteId: string | null = null;
     let matchedDistance = Number.POSITIVE_INFINITY;
 
     sceneWasteSpotsRef.current.forEach((spot) => {
@@ -1007,10 +1194,10 @@ export function SceneView() {
       const distance = Math.hypot(clientX - spotClientX, clientY - spotClientY);
       if (distance > snapRadius || distance >= matchedDistance) return;
       matchedDistance = distance;
-      matchedInstanceId = spot.instanceId;
+      matchedWasteId = spot.id;
     });
 
-    return matchedInstanceId;
+    return matchedWasteId;
   }, []);
   const isPointerInsideSceneToolDock = useCallback((clientX: number, clientY: number) => {
     const dockElement = sceneToolDockRef.current;
@@ -1041,49 +1228,104 @@ export function SceneView() {
       overScene: placement.overScene,
       sceneX: placement.sceneX,
       sceneY: placement.sceneY,
-      hoveredWasteInstanceId: tool === 'clean' ? findHoveredWasteInstanceId(clientX, clientY) : null,
+      hoveredWasteId: tool === 'clean' ? findHoveredWasteId(clientX, clientY) : null,
     };
-  }, [findHoveredWasteInstanceId, getSceneToolPlacement, isPointerInsideSceneToolDock]);
+  }, [findHoveredWasteId, getSceneToolPlacement, isPointerInsideSceneToolDock]);
+  const shouldCancelSceneToolDrag = useCallback((dragState: SceneToolDragState) => (
+    dragState.overDock && !(dragState.tool === 'clean' && dragState.hoveredWasteId)
+  ), []);
   const finishSceneToolDrag = useCallback((dragState: SceneToolDragState) => {
     if (dragState.tool === 'feed' && effectiveTheme === 'A' && dragState.overScene && dragState.sceneX !== null && dragState.sceneY !== null) {
-      const nextDrops = spawnFeedBurst(dragState.sceneX, dragState.sceneY);
+      if (sceneFeedBurstCount <= 0) return;
+      const consumed = consumeFood(selectedFoodId, sceneFeedBurstCount);
+      if (!consumed) return;
+      const nextDrops = spawnFeedBurst(dragState.sceneX, dragState.sceneY, selectedFoodId, sceneFeedBurstCount);
       assignPendingFeedDrops(nextDrops);
       return;
     }
 
-    if (dragState.tool === 'clean' && dragState.hoveredWasteInstanceId) {
-      cleanCompletedPetWaste(dragState.hoveredWasteInstanceId);
+    if (dragState.tool === 'clean' && dragState.hoveredWasteId) {
+      const targetWasteSpot = sceneWasteSpotsRef.current.find((spot) => spot.id === dragState.hoveredWasteId);
+      if (!targetWasteSpot) return;
+      const cleaned = cleanCompletedPetWaste(targetWasteSpot.instanceId, targetWasteSpot.id);
+      if (cleaned) {
+        setSceneWasteCleanupRequest({
+          id: targetWasteSpot.id,
+          nonce: Date.now(),
+        });
+      }
     }
-  }, [assignPendingFeedDrops, cleanCompletedPetWaste, effectiveTheme, spawnFeedBurst]);
+  }, [assignPendingFeedDrops, cleanCompletedPetWaste, consumeFood, effectiveTheme, sceneFeedBurstCount, selectedFoodId, spawnFeedBurst]);
   const handleSceneToolCardPointerDown = useCallback((tool: SceneToolType) => (event: React.PointerEvent<HTMLButtonElement>) => {
     if (event.button !== 0) return;
-    if (tool === 'feed' && effectiveTheme !== 'A') return;
+    if (tool === 'feed' && (effectiveTheme !== 'A' || sceneFeedBurstCount <= 0)) return;
     if (tool === 'clean' && sceneWasteTotal <= 0) return;
 
     event.preventDefault();
     event.stopPropagation();
+    suppressPetSelection();
     setSelectedPetInstanceId(null);
     setToolDragState(buildSceneToolDragState(tool, event.pointerId, event.clientX, event.clientY));
-  }, [buildSceneToolDragState, effectiveTheme, sceneWasteTotal]);
+  }, [buildSceneToolDragState, effectiveTheme, sceneFeedBurstCount, sceneWasteTotal, suppressPetSelection]);
+  const handleFeedToolPointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    if (effectiveTheme !== 'A') return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    suppressPetSelection();
+    setSelectedPetInstanceId(null);
+    closeShopPanel();
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    clearFeedToolLongPress();
+    closeFoodSelector();
+    feedToolPressRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      rect,
+      selectorOpened: false,
+    };
+    feedToolLongPressTimerRef.current = window.setTimeout(() => {
+      const currentPress = feedToolPressRef.current;
+      if (!currentPress || currentPress.pointerId !== event.pointerId) return;
+      currentPress.selectorOpened = true;
+      setSceneToolDockOpen(true);
+      setFoodSelectorAnchor({
+        x: rect.left + rect.width * 0.88,
+        y: rect.top + rect.height * 0.52,
+      });
+      setFoodSelectorHoverId(selectedFoodId);
+      setShowFoodSelector(true);
+    }, FEED_TOOL_LONG_PRESS_MS);
+  }, [clearFeedToolLongPress, closeFoodSelector, closeShopPanel, effectiveTheme, selectedFoodId, suppressPetSelection]);
 
   const handleFeedSelectedPet = () => {
     if (!cardPet) return;
+    if (cardPet.isDead) return;
     if (cardSatiety >= FEED_BLOCK_SATIETY) return;
     if (cardCheerSession) return;
     if (cardFeedSession?.instanceId === cardPet.instanceId) return;
     if (feedingPetIdsRef.current.has(cardPet.instanceId)) return;
+    if (selectedFoodStock <= 0) return;
+    const consumed = consumeFood(selectedFoodId, 1);
+    if (!consumed) return;
 
     const startedAt = Date.now();
     queueSceneAction(cardPet.instanceId, 'feed');
     setCardFeedProgress(0);
     setCardFeedSession({
       instanceId: cardPet.instanceId,
+      foodId: selectedFoodId,
+      satietyGain: selectedFood.satietyGain,
       startedAt,
       endsAt: startedAt + CARD_DIRECT_FEED_MS,
     });
   };
   const handleCheerSelectedPet = () => {
     if (!cardPet) return;
+    if (cardPet.isDead) return;
     triggerCardCheer(cardPet);
   };
   useEffect(() => {
@@ -1100,7 +1342,7 @@ export function SceneView() {
       if (!currentDragState || event.pointerId !== currentDragState.pointerId) return;
       event.preventDefault();
       const nextDragState = buildSceneToolDragState(currentDragState.tool, event.pointerId, event.clientX, event.clientY);
-      if (nextDragState.overDock) {
+      if (shouldCancelSceneToolDrag(nextDragState)) {
         setToolDragState(null);
         return;
       }
@@ -1122,7 +1364,73 @@ export function SceneView() {
       window.removeEventListener('pointerup', handlePointerUp);
       window.removeEventListener('pointercancel', handlePointerCancel);
     };
-  }, [buildSceneToolDragState, finishSceneToolDrag, isSceneToolDragging]);
+  }, [buildSceneToolDragState, finishSceneToolDrag, isSceneToolDragging, shouldCancelSceneToolDrag]);
+  useEffect(() => {
+    const handlePointerMove = (event: PointerEvent) => {
+      const currentPress = feedToolPressRef.current;
+      if (!currentPress || currentPress.pointerId !== event.pointerId) return;
+      if (currentPress.selectorOpened) {
+        if (!foodSelectorAnchor) return;
+        let nextHoveredFoodId: FoodId | null = null;
+        let nearestDistance = Number.POSITIVE_INFINITY;
+        foodSelectorItems.forEach((food) => {
+          const targetX = foodSelectorAnchor.x + food.offsetX;
+          const targetY = foodSelectorAnchor.y + food.offsetY;
+          const distance = Math.hypot(event.clientX - targetX, event.clientY - targetY);
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nextHoveredFoodId = food.id;
+          }
+        });
+        setFoodSelectorHoverId(nearestDistance <= 52 ? nextHoveredFoodId : null);
+        return;
+      }
+
+      const distance = Math.hypot(event.clientX - currentPress.startX, event.clientY - currentPress.startY);
+      if (distance < FEED_TOOL_DRAG_START_DISTANCE) return;
+      if (selectedFoodStock <= 0) return;
+
+      clearFeedToolLongPress();
+      closeFoodSelector();
+      feedToolPressRef.current = null;
+      setToolDragState(buildSceneToolDragState('feed', event.pointerId, event.clientX, event.clientY));
+    };
+    const handlePointerUp = (event: PointerEvent) => {
+      const currentPress = feedToolPressRef.current;
+      if (!currentPress || currentPress.pointerId !== event.pointerId) return;
+      clearFeedToolLongPress();
+      if (currentPress.selectorOpened && foodSelectorHoverId) {
+        setSelectedFood(foodSelectorHoverId);
+      }
+      closeFoodSelector();
+      feedToolPressRef.current = null;
+    };
+    const handlePointerCancel = (event: PointerEvent) => {
+      const currentPress = feedToolPressRef.current;
+      if (!currentPress || currentPress.pointerId !== event.pointerId) return;
+      clearFeedToolLongPress();
+      closeFoodSelector();
+      feedToolPressRef.current = null;
+    };
+
+    window.addEventListener('pointermove', handlePointerMove, {passive: false});
+    window.addEventListener('pointerup', handlePointerUp, {passive: false});
+    window.addEventListener('pointercancel', handlePointerCancel, {passive: false});
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerCancel);
+    };
+  }, [
+    buildSceneToolDragState,
+    clearFeedToolLongPress,
+    closeFoodSelector,
+    foodSelectorAnchor,
+    foodSelectorHoverId,
+    foodSelectorItems,
+    selectedFoodStock,
+    setSelectedFood,
+  ]);
   const handlePetFeedStarted = ({instanceId, dropId}: {instanceId: string; dropId: string}) => {
     const assignedDropId = petFeedAssignmentsRef.current.get(instanceId);
     const assignedPetId = feedDropAssignmentsRef.current.get(dropId);
@@ -1147,6 +1455,18 @@ export function SceneView() {
     if (effectiveTheme !== 'A') return;
     assignPendingFeedDrops(sceneFeedDrops);
   }, [assignPendingFeedDrops, effectiveTheme, sceneFeedDrops]);
+  useEffect(() => {
+    if (sceneToolDockOpen) return;
+    closeFoodSelector();
+  }, [closeFoodSelector, sceneToolDockOpen]);
+  useEffect(() => {
+    if (effectiveTheme === 'A') return;
+    clearFeedToolLongPress();
+    feedToolPressRef.current = null;
+    closeFoodSelector();
+    closeShopPanel();
+    setSceneShopDockOpen(false);
+  }, [clearFeedToolLongPress, closeFoodSelector, closeShopPanel, effectiveTheme]);
   useEffect(() => {
     if (!toolDragState) return;
     if (toolDragState.tool === 'feed' && effectiveTheme !== 'A') {
@@ -1182,7 +1502,9 @@ export function SceneView() {
     }
 
     const beforePet = useStore.getState().completedPets.find((pet) => pet.instanceId === instanceId);
-    const fed = feedCompletedPet(instanceId);
+    const fed = feedCompletedPet(instanceId, {
+      satietyGain: getFoodItemById(currentDrop.foodId).satietyGain,
+    });
     const afterPet = useStore.getState().completedPets.find((pet) => pet.instanceId === instanceId);
     releasePetFeedAssignment(instanceId);
     if (feedDropClaimRef.current.get(dropId) === instanceId) {
@@ -1242,13 +1564,13 @@ export function SceneView() {
   const toolDragPreviewPoint = toolDragState?.overScene && toolDragState.sceneX !== null && toolDragState.sceneY !== null
     ? getSceneClientPoint(toolDragState.sceneX, toolDragState.sceneY)
     : null;
-  const activeHoveredWaste = toolDragState?.hoveredWasteInstanceId
-    ? sceneWasteSpots.find((spot) => spot.instanceId === toolDragState.hoveredWasteInstanceId) ?? null
+  const activeHoveredWaste = toolDragState?.hoveredWasteId
+    ? sceneWasteSpots.find((spot) => spot.id === toolDragState.hoveredWasteId) ?? null
     : null;
   const hoveredWastePreviewPoint = activeHoveredWaste
     ? getSceneClientPoint(activeHoveredWaste.x, activeHoveredWaste.y)
     : null;
-  const isSceneToolCancelHover = toolDragState?.overDock ?? false;
+  const isSceneToolCancelHover = toolDragState ? shouldCancelSceneToolDrag(toolDragState) : false;
 
   return (
     <div
@@ -1396,6 +1718,21 @@ export function SceneView() {
               )}>
                 清空场景
               </button>
+            <button
+              onClick={handleDebugKillPet}
+              disabled={livingPetsInTheme.length === 0}
+              className={cn(
+                'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
+                livingPetsInTheme.length === 0
+                  ? (isDarkBackdrop
+                    ? 'cursor-not-allowed border-white/10 bg-white/8 text-white/38 active:scale-100'
+                    : 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 active:scale-100')
+                  : (isDarkBackdrop
+                    ? 'border-white/18 bg-black/28 text-white hover:bg-black/34'
+                    : 'border-slate-200 bg-white/90 text-slate-700 hover:bg-white'),
+              )}>
+              测试死亡
+            </button>
             </div>
         )}
       </div>
@@ -1432,11 +1769,13 @@ export function SceneView() {
               isDarkBackdrop={isDarkBackdrop}
               sceneSurfaceRef={sceneSurfaceRef}
               onWasteSpotsChange={setSceneWasteSpots}
-              highlightedWasteInstanceId={toolDragState?.tool === 'clean' ? toolDragState.hoveredWasteInstanceId : null}
+              highlightedWasteId={toolDragState?.tool === 'clean' ? toolDragState.hoveredWasteId : null}
+              cleanedWasteRequest={sceneWasteCleanupRequest}
               onPetSelect={isSceneToolDragging ? undefined : handlePetSelect}
               onSceneBlankClick={() => {
-                setSelectedPetInstanceId(null);
-                setSceneToolDockOpen(false);
+                closeSelectedPetCard(true);
+                closeFoodSelector();
+                closeShopPanel();
               }}
               onRuntimePetPointChange={handleRuntimePetPointChange}
               actionRequest={sceneActionRequest}
@@ -1525,144 +1864,314 @@ export function SceneView() {
 
       {effectiveTheme === 'A' && (
         <div ref={sceneToolDockRef} className="pointer-events-none absolute bottom-24 left-0.5 z-[4850]">
-          <div
-            className={cn(
-              'relative flex items-center transition-transform duration-150',
-              isSceneToolCancelHover ? 'scale-[1.02]' : '',
-            )}>
+          <div className="flex flex-col items-start gap-2">
             <div
               className={cn(
-                'overflow-hidden transition-[width,opacity] duration-220 ease-out',
-                isSceneToolDockExpanded ? 'w-[78px] opacity-100' : 'w-0 opacity-0',
+                'relative flex items-center transition-transform duration-150',
+                isSceneToolCancelHover ? 'scale-[1.02]' : '',
               )}>
-              <div className="pointer-events-auto flex w-[78px] flex-col gap-1.5">
-                <button
-                  type="button"
-                  onPointerDown={handleSceneToolCardPointerDown('feed')}
-                  className={cn(
-                    'group relative inline-flex h-11 w-[78px] items-center justify-center gap-1.5 rounded-[20px] border px-2.5 text-[11px] font-black shadow-[0_6px_18px_rgba(15,23,42,0.07)] transition-all active:scale-[0.98] touch-none',
-                    isSceneToolCancelHover
-                      ? (isDarkBackdrop
-                        ? 'border-rose-200/70 bg-rose-300/20 text-rose-50 shadow-[0_12px_28px_rgba(251,113,133,0.18)]'
-                        : 'border-rose-200 bg-rose-50 text-rose-700 shadow-[0_12px_24px_rgba(251,113,133,0.14)]')
-                      : toolDragState?.tool === 'feed'
-                      ? (isDarkBackdrop
-                        ? 'border-amber-200/65 bg-amber-300/24 text-amber-50 shadow-[0_12px_28px_rgba(251,191,36,0.22)]'
-                        : 'border-amber-200 bg-amber-100 text-amber-900 shadow-[0_12px_24px_rgba(245,158,11,0.18)]')
-                      : (isDarkBackdrop
-                        ? 'border-white/8 bg-black/10 text-white/58 hover:bg-black/14'
-                        : 'border-white/55 bg-white/56 text-slate-600 hover:bg-white/70'),
-                  )}>
-                  <span
+              <div
+                className={cn(
+                  'overflow-hidden transition-[width,opacity] duration-220 ease-out',
+                  isSceneToolDockExpanded ? 'w-[78px] opacity-100' : 'w-0 opacity-0',
+                )}>
+                <div className="pointer-events-auto flex w-[78px] flex-col gap-1.5">
+                  <button
+                    ref={feedToolButtonRef}
+                    type="button"
+                    onPointerDown={handleFeedToolPointerDown}
                     className={cn(
-                      'inline-flex h-6 w-6 items-center justify-center rounded-full border text-[13px] shadow-sm transition-transform duration-150 group-active:scale-95',
+                      'group relative inline-flex h-11 w-[78px] items-center justify-center gap-1.5 rounded-[20px] border pl-2.5 pr-7 text-[11px] font-black shadow-[0_10px_20px_rgba(15,23,42,0.05)] backdrop-blur-xl transition-all active:scale-[0.98] touch-none',
                       isSceneToolCancelHover
                         ? (isDarkBackdrop
-                          ? 'border-rose-200/45 bg-rose-200/20 text-rose-50'
-                          : 'border-rose-200 bg-white/92 text-rose-500')
+                          ? 'border-rose-200/70 bg-rose-300/20 text-rose-50 shadow-[0_12px_28px_rgba(251,113,133,0.18)]'
+                          : 'border-rose-200 bg-rose-50 text-rose-700 shadow-[0_12px_24px_rgba(251,113,133,0.14)]')
                         : toolDragState?.tool === 'feed'
                         ? (isDarkBackdrop
-                          ? 'border-amber-200/45 bg-amber-200/20'
-                          : 'border-amber-200 bg-white/92')
-                        : (isDarkBackdrop
-                          ? 'border-white/8 bg-white/6 text-white/72'
-                          : 'border-white/72 bg-white/70 text-slate-500'),
-                    )}>
-                    <Wheat size={12} strokeWidth={2.4} />
-                  </span>
-                  <span className={cn(isSceneToolCancelHover ? 'opacity-100' : toolDragState?.tool === 'feed' ? '' : 'opacity-78')}>
-                    {isSceneToolCancelHover ? '取消' : '投喂'}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  disabled={sceneWasteTotal <= 0}
-                  onPointerDown={handleSceneToolCardPointerDown('clean')}
-                  className={cn(
-                    'group relative inline-flex h-11 w-[78px] items-center justify-center gap-1.5 rounded-[20px] border px-2.5 text-[11px] font-black shadow-[0_6px_18px_rgba(15,23,42,0.07)] transition-all active:scale-[0.98] touch-none',
-                    isSceneToolCancelHover
-                      ? (isDarkBackdrop
-                        ? 'border-rose-200/70 bg-rose-300/20 text-rose-50 shadow-[0_12px_28px_rgba(251,113,133,0.18)]'
-                        : 'border-rose-200 bg-rose-50 text-rose-700 shadow-[0_12px_24px_rgba(251,113,133,0.14)]')
-                      : '',
-                    sceneWasteTotal <= 0 &&
-                      (isDarkBackdrop
-                        ? 'cursor-not-allowed border-white/10 bg-white/6 text-white/38 shadow-none'
-                        : 'cursor-not-allowed border-slate-200/80 bg-slate-100/88 text-slate-400 shadow-none'),
-                    !isSceneToolCancelHover && sceneWasteTotal > 0 && toolDragState?.tool === 'clean'
-                      ? (isDarkBackdrop
-                        ? 'border-emerald-200/65 bg-emerald-300/24 text-emerald-50 shadow-[0_12px_28px_rgba(52,211,153,0.2)]'
-                        : 'border-emerald-200 bg-emerald-50 text-emerald-900 shadow-[0_12px_24px_rgba(16,185,129,0.16)]')
-                      : !isSceneToolCancelHover && sceneWasteTotal > 0
+                          ? 'border-amber-200/65 bg-amber-300/24 text-amber-50 shadow-[0_12px_28px_rgba(251,191,36,0.22)]'
+                          : 'border-amber-200 bg-amber-100 text-amber-900 shadow-[0_12px_24px_rgba(245,158,11,0.18)]')
+                        : isSelectedFoodEmpty
                         ? (isDarkBackdrop
+                          ? 'border-white/10 bg-white/8 text-white/52 shadow-none'
+                          : 'border-white/58 bg-white/28 text-slate-700 shadow-none')
+                        : (isDarkBackdrop
                           ? 'border-white/8 bg-black/10 text-white/58 hover:bg-black/14'
-                          : 'border-white/55 bg-white/56 text-slate-600 hover:bg-white/70')
-                        : '',
-                  )}>
-                  <span
+                          : 'border-white/62 bg-white/38 text-slate-900 hover:bg-white/48'),
+                    )}>
+                    <UiTextureLayer path={FLOATING_PANEL_ASSET_PATH} className="rounded-[inherit]" opacity={0.9} />
+                    <span
+                      className={cn(
+                        'relative z-[1] inline-flex h-6 w-6 items-center justify-center rounded-full border text-[13px] shadow-sm transition-transform duration-150 group-active:scale-95',
+                        isSceneToolCancelHover
+                          ? (isDarkBackdrop
+                            ? 'border-rose-200/45 bg-rose-200/20 text-rose-50'
+                            : 'border-rose-200 bg-white/92 text-rose-500')
+                          : toolDragState?.tool === 'feed'
+                          ? (isDarkBackdrop
+                            ? 'border-amber-200/45 bg-amber-200/20'
+                            : 'border-amber-200 bg-white/92')
+                          : (isDarkBackdrop
+                            ? 'border-white/8 bg-white/6 text-white/72'
+                            : 'border-white/66 bg-white/56 text-slate-700'),
+                      )}>
+                      <FoodSprite foodId={selectedFoodId} size={16} />
+                    </span>
+                    <span className="relative z-[1] text-[11px] tracking-[0.01em] text-current [text-shadow:0_1px_0_rgba(255,255,255,0.72)]">
+                      {isSceneToolCancelHover ? '取消' : isSelectedFoodEmpty ? (hasAnyFoodStock ? '切粮' : '缺粮') : '投喂'}
+                    </span>
+                    <span className="absolute right-1.5 top-1/2 z-[1] inline-flex h-[18px] min-w-[18px] -translate-y-1/2 items-center justify-center rounded-full border border-white/85 bg-amber-300 px-1 text-[8px] font-black leading-none text-amber-950 shadow-[0_2px_6px_rgba(245,158,11,0.24)]">
+                      {selectedFoodStock}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={sceneWasteTotal <= 0}
+                    onPointerDown={handleSceneToolCardPointerDown('clean')}
                     className={cn(
-                      'inline-flex h-6 w-6 items-center justify-center rounded-full border text-[13px] shadow-sm transition-transform duration-150 group-active:scale-95',
+                      'group relative inline-flex h-11 w-[78px] items-center justify-center gap-1.5 rounded-[20px] border pl-2.5 pr-7 text-[11px] font-black shadow-[0_10px_20px_rgba(15,23,42,0.05)] backdrop-blur-xl transition-all active:scale-[0.98] touch-none',
                       isSceneToolCancelHover
                         ? (isDarkBackdrop
-                          ? 'border-rose-200/45 bg-rose-200/20 text-rose-50'
-                          : 'border-rose-200 bg-white/92 text-rose-500')
-                        : sceneWasteTotal > 0 && toolDragState?.tool === 'clean'
+                          ? 'border-rose-200/70 bg-rose-300/20 text-rose-50 shadow-[0_12px_28px_rgba(251,113,133,0.18)]'
+                          : 'border-rose-200 bg-rose-50 text-rose-700 shadow-[0_12px_24px_rgba(251,113,133,0.14)]')
+                        : '',
+                      sceneWasteTotal <= 0 &&
+                        (isDarkBackdrop
+                          ? 'cursor-not-allowed border-white/10 bg-white/6 text-white/38 shadow-none'
+                          : 'cursor-not-allowed border-white/58 bg-white/28 text-slate-400 shadow-none'),
+                      !isSceneToolCancelHover && sceneWasteTotal > 0 && toolDragState?.tool === 'clean'
                         ? (isDarkBackdrop
-                          ? 'border-emerald-200/45 bg-emerald-200/20'
-                          : 'border-emerald-200 bg-white/92')
-                        : (isDarkBackdrop
-                          ? 'border-white/8 bg-white/6 text-white/72'
-                          : 'border-white/72 bg-white/70 text-slate-500'),
+                          ? 'border-emerald-200/65 bg-emerald-300/24 text-emerald-50 shadow-[0_12px_28px_rgba(52,211,153,0.2)]'
+                          : 'border-emerald-200 bg-emerald-50 text-emerald-900 shadow-[0_12px_24px_rgba(16,185,129,0.16)]')
+                        : !isSceneToolCancelHover && sceneWasteTotal > 0
+                          ? (isDarkBackdrop
+                            ? 'border-white/8 bg-black/10 text-white/58 hover:bg-black/14'
+                            : 'border-white/62 bg-white/38 text-slate-900 hover:bg-white/48')
+                          : '',
                     )}>
-                    <Sparkles size={12} strokeWidth={2.3} />
-                  </span>
-                  <span className={cn(isSceneToolCancelHover ? 'opacity-100' : sceneWasteTotal > 0 && toolDragState?.tool === 'clean' ? '' : 'opacity-78')}>
-                    {isSceneToolCancelHover ? '取消' : '清理'}
-                  </span>
-                  {sceneWasteTotal > 0 && (
-                    <span className="absolute -right-1 -top-1 inline-flex min-w-5 items-center justify-center rounded-full border border-white/85 bg-emerald-400 px-1 text-[9px] leading-4 text-emerald-950 shadow-[0_2px_6px_rgba(16,185,129,0.24)]">
-                      {sceneWasteTotal}
+                    <UiTextureLayer path={FLOATING_PANEL_ASSET_PATH} className="rounded-[inherit]" opacity={0.9} />
+                    <span
+                      className={cn(
+                        'relative z-[1] inline-flex h-6 w-6 items-center justify-center rounded-full border text-[13px] shadow-sm transition-transform duration-150 group-active:scale-95',
+                        isSceneToolCancelHover
+                          ? (isDarkBackdrop
+                            ? 'border-rose-200/45 bg-rose-200/20 text-rose-50'
+                            : 'border-rose-200 bg-white/92 text-rose-500')
+                          : sceneWasteTotal > 0 && toolDragState?.tool === 'clean'
+                          ? (isDarkBackdrop
+                            ? 'border-emerald-200/45 bg-emerald-200/20'
+                            : 'border-emerald-200 bg-white/92')
+                          : (isDarkBackdrop
+                            ? 'border-white/8 bg-white/6 text-white/72'
+                            : 'border-white/66 bg-white/56 text-slate-700'),
+                      )}>
+                      <Sparkles size={12} strokeWidth={2.3} />
                     </span>
-                  )}
-                </button>
+                    <span className="relative z-[1] text-[11px] tracking-[0.01em] text-current [text-shadow:0_1px_0_rgba(255,255,255,0.72)]">
+                      {isSceneToolCancelHover ? '取消' : '清理'}
+                    </span>
+                    {sceneWasteTotal > 0 && (
+                      <span className="absolute right-1.5 top-1/2 z-[1] inline-flex h-[18px] min-w-[18px] -translate-y-1/2 items-center justify-center rounded-full border border-white/85 bg-emerald-400 px-1 text-[8px] font-black leading-none text-emerald-950 shadow-[0_2px_6px_rgba(16,185,129,0.24)]">
+                        {sceneWasteTotal}
+                      </span>
+                    )}
+                  </button>
+                </div>
               </div>
-            </div>
 
-            <button
-              type="button"
-              onClick={() => setSceneToolDockOpen((previous) => !previous)}
+              <button
+                type="button"
+                onClick={() => setSceneToolDockOpen((previous) => !previous)}
+                className={cn(
+                  'pointer-events-auto ml-0.5 inline-flex h-[62px] w-5.5 shrink-0 flex-col items-center justify-center gap-0.5 rounded-r-[16px] rounded-l-[10px] border shadow-[0_8px_18px_rgba(15,23,42,0.05)] backdrop-blur-xl transition-all active:scale-[0.98]',
+                  isSceneToolCancelHover
+                    ? (isDarkBackdrop
+                      ? 'border-rose-200/70 bg-rose-300/20 text-rose-50'
+                      : 'border-rose-200 bg-rose-50 text-rose-700')
+                    : (isDarkBackdrop
+                      ? 'border-white/10 bg-black/18 text-white/76 hover:bg-black/24'
+                      : 'border-white/58 bg-white/34 text-slate-800 hover:bg-white/44'),
+                )}
+                title={isSceneToolDockExpanded ? '收起工具' : '展开工具'}>
+                <UiTextureLayer path={TOGGLE_HANDLE_ASSET_PATH} className="rounded-[inherit]" opacity={0.92} />
+                <div className="relative z-[1] flex flex-col items-center gap-1">
+                  <Wheat size={9} strokeWidth={2.3} className={cn(isSceneToolCancelHover ? 'text-current' : toolDragState?.tool === 'feed' ? 'text-amber-500' : '')} />
+                  <Sparkles size={9} strokeWidth={2.2} className={cn(isSceneToolCancelHover ? 'text-current' : toolDragState?.tool === 'clean' ? 'text-emerald-500' : '')} />
+                </div>
+                {sceneWasteTotal > 0 && (
+                  <span className="absolute right-0.5 top-1 z-[1] h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_0_2px_rgba(255,255,255,0.82)]" />
+                )}
+                <span className="absolute bottom-1 z-[1]">
+                  {isSceneToolCancelHover
+                    ? <X size={10} strokeWidth={2.7} />
+                    : isSceneToolDockExpanded
+                      ? <ChevronLeft size={10} strokeWidth={2.7} />
+                      : <ChevronRight size={10} strokeWidth={2.7} />}
+                </span>
+              </button>
+            </div>
+            <div
               className={cn(
-                'pointer-events-auto ml-0.5 inline-flex h-[62px] w-5.5 shrink-0 flex-col items-center justify-center gap-0.5 rounded-r-[16px] rounded-l-[10px] border shadow-[0_7px_16px_rgba(15,23,42,0.08)] backdrop-blur-md transition-all active:scale-[0.98]',
-                isSceneToolCancelHover
-                  ? (isDarkBackdrop
-                    ? 'border-rose-200/70 bg-rose-300/20 text-rose-50'
-                    : 'border-rose-200 bg-rose-50 text-rose-700')
-                  : (isDarkBackdrop
-                    ? 'border-white/10 bg-black/18 text-white/76 hover:bg-black/24'
-                    : 'border-white/78 bg-white/72 text-slate-600 hover:bg-white/86'),
-              )}
-              title={isSceneToolDockExpanded ? '收起工具' : '展开工具'}>
-              <div className="flex flex-col items-center gap-1">
-                <Wheat size={9} strokeWidth={2.3} className={cn(isSceneToolCancelHover ? 'text-current' : toolDragState?.tool === 'feed' ? 'text-amber-500' : '')} />
-                <Sparkles size={9} strokeWidth={2.2} className={cn(isSceneToolCancelHover ? 'text-current' : toolDragState?.tool === 'clean' ? 'text-emerald-500' : '')} />
+                'relative flex items-center transition-transform duration-150',
+                showSceneShop ? 'scale-[1.01]' : '',
+              )}>
+              <div
+                className={cn(
+                  'overflow-hidden transition-[width,opacity] duration-220 ease-out',
+                  isSceneShopDockExpanded ? 'w-[78px] opacity-100' : 'w-0 opacity-0',
+                )}>
+                <div className="pointer-events-auto flex w-[78px]">
+                  <button
+                    ref={shopToolButtonRef}
+                    type="button"
+                    onClick={handleOpenSceneShop}
+                    className={cn(
+                      'group relative inline-flex h-11 w-[78px] items-center justify-center gap-1.5 rounded-[20px] border px-2.5 text-[11px] font-black shadow-[0_10px_20px_rgba(15,23,42,0.05)] backdrop-blur-xl transition-all active:scale-[0.98]',
+                      showSceneShop
+                        ? (isDarkBackdrop
+                          ? 'border-amber-200/65 bg-amber-300/24 text-amber-50 shadow-[0_12px_28px_rgba(251,191,36,0.2)]'
+                          : 'border-amber-200 bg-amber-100 text-amber-900 shadow-[0_12px_24px_rgba(245,158,11,0.16)]')
+                        : (isDarkBackdrop
+                          ? 'border-white/8 bg-black/10 text-white/58 hover:bg-black/14'
+                          : 'border-white/62 bg-white/38 text-slate-900 hover:bg-white/48'),
+                    )}>
+                    <UiTextureLayer path={SHOP_BUTTON_ASSET_PATH ?? FLOATING_PANEL_ASSET_PATH} className="rounded-[inherit]" opacity={0.92} />
+                    <span
+                      className={cn(
+                        'relative z-[1] inline-flex h-6 w-6 items-center justify-center rounded-full border text-[13px] shadow-sm transition-transform duration-150 group-active:scale-95',
+                        showSceneShop
+                          ? (isDarkBackdrop
+                            ? 'border-amber-200/45 bg-amber-200/20 text-amber-50'
+                            : 'border-amber-200 bg-white/92 text-amber-600')
+                          : (isDarkBackdrop
+                            ? 'border-white/8 bg-white/6 text-white/72'
+                            : 'border-white/66 bg-white/56 text-slate-700'),
+                      )}>
+                      <Store size={12} strokeWidth={2.3} />
+                    </span>
+                    <span className="relative z-[1] text-[11px] tracking-[0.01em] text-current [text-shadow:0_1px_0_rgba(255,255,255,0.72)]">
+                      {showSceneShop ? '收起' : '商店'}
+                    </span>
+                  </button>
+                </div>
               </div>
-              {sceneWasteTotal > 0 && (
-                <span className="absolute right-0.5 top-1 h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_0_2px_rgba(255,255,255,0.82)]" />
-              )}
-              <span className="absolute bottom-1">
-                {isSceneToolCancelHover
-                  ? <X size={10} strokeWidth={2.7} />
-                  : isSceneToolDockExpanded
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (showSceneShop) {
+                    closeShopPanel();
+                    setSceneShopDockOpen(false);
+                    return;
+                  }
+                  setSceneShopDockOpen((previous) => !previous);
+                }}
+                className={cn(
+                  'pointer-events-auto ml-0.5 inline-flex h-[50px] w-5.5 shrink-0 flex-col items-center justify-center gap-0.5 rounded-r-[16px] rounded-l-[10px] border shadow-[0_8px_18px_rgba(15,23,42,0.05)] backdrop-blur-xl transition-all active:scale-[0.98]',
+                  showSceneShop
+                    ? (isDarkBackdrop
+                      ? 'border-amber-200/55 bg-amber-200/18 text-amber-50'
+                      : 'border-amber-200 bg-amber-50 text-amber-800')
+                    : (isDarkBackdrop
+                      ? 'border-white/10 bg-black/18 text-white/76 hover:bg-black/24'
+                      : 'border-white/58 bg-white/34 text-slate-800 hover:bg-white/44'),
+                )}
+                title={isSceneShopDockExpanded ? '收起商店' : '展开商店'}>
+                <UiTextureLayer path={TOGGLE_HANDLE_ASSET_PATH} className="rounded-[inherit]" opacity={0.92} />
+                <Store size={9} strokeWidth={2.3} className={cn('relative z-[1]', showSceneShop ? 'text-current' : '')} />
+                <span className="absolute bottom-1 z-[1]">
+                  {isSceneShopDockExpanded
                     ? <ChevronLeft size={10} strokeWidth={2.7} />
                     : <ChevronRight size={10} strokeWidth={2.7} />}
-              </span>
-            </button>
+                </span>
+              </button>
+            </div>
           </div>
         </div>
       )}
 
+      {showFoodSelector && foodSelectorAnchor && (
+        <>
+          <div
+            className="fixed inset-0 z-[5400]"
+            onPointerDown={() => closeFoodSelector()}
+          />
+          <div className="pointer-events-none fixed inset-0 z-[5420]">
+            <div
+              className="absolute"
+              style={{
+                left: foodSelectorAnchor.x,
+                top: foodSelectorAnchor.y,
+              }}>
+              <div
+                className={cn(
+                  'absolute -translate-x-[8%] -translate-y-[134%] rounded-full border px-2.5 py-1 text-[10px] font-black shadow-[0_10px_24px_rgba(15,23,42,0.14)] backdrop-blur-md',
+                  isDarkBackdrop
+                    ? 'border-white/12 bg-black/24 text-white'
+                    : 'border-white/85 bg-white/94 text-slate-700',
+                )}>
+                {foodSelectorHoverId ? `${getFoodItemById(foodSelectorHoverId).label} · 松手确认` : '滑到食物上，松手确认'}
+              </div>
+              {foodSelectorItems.map((food) => {
+                const stock = foodInventory[food.id] ?? 0;
+                const isHovered = food.id === foodSelectorHoverId;
+                const isSelected = food.id === selectedFoodId;
+                return (
+                  <div
+                    key={food.id}
+                    className={cn(
+                      'absolute inline-flex h-11 w-11 items-center justify-center rounded-full border shadow-[0_10px_22px_rgba(15,23,42,0.14)] backdrop-blur-md transition-all duration-150',
+                      isHovered
+                        ? 'scale-[1.16] border-amber-200 bg-amber-50'
+                        : isSelected
+                          ? 'scale-[1.03] border-amber-100 bg-amber-50/88'
+                          : stock <= 0
+                            ? (isDarkBackdrop
+                              ? 'scale-[0.94] border-white/8 bg-black/18 opacity-72'
+                              : 'scale-[0.94] border-slate-200/85 bg-white/86 opacity-72')
+                        : isDarkBackdrop
+                          ? 'border-white/12 bg-black/22'
+                          : 'border-white/85 bg-white/94',
+                    )}
+                    style={{
+                      transform: `translate(${food.offsetX}px, ${food.offsetY}px) translate(-50%, -50%)`,
+                    }}
+                    title={`${food.label}（库存 ${stock}）`}>
+                    <span
+                      className={cn(
+                        'inline-flex h-8 w-8 items-center justify-center rounded-full border',
+                        isHovered
+                          ? 'border-amber-200 bg-white'
+                          : isSelected
+                            ? 'border-amber-100 bg-white'
+                            : stock <= 0
+                              ? (isDarkBackdrop
+                                ? 'border-white/10 bg-white/4'
+                                : 'border-slate-200 bg-slate-50/92')
+                          : isDarkBackdrop
+                            ? 'border-white/10 bg-white/6'
+                            : 'border-slate-200 bg-slate-50',
+                      )}>
+                      <FoodSprite foodId={food.id} size={18} />
+                    </span>
+                    <span
+                      className={cn(
+                        'absolute -right-1 -top-1 inline-flex min-w-4 items-center justify-center rounded-full border px-1 text-[8px] font-black leading-4 shadow-sm',
+                        stock > 0
+                          ? 'border-white/90 bg-amber-300 text-amber-950'
+                          : 'border-white/90 bg-slate-300 text-slate-700',
+                      )}>
+                      {stock}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
+
       {cardPet && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-24 z-[5000] flex justify-end px-3">
+        <div className="pointer-events-none absolute inset-x-0 bottom-24 z-[6000] flex justify-end px-3">
           <section
             className={cn(
               'pointer-events-auto relative w-[192px] rounded-xl border p-2 backdrop-blur-[2px]',
@@ -1671,7 +2180,9 @@ export function SceneView() {
               isDarkBackdrop
                 ? 'border-white/12 bg-black/24 text-white shadow-[0_6px_16px_rgba(2,6,23,0.24)]'
                 : 'border-slate-200/75 bg-white/82 text-slate-700 shadow-[0_6px_14px_rgba(15,23,42,0.12)]',
-            )}>
+            )}
+            onPointerDown={(event) => event.stopPropagation()}
+            onPointerUp={(event) => event.stopPropagation()}>
             <div className="flex items-start justify-between gap-2 pr-1">
               <div className="min-w-0 pr-8">
                 <p className={cn('truncate text-sm font-black', isDarkBackdrop ? 'text-white' : 'text-slate-800')}>
@@ -1687,13 +2198,17 @@ export function SceneView() {
                   event.preventDefault();
                   event.stopPropagation();
                 }}
+                onPointerUp={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
-                  setSelectedPetInstanceId(null);
+                  closeSelectedPetCard();
                 }}
                 className={cn(
-                  'absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-xl border transition-colors touch-manipulation',
+                  'absolute right-2 top-2 z-[2] inline-flex h-8 w-8 items-center justify-center rounded-xl border transition-colors touch-manipulation',
                   isDarkBackdrop
                     ? 'border-white/20 bg-white/10 text-white/85 hover:bg-white/18'
                     : 'border-slate-200 bg-white/95 text-slate-500 hover:bg-slate-100',
@@ -1710,14 +2225,18 @@ export function SceneView() {
                   : 'border-slate-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.92),rgba(238,242,255,0.76))]',
               )}>
               {selectedSpriteOption ? (
-                <SpriteActor
-                  spriteKey={selectedSpriteOption.key}
-                  action={selectedSpriteAction}
-                  scale={Math.min(selectedSpriteOption.sceneScale ?? 2.2, 2.35)}
-                  flipX={selectedSpriteOption.flipX}
+                isCardPetDead ? (
+                  <GraveSprite size={34} className="drop-shadow-[0_8px_16px_rgba(15,23,42,0.16)]" />
+                ) : (
+                  <SpriteActor
+                    spriteKey={selectedSpriteOption.key}
+                    action={selectedSpriteAction}
+                    scale={Math.min(selectedSpriteOption.sceneScale ?? 2.2, 2.35)}
+                    flipX={selectedSpriteOption.flipX}
                     ariaLabel={selectedDisplayName}
                     className="drop-shadow-[0_8px_18px_rgba(15,23,42,0.24)]"
                   />
+                )
                 ) : selectedCustomPet ? (
                   <img
                     src={selectedCustomPet.image}
@@ -1752,9 +2271,9 @@ export function SceneView() {
                   {QUALITY_LABELS[cardPet.quality]}
                 </p>
               </div>
-              <div className={cn('rounded-lg border px-1.5 py-0.5 text-center', STATE_TONE[cardPet.state])}>
-                <p className="text-[9px] font-semibold opacity-70">状态</p>
-                <p className="text-[10px] font-black">{STATE_LABELS[cardPet.state]}</p>
+              <div className={cn('rounded-lg border px-1.5 py-0.5 text-center', isCardPetDead ? 'border-slate-300 bg-slate-100 text-slate-500' : STATE_TONE[cardPet.state])}>
+                <p className="text-[9px] font-semibold opacity-70">{isCardPetDead ? '生命' : '状态'}</p>
+                <p className="text-[10px] font-black">{isCardPetDead ? '已离世' : STATE_LABELS[cardPet.state]}</p>
               </div>
             </div>
 
@@ -1774,7 +2293,7 @@ export function SceneView() {
                   {
                     label: '健康',
                     value: cardHealth,
-                    tip: getHealthLabel(cardHealth),
+                    tip: isCardPetDead ? '已离世' : getHealthLabel(cardHealth),
                     tone: isDarkBackdrop ? 'bg-emerald-300' : 'bg-emerald-500',
                   },
                   {
@@ -1812,77 +2331,97 @@ export function SceneView() {
                 })}
               </div>
             </div>
-            <div className="mt-1.5 grid grid-cols-2 gap-1">
-              <button
-                type="button"
-                disabled={isSelectedPetFull || isCardActionBusy}
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={handleFeedSelectedPet}
-                className={cn(
-                  'relative inline-flex h-7 items-center justify-center overflow-hidden rounded-lg border text-[10px] font-black transition-all active:scale-[0.98]',
-                  isSelectedPetFull &&
-                    (isDarkBackdrop
-                      ? 'cursor-not-allowed border-white/12 bg-white/8 text-white/45 active:scale-100'
-                      : 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 active:scale-100'),
-                  isSelectedPetCardFeeding && isDarkBackdrop
-                    ? 'cursor-wait border-amber-200/35 bg-amber-200/15 text-amber-100 active:scale-100'
-                    : isSelectedPetCardFeeding
-                      ? 'cursor-wait border-amber-200 bg-amber-50 text-amber-700 active:scale-100'
-                      : '',
-                  !isSelectedPetFull && !isSelectedPetCardFeeding && isDarkBackdrop
-                    ? 'border-amber-200/35 bg-amber-200/15 text-amber-100 hover:bg-amber-200/20'
-                    : !isSelectedPetFull && !isSelectedPetCardFeeding
-                      ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
-                      : '',
-                )}>
-                {isSelectedPetCardFeeding && (
-                  <div
+            <div className={cn('mt-1.5 grid gap-1', isCardPetDead ? 'grid-cols-1' : 'grid-cols-2')}>
+              {isCardPetDead ? (
+                <button
+                  type="button"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={() => {
+                    closeSelectedPetCard();
+                    discardCompletedPet(cardPet.instanceId);
+                  }}
+                  className={cn(
+                    'inline-flex h-7 items-center justify-center rounded-lg border text-[10px] font-black transition-all active:scale-[0.98]',
+                    isDarkBackdrop
+                      ? 'border-slate-300/35 bg-slate-200/15 text-slate-100 hover:bg-slate-200/20'
+                      : 'border-slate-300 bg-slate-100 text-slate-700 hover:bg-slate-200',
+                  )}>
+                  清理
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    disabled={isSelectedPetFull || isCardActionBusy || isSelectedFoodUnavailable}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={handleFeedSelectedPet}
                     className={cn(
-                      'absolute inset-y-0 left-0 rounded-[inherit] transition-[width] duration-75',
-                      isDarkBackdrop ? 'bg-amber-200/28' : 'bg-amber-200/75',
+                      'relative inline-flex h-7 items-center justify-center overflow-hidden rounded-lg border text-[10px] font-black transition-all active:scale-[0.98]',
+                      (isSelectedPetFull || isSelectedFoodUnavailable) &&
+                        (isDarkBackdrop
+                          ? 'cursor-not-allowed border-white/12 bg-white/8 text-white/45 active:scale-100'
+                          : 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 active:scale-100'),
+                      isSelectedPetCardFeeding && isDarkBackdrop
+                        ? 'cursor-wait border-amber-200/35 bg-amber-200/15 text-amber-100 active:scale-100'
+                        : isSelectedPetCardFeeding
+                          ? 'cursor-wait border-amber-200 bg-amber-50 text-amber-700 active:scale-100'
+                          : '',
+                      !isSelectedPetFull && !isSelectedFoodUnavailable && !isSelectedPetCardFeeding && isDarkBackdrop
+                        ? 'border-amber-200/35 bg-amber-200/15 text-amber-100 hover:bg-amber-200/20'
+                        : !isSelectedPetFull && !isSelectedFoodUnavailable && !isSelectedPetCardFeeding
+                          ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
+                          : '',
+                    )}>
+                    {isSelectedPetCardFeeding && (
+                      <div
+                        className={cn(
+                          'absolute inset-y-0 left-0 rounded-[inherit] transition-[width] duration-75',
+                          isDarkBackdrop ? 'bg-amber-200/28' : 'bg-amber-200/75',
+                        )}
+                        style={{width: `${Math.round((cardFeedProgress ?? 0) * 100)}%`}}
+                      />
                     )}
-                    style={{width: `${Math.round((cardFeedProgress ?? 0) * 100)}%`}}
-                  />
-                )}
-                <span className="relative z-[1]">
-                  {isSelectedPetFull ? '已饱' : isSelectedPetCardFeeding ? '喂食中' : '喂食'}
-                </span>
-              </button>
-              <button
-                type="button"
-                disabled={isCardActionBusy}
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={handleCheerSelectedPet}
-                className={cn(
-                  'relative inline-flex h-7 items-center justify-center overflow-hidden rounded-lg border text-[10px] font-black transition-all active:scale-[0.98]',
-                  isCardActionBusy &&
-                    (isDarkBackdrop
-                      ? 'cursor-not-allowed border-white/12 bg-white/8 text-white/45 active:scale-100'
-                      : 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 active:scale-100'),
-                  isSelectedPetCardCheering && isDarkBackdrop
-                    ? 'cursor-wait border-rose-200/35 bg-rose-200/15 text-rose-100 active:scale-100'
-                    : isSelectedPetCardCheering
-                      ? 'cursor-wait border-rose-200 bg-rose-50 text-rose-700 active:scale-100'
-                      : '',
-                  !isCardActionBusy && isDarkBackdrop
-                    ? 'border-rose-200/35 bg-rose-200/15 text-rose-100 hover:bg-rose-200/20'
-                    : !isCardActionBusy
-                      ? 'border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100'
-                      : '',
-                )}>
-                {isSelectedPetCardCheering && (
-                  <div
+                    <span className="relative z-[1]">
+                      {isSelectedPetFull ? '已饱' : isSelectedFoodUnavailable ? '缺粮' : isSelectedPetCardFeeding ? '喂食中' : '喂食'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isCardActionBusy}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={handleCheerSelectedPet}
                     className={cn(
-                      'absolute inset-y-0 left-0 rounded-[inherit] transition-[width] duration-75',
-                      isDarkBackdrop ? 'bg-rose-200/28' : 'bg-rose-200/75',
+                      'relative inline-flex h-7 items-center justify-center overflow-hidden rounded-lg border text-[10px] font-black transition-all active:scale-[0.98]',
+                      isCardActionBusy &&
+                        (isDarkBackdrop
+                          ? 'cursor-not-allowed border-white/12 bg-white/8 text-white/45 active:scale-100'
+                          : 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 active:scale-100'),
+                      isSelectedPetCardCheering && isDarkBackdrop
+                        ? 'cursor-wait border-rose-200/35 bg-rose-200/15 text-rose-100 active:scale-100'
+                        : isSelectedPetCardCheering
+                          ? 'cursor-wait border-rose-200 bg-rose-50 text-rose-700 active:scale-100'
+                          : '',
+                      !isCardActionBusy && isDarkBackdrop
+                        ? 'border-rose-200/35 bg-rose-200/15 text-rose-100 hover:bg-rose-200/20'
+                        : !isCardActionBusy
+                          ? 'border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100'
+                          : '',
+                    )}>
+                    {isSelectedPetCardCheering && (
+                      <div
+                        className={cn(
+                          'absolute inset-y-0 left-0 rounded-[inherit] transition-[width] duration-75',
+                          isDarkBackdrop ? 'bg-rose-200/28' : 'bg-rose-200/75',
+                        )}
+                        style={{width: `${Math.round((cardCheerProgress ?? 0) * 100)}%`}}
+                      />
                     )}
-                    style={{width: `${Math.round((cardCheerProgress ?? 0) * 100)}%`}}
-                  />
-                )}
-                <span className="relative z-[1]">
-                  {isSelectedPetCardCheering ? '抚摸中' : '抚摸'}
-                </span>
-              </button>
+                    <span className="relative z-[1]">
+                      {isSelectedPetCardCheering ? '抚摸中' : '抚摸'}
+                    </span>
+                  </button>
+                </>
+              )}
             </div>
           </section>
         </div>
@@ -1904,8 +2443,8 @@ export function SceneView() {
               {isSceneToolCancelHover
                 ? '松手取消本次操作'
                 : toolDragState.tool === 'feed'
-                ? (toolDragState.overScene ? `圆环是实际落点，松手撒出 ${FEED_DROP_BURST_COUNT} 份饲料` : '拖到场景里，圆环会显示落点')
-                : (toolDragState.hoveredWasteInstanceId ? '绿色圆环是清理目标，松手生效' : '拖到便便上方，圆环会锁定目标')}
+                ? (toolDragState.overScene ? `圆环是实际落点，松手撒出 ${sceneFeedBurstCount} 份${selectedFood.label}` : `拖到场景里，松手撒出${selectedFood.label}`)
+                : (toolDragState.hoveredWasteId ? '绿色圆环是清理目标，松手生效' : '拖到便便上方，圆环会锁定目标')}
             </div>
           </div>
           {toolDragState.tool === 'feed' && toolDragPreviewPoint && (
@@ -1918,13 +2457,16 @@ export function SceneView() {
               }}>
               <div className="flex flex-col items-center gap-1">
                 <div className="rounded-full border border-amber-200/90 bg-[rgba(255,251,235,0.96)] px-2 py-0.5 text-[9px] font-black text-amber-800 shadow-[0_8px_20px_rgba(245,158,11,0.14)]">
-                  落点
+                  {selectedFood.label}
                 </div>
                 <div className="relative h-10 w-10">
                   <div className="absolute inset-0 rounded-full border-2 border-amber-300/95 bg-amber-100/18 shadow-[0_8px_20px_rgba(245,158,11,0.14)] backdrop-blur-sm" />
-                  <div className="absolute inset-[7px] rounded-full border border-dashed border-amber-400/90" />
-                  <div className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-amber-500 shadow-[0_0_0_3px_rgba(251,191,36,0.18)]" />
-                  <div className="absolute inset-0 rounded-full border border-amber-300/55 animate-ping" />
+                  <UiTextureLayer path={FEED_PLACEMENT_ASSET_PATH} className="rounded-full" opacity={0.96} />
+                  <div className="absolute inset-[7px] z-[1] rounded-full border border-dashed border-amber-400/90" />
+                  <div className="absolute left-1/2 top-1/2 z-[1] -translate-x-1/2 -translate-y-1/2">
+                    <FoodSprite foodId={selectedFoodId} size={16} />
+                  </div>
+                  <div className="absolute inset-0 z-[1] rounded-full border border-amber-300/55 animate-ping" />
                 </div>
               </div>
             </div>
@@ -1965,7 +2507,7 @@ export function SceneView() {
                   : 'border-emerald-200/90 bg-[linear-gradient(180deg,rgba(236,253,245,0.96),rgba(220,252,231,0.94))] text-emerald-800',
               )}>
               {toolDragState.tool === 'feed' ? (
-                <Wheat size={16} strokeWidth={2.4} />
+                <FoodSprite foodId={selectedFoodId} size={18} />
               ) : (
                 <Sparkles size={16} strokeWidth={2.3} />
               )}
@@ -1982,6 +2524,15 @@ export function SceneView() {
         onRename={renameCompletedPet}
         onDiscard={discardCompletedPet}
         onClose={() => setShowPetBoard(false)}
+      />
+      <SceneShopSheet
+        open={showSceneShop}
+        anchor={shopPanelAnchor}
+        coins={coins}
+        selectedFoodId={selectedFoodId}
+        foodInventory={foodInventory}
+        onBuyFood={buyFood}
+        onClose={closeShopPanel}
       />
     </div>
   );

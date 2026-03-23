@@ -13,6 +13,7 @@ import {
   type PetSpriteAction,
 } from '../data/petSprites';
 import {SpriteActor} from './SpriteActor';
+import {GraveSprite} from './GraveSprite';
 import {
   getHealthLabel,
   getMoodLabel,
@@ -36,6 +37,7 @@ interface BoardItem {
   speciesName: string;
   stateLabel: string;
   sceneLabel: string;
+  isDead: boolean;
   health: number;
   satiety: number;
   mood: number;
@@ -86,7 +88,67 @@ function resolveSpriteAction(petId: string, state: CompletedPet['state']): PetSp
   return 'idle';
 }
 
-const PREVIEW_STAGE_SIZE = 74;
+const PREVIEW_TARGET_MIN = 76;
+const PREVIEW_TARGET_BASE = 82;
+const PREVIEW_TARGET_MAX = 98;
+const PREVIEW_BOX_SIZE = 104;
+const BOARD_PREVIEW_SPECIES_FACTOR: Record<string, number> = {
+  farm_Akita: 1,
+  farm_chicken: 0.54,
+  farm_vita: 0.68,
+  farm_miniyellowcat: 1.18,
+  farm_miniblackwcat: 1.18,
+  farm_minisiamese: 1.18,
+  farm_miniTabbycat: 1.18,
+  farm_miniragdollcat: 1.18,
+  farm_minicivetcat: 1.18,
+  farm_littlewhite: 0.82,
+  farm_littleblue: 0.82,
+  farm_littlegray: 0.82,
+  farm_robotbird: 0.82,
+  farm_robotsheep: 0.82,
+  farm_robotfrog: 0.82,
+  farm_robotpig: 0.82,
+};
+const BOARD_PREVIEW_ZOOM_FACTOR: Record<string, number> = {
+  farm_Akita: 1.92,
+};
+const BOARD_PREVIEW_Y_OFFSET: Record<string, number> = {
+  farm_Akita: 18,
+};
+
+function getBoardPreviewScale(petId: string, action: PetSpriteAction) {
+  const spriteOption = getPetSpriteOptionByKey(petId);
+  const actionConfig = getPetSpriteConfigByKey(petId, action);
+  const frameWidth = actionConfig?.frameWidth ?? 32;
+  const frameHeight = actionConfig?.frameHeight ?? 32;
+  const frameSize = Math.max(frameWidth, frameHeight);
+  const sceneScale = spriteOption?.sceneScale ?? 2.2;
+  const sceneFootprint = frameSize * sceneScale;
+
+  // Compress the size gap between different source sheets while keeping
+  // larger scene animals slightly larger in the collection preview.
+  const targetSize = Math.max(
+    PREVIEW_TARGET_MIN,
+    Math.min(
+      PREVIEW_TARGET_MAX,
+      PREVIEW_TARGET_BASE + (sceneFootprint - 72) * 0.08,
+    ),
+  );
+  const speciesFactor = BOARD_PREVIEW_SPECIES_FACTOR[petId] ?? 1;
+  const desiredScale = (targetSize * speciesFactor) / frameSize;
+  const maxFitScale = Math.min(PREVIEW_BOX_SIZE / frameWidth, PREVIEW_BOX_SIZE / frameHeight);
+
+  return Math.min(desiredScale, maxFitScale);
+}
+
+function getBoardPreviewZoom(petId: string) {
+  return BOARD_PREVIEW_ZOOM_FACTOR[petId] ?? 1;
+}
+
+function getBoardPreviewYOffset(petId: string) {
+  return BOARD_PREVIEW_Y_OFFSET[petId] ?? 0;
+}
 
 export function PetBoardSheet({
   open,
@@ -112,12 +174,13 @@ export function PetBoardSheet({
               pet,
               title: pet.nickname || speciesName,
               speciesName,
-              stateLabel: STATE_LABEL[pet.state],
+              stateLabel: pet.isDead ? '已离世' : STATE_LABEL[pet.state],
               sceneLabel: THEME_LABEL[pet.theme],
+              isDead: Boolean(pet.isDead),
               health: Math.round(getPetMetric(pet, 'health')),
               satiety: Math.round(getPetMetric(pet, 'satiety')),
               mood: Math.round(getPetMetric(pet, 'mood')),
-              healthLabel: getHealthLabel(getPetMetric(pet, 'health')),
+              healthLabel: pet.isDead ? '已离世' : getHealthLabel(getPetMetric(pet, 'health')),
               satietyLabel: getSatietyLabel(getPetMetric(pet, 'satiety')),
               moodLabel: getMoodLabel(getPetMetric(pet, 'mood')),
             };
@@ -130,12 +193,13 @@ export function PetBoardSheet({
               pet,
               title: pet.nickname || speciesName,
               speciesName,
-              stateLabel: STATE_LABEL[pet.state],
+              stateLabel: pet.isDead ? '已离世' : STATE_LABEL[pet.state],
               sceneLabel: THEME_LABEL[pet.theme],
+              isDead: Boolean(pet.isDead),
               health: Math.round(getPetMetric(pet, 'health')),
               satiety: Math.round(getPetMetric(pet, 'satiety')),
               mood: Math.round(getPetMetric(pet, 'mood')),
-              healthLabel: getHealthLabel(getPetMetric(pet, 'health')),
+              healthLabel: pet.isDead ? '已离世' : getHealthLabel(getPetMetric(pet, 'health')),
               satietyLabel: getSatietyLabel(getPetMetric(pet, 'satiety')),
               moodLabel: getMoodLabel(getPetMetric(pet, 'mood')),
             };
@@ -147,12 +211,13 @@ export function PetBoardSheet({
             pet,
             title: pet.nickname || speciesName,
             speciesName,
-            stateLabel: STATE_LABEL[pet.state],
+            stateLabel: pet.isDead ? '已离世' : STATE_LABEL[pet.state],
             sceneLabel: THEME_LABEL[pet.theme],
+            isDead: Boolean(pet.isDead),
             health: Math.round(getPetMetric(pet, 'health')),
             satiety: Math.round(getPetMetric(pet, 'satiety')),
             mood: Math.round(getPetMetric(pet, 'mood')),
-            healthLabel: getHealthLabel(getPetMetric(pet, 'health')),
+            healthLabel: pet.isDead ? '已离世' : getHealthLabel(getPetMetric(pet, 'health')),
             satietyLabel: getSatietyLabel(getPetMetric(pet, 'satiety')),
             moodLabel: getMoodLabel(getPetMetric(pet, 'mood')),
           };
@@ -299,7 +364,7 @@ export function PetBoardSheet({
                                 品种 · {item.speciesName}
                               </span>
                               <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-bold text-indigo-500">
-                                形态 · {item.stateLabel}
+                                {item.isDead ? '状态' : '形态'} · {item.stateLabel}
                               </span>
                             </div>
                             <div className="mt-1.5 space-y-1.5 rounded-xl border border-slate-100 bg-slate-50/75 px-2 py-1.5">
@@ -360,34 +425,53 @@ export function PetBoardSheet({
                             )}
                           </div>
 
-                          <div className="relative mt-3 h-[104px] rounded-[18px] border border-slate-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(241,245,249,0.9))] shadow-inner">
+                          <div className="relative mt-3 h-[122px] rounded-[18px] border border-slate-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(241,245,249,0.9))] shadow-inner">
                             <div className="absolute inset-x-0 bottom-2 flex justify-center">
-                              <div className="flex h-[74px] w-[74px] items-end justify-center">
-                                {isPetSpriteKey(item.pet.petId) ? (
+                              <div className="flex h-[104px] w-[104px] items-end justify-center overflow-visible">
+                                {item.isDead ? (
+                                  <GraveSprite size={48} className="drop-shadow-sm" />
+                                ) : isPetSpriteKey(item.pet.petId) ? (
                                   (() => {
                                     const spriteOption = getPetSpriteOptionByKey(item.pet.petId);
                                     const action = resolveSpriteAction(item.pet.petId, item.pet.state);
-                                    const actionConfig = getPetSpriteConfigByKey(item.pet.petId, action);
-                                    const frameWidth = actionConfig?.frameWidth ?? 32;
-                                    const frameHeight = actionConfig?.frameHeight ?? 32;
-                                    const scale = PREVIEW_STAGE_SIZE / Math.max(frameWidth, frameHeight);
+                                    const previewZoom = getBoardPreviewZoom(item.pet.petId);
+                                    const previewYOffset = getBoardPreviewYOffset(item.pet.petId);
                                     return spriteOption ? (
-                                      <SpriteActor
-                                        spriteKey={spriteOption.key}
-                                        action={action}
-                                        scale={scale}
-                                        flipX={spriteOption.flipX}
-                                        seed={index}
-                                        ariaLabel={item.title}
-                                        className="drop-shadow-[0_7px_12px_rgba(15,23,42,0.2)]"
-                                      />
+                                      <div
+                                        className="flex h-full w-full items-end justify-center overflow-hidden"
+                                        style={{transform: `translateZ(0)`}}
+                                      >
+                                        <div
+                                          style={{
+                                            transform: `translateY(${previewYOffset}px)`,
+                                            transformOrigin: 'center bottom',
+                                          }}
+                                        >
+                                          <div
+                                            style={{
+                                              transform: `scale(${previewZoom})`,
+                                              transformOrigin: 'center bottom',
+                                            }}
+                                          >
+                                            <SpriteActor
+                                              spriteKey={spriteOption.key}
+                                              action={action}
+                                              scale={getBoardPreviewScale(item.pet.petId, action)}
+                                              flipX={spriteOption.flipX}
+                                              seed={index}
+                                              ariaLabel={item.title}
+                                              className="drop-shadow-[0_7px_12px_rgba(15,23,42,0.2)]"
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
                                     ) : null;
                                   })()
                                 ) : customPet ? (
                                   <img
                                     src={customPet.image}
                                     alt={customPet.name}
-                                    className="h-[74px] w-[74px] object-contain drop-shadow-[0_7px_12px_rgba(15,23,42,0.16)]"
+                                    className="h-[104px] w-[104px] object-contain drop-shadow-[0_7px_12px_rgba(15,23,42,0.16)]"
                                   />
                                 ) : (
                                   <span className="text-[56px] leading-none drop-shadow-sm">

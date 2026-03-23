@@ -12,11 +12,27 @@ import {
   SCENE_X_MAX,
   SCENE_X_MIN,
 } from '../constants/sceneBounds';
+import {
+  DEFAULT_FOOD_ID,
+  FOOD_ITEM_MAP,
+  createInitialFoodInventory,
+  getFoodItemById,
+  normalizeFoodInventory,
+  type FoodId,
+  type FoodInventory,
+} from '../data/foods';
 import {PET_STATUS_DEFAULTS, clampMetric, getPetMetric, roundMetric} from '../utils/petStatus';
 
 export type TabType = 'home' | 'feed' | 'scene' | 'pokedex' | 'stats';
 export type ActivityType = 'work' | 'study' | 'entertainment' | 'rest' | 'exercise';
 export type PetQuality = 'common' | 'rare' | 'epic';
+
+export interface PetWasteSpot {
+  id: string;
+  x: number;
+  y: number;
+  createdAt: number;
+}
 
 export interface Allocation {
   id: string;
@@ -57,6 +73,9 @@ export interface CompletedPet {
   digestionLoad?: number;
   poopProgress?: number;
   wasteCount?: number;
+  wasteSpots?: PetWasteSpot[];
+  isDead?: boolean;
+  deathAt?: number | null;
   statusUpdatedAt?: number;
 }
 
@@ -121,14 +140,21 @@ interface AppState {
   currentEgg: EggState;
   feedEgg: (date: string, allocationId: string) => boolean;
   completeEgg: (customPet?: CustomPet, nickname?: string) => CompletedPet | null;
+  coins: number;
+  foodInventory: FoodInventory;
+  selectedFoodId: FoodId;
+  buyFood: (foodId: FoodId, quantity: number) => boolean;
+  consumeFood: (foodId: FoodId, quantity?: number) => boolean;
+  setSelectedFood: (foodId: FoodId) => void;
   
   unlockedPets: Record<string, PetState[]>;
   completedPets: CompletedPet[];
   customPets: CustomPet[];
   syncPetData: () => void;
-  feedCompletedPet: (instanceId: string) => boolean;
+  feedCompletedPet: (instanceId: string, options?: {satietyGain?: number}) => boolean;
   cheerCompletedPet: (instanceId: string) => boolean;
-  cleanCompletedPetWaste: (instanceId: string) => boolean;
+  cleanCompletedPetWaste: (instanceId: string, wasteSpotId?: string) => boolean;
+  debugKillCompletedPet: (instanceId: string) => boolean;
   cleanSceneWaste: (theme: ThemeType) => number;
   updatePetPosition: (instanceId: string, x: number, y: number) => void;
   updatePetPositionsBatch: (updates: Array<{instanceId: string; x: number; y: number}>) => void;
@@ -267,6 +293,9 @@ function createSceneSeedPet(
     digestionLoad: roundMetric(Math.random() * 8),
     poopProgress: initialPoopState.poopProgress,
     wasteCount: initialPoopState.wasteCount,
+    wasteSpots: [],
+    isDead: false,
+    deathAt: null,
     statusUpdatedAt: now,
   };
 }
@@ -319,6 +348,10 @@ function getHatchSpawnPosition(theme: ThemeType, existingPets: CompletedPet[]) {
 type PetCareAction = 'feed' | 'cheer' | 'clean';
 const BASE_POOP_PROGRESS_GAIN_PER_HOUR = 0.4;
 const DIGESTION_TO_POOP_PROGRESS_PER_HOUR = 24;
+const INITIAL_COINS = 200;
+const HATCH_COIN_REWARD = 20;
+const FIRST_SPECIES_HATCH_BONUS = 50;
+const WASTE_CLEAN_COIN_REWARD = 1;
 const FEED_BLOCK_SATIETY = 100;
 const FEED_SATIETY_GAIN = 5;
 const FEED_DIGESTION_GAIN = 18;
@@ -334,6 +367,123 @@ const WASTE_CLEANLINESS_PENALTY_PER_POOP = 18;
 const WASTE_MOOD_LOSS_PER_HOUR = 0.85;
 const WASTE_HEALTH_LOSS_PER_HOUR = 0.9;
 const CHEER_MOOD_GAIN = 5;
+const WASTE_SPAWN_X_JITTER = 2.4;
+const WASTE_SPAWN_Y_JITTER = 1.2;
+
+function hashToUnit(input: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 4294967295;
+}
+
+function clampWasteSpotPosition(spot: PetWasteSpot): PetWasteSpot {
+  return {
+    ...spot,
+    x: Math.max(SCENE_X_MIN, Math.min(SCENE_X_MAX, spot.x)),
+    y: Math.max(SCENE_SPAWN_Y_MIN, Math.min(SCENE_SPAWN_Y_MAX + 4, spot.y)),
+  };
+}
+
+function createPetWasteSpot(pet: CompletedPet, now: number): PetWasteSpot {
+  const jitterX = (Math.random() - 0.5) * WASTE_SPAWN_X_JITTER;
+  const jitterY = (Math.random() - 0.5) * WASTE_SPAWN_Y_JITTER;
+  return clampWasteSpotPosition({
+    id: `waste-${pet.instanceId}-${now}-${Math.random().toString(36).slice(2, 7)}`,
+    x: pet.x + jitterX,
+    y: pet.y + 4.4 + jitterY,
+    createdAt: now,
+  });
+}
+
+function createLegacyWasteSpot(pet: CompletedPet, index: number, now: number): PetWasteSpot {
+  const jitterX = (hashToUnit(`${pet.instanceId}:legacy-waste:${index}:x`) - 0.5) * WASTE_SPAWN_X_JITTER;
+  const jitterY = (hashToUnit(`${pet.instanceId}:legacy-waste:${index}:y`) - 0.5) * WASTE_SPAWN_Y_JITTER;
+  return clampWasteSpotPosition({
+    id: `legacy-waste-${pet.instanceId}-${index}`,
+    x: pet.x + jitterX,
+    y: pet.y + 4.4 + jitterY,
+    createdAt: now - (index + 1) * 1000,
+  });
+}
+
+function normalizeWasteSpots(pet: CompletedPet, expectedWasteCount: number, now: number) {
+  const safeCount = getWasteCount(expectedWasteCount);
+  const existingSpots = Array.isArray(pet.wasteSpots)
+    ? pet.wasteSpots
+      .filter((spot): spot is PetWasteSpot =>
+        Boolean(spot)
+        && typeof spot.id === 'string'
+        && typeof spot.x === 'number'
+        && typeof spot.y === 'number',
+      )
+      .map((spot) => clampWasteSpotPosition({
+        ...spot,
+        createdAt: typeof spot.createdAt === 'number' ? spot.createdAt : now,
+      }))
+    : [];
+
+  if (existingSpots.length === safeCount) return existingSpots;
+  if (existingSpots.length > safeCount) return existingSpots.slice(0, safeCount);
+
+  const nextSpots = [...existingSpots];
+  for (let index = existingSpots.length; index < safeCount; index += 1) {
+    nextSpots.push(createLegacyWasteSpot(pet, index, now));
+  }
+  return nextSpots;
+}
+
+function appendWasteSpots(pet: CompletedPet, count: number, now: number) {
+  const safeCount = Math.max(0, Math.round(count));
+  if (safeCount <= 0) return pet.wasteSpots ?? [];
+  const nextSpots = [...(pet.wasteSpots ?? [])];
+  for (let index = 0; index < safeCount; index += 1) {
+    nextSpots.push(createPetWasteSpot(pet, now + index));
+  }
+  return nextSpots;
+}
+
+function finalizePetDeathState(pet: CompletedPet, now: number): CompletedPet {
+  if ((pet.isDead ?? false) || (pet.health ?? 0) > 0) {
+    return pet;
+  }
+
+  return {
+    ...pet,
+    health: 0,
+    isDead: true,
+    deathAt: pet.deathAt ?? now,
+    digestionLoad: 0,
+    statusUpdatedAt: now,
+  };
+}
+
+function hasPetRuntimeChanged(previous: CompletedPet, next: CompletedPet) {
+  return (
+    previous.quality !== next.quality
+    || previous.x !== next.x
+    || previous.y !== next.y
+    || previous.variant !== next.variant
+    || previous.scale !== next.scale
+    || previous.jumpDelay !== next.jumpDelay
+    || previous.moveDelay !== next.moveDelay
+    || previous.floatDelay !== next.floatDelay
+    || previous.health !== next.health
+    || previous.satiety !== next.satiety
+    || previous.mood !== next.mood
+    || previous.hygiene !== next.hygiene
+    || previous.wasteLevel !== next.wasteLevel
+    || previous.digestionLoad !== next.digestionLoad
+    || previous.poopProgress !== next.poopProgress
+    || previous.wasteCount !== next.wasteCount
+    || previous.isDead !== next.isDead
+    || previous.deathAt !== next.deathAt
+    || previous.statusUpdatedAt !== next.statusUpdatedAt
+    || JSON.stringify(previous.wasteSpots ?? []) !== JSON.stringify(next.wasteSpots ?? [])
+  );
+}
 
 function getDigestionLoad(value: number | undefined) {
   if (typeof value !== 'number' || Number.isNaN(value)) return 0;
@@ -400,6 +550,9 @@ function withPetStatus(pet: CompletedPet, fallbackNow: number): CompletedPet {
     digestionLoad: getDigestionLoad(pet.digestionLoad),
     wasteCount,
     poopProgress,
+    wasteSpots: normalizeWasteSpots(pet, wasteCount, fallbackNow),
+    isDead: Boolean(pet.isDead),
+    deathAt: pet.deathAt ?? null,
     statusUpdatedAt: pet.statusUpdatedAt ?? fallbackNow,
   };
 }
@@ -437,7 +590,8 @@ function resolvePoopProgressState(input: {
 }
 
 function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
-  const normalized = withPetStatus(pet, now);
+  const normalized = finalizePetDeathState(withPetStatus(pet, now), now);
+  if (normalized.isDead) return normalized;
   const elapsedHours = Math.max(0, (now - (normalized.statusUpdatedAt ?? now)) / 3_600_000);
 
   if (elapsedHours < 1 / 120) return normalized;
@@ -463,6 +617,9 @@ function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
   const wasteCount = poopResolved.wasteCount;
   const poopProgress = poopResolved.poopProgress;
   const wasteLevel = getWasteLevelFromPoopState(wasteCount, poopProgress);
+  const wasteSpots = poopResolved.createdWaste > 0
+    ? appendWasteSpots(normalized, poopResolved.createdWaste, now)
+    : normalized.wasteSpots ?? [];
 
   let health = normalized.health!;
   const targetHealth = getHealthTarget(satiety, mood, hygiene, wasteCount);
@@ -475,7 +632,7 @@ function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
     health = roundMetric(health - elapsedHours * (wasteCount - 2) * WASTE_HEALTH_LOSS_PER_HOUR);
   }
 
-  return {
+  return finalizePetDeathState({
     ...normalized,
     satiety,
     mood,
@@ -484,12 +641,18 @@ function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
     digestionLoad,
     poopProgress,
     wasteCount,
+    wasteSpots,
     health,
     statusUpdatedAt: now,
-  };
+  }, now);
 }
 
-function applyPetWasteCleanup(base: CompletedPet, cleanedWasteCount: number, now: number): CompletedPet {
+function applyPetWasteCleanup(
+  base: CompletedPet,
+  cleanedWasteCount: number,
+  now: number,
+  wasteSpotId?: string,
+): CompletedPet {
   const resolvedCleanedWasteCount = Math.max(0, Math.min(base.wasteCount ?? 0, Math.round(cleanedWasteCount)));
   if (resolvedCleanedWasteCount <= 0) {
     return {
@@ -498,11 +661,25 @@ function applyPetWasteCleanup(base: CompletedPet, cleanedWasteCount: number, now
     };
   }
 
+  const remainingWasteSpots = wasteSpotId
+    ? (base.wasteSpots ?? []).filter((spot) => spot.id !== wasteSpotId)
+    : (base.wasteSpots ?? []).slice(resolvedCleanedWasteCount);
+  const wasteCount = Math.max(0, (base.wasteCount ?? 0) - resolvedCleanedWasteCount);
+  const wasteLevel = getWasteLevelFromPoopState(wasteCount, base.poopProgress!);
+
+  if (base.isDead) {
+    return {
+      ...base,
+      wasteLevel,
+      wasteCount,
+      wasteSpots: remainingWasteSpots,
+      statusUpdatedAt: now,
+    };
+  }
+
   const hygiene = roundMetric(base.hygiene! + Math.min(42, resolvedCleanedWasteCount * 14));
   const mood = roundMetric(base.mood! + resolvedCleanedWasteCount * 3);
   let health = roundMetric(base.health! + resolvedCleanedWasteCount * 1.5);
-  const wasteCount = Math.max(0, (base.wasteCount ?? 0) - resolvedCleanedWasteCount);
-  const wasteLevel = getWasteLevelFromPoopState(wasteCount, base.poopProgress!);
   const targetHealth = getHealthTarget(base.satiety!, mood, hygiene, wasteCount);
   health = roundMetric(health + (targetHealth - health) * 0.28);
 
@@ -513,12 +690,19 @@ function applyPetWasteCleanup(base: CompletedPet, cleanedWasteCount: number, now
     health,
     wasteLevel,
     wasteCount,
+    wasteSpots: remainingWasteSpots,
     statusUpdatedAt: now,
   };
 }
 
-function applyPetCareAction(pet: CompletedPet, action: PetCareAction, now: number): CompletedPet {
+function applyPetCareAction(
+  pet: CompletedPet,
+  action: PetCareAction,
+  now: number,
+  options?: {satietyGain?: number},
+): CompletedPet {
   const base = applyPetPassiveStatus(pet, now);
+  if (base.isDead) return base;
   if (action === 'clean') {
     return applyPetWasteCleanup(base, base.wasteCount ?? 0, now);
   }
@@ -532,7 +716,8 @@ function applyPetCareAction(pet: CompletedPet, action: PetCareAction, now: numbe
   let health = base.health!;
 
   if (action === 'feed') {
-    satiety = roundMetric(satiety + FEED_SATIETY_GAIN);
+    const satietyGain = Math.max(0, options?.satietyGain ?? FEED_SATIETY_GAIN);
+    satiety = roundMetric(satiety + satietyGain);
     mood = roundMetric(mood + 4);
     hygiene = roundMetric(hygiene - FEED_HYGIENE_LOSS);
     digestionLoad = roundMetric(digestionLoad + FEED_DIGESTION_GAIN);
@@ -561,7 +746,7 @@ function applyPetCareAction(pet: CompletedPet, action: PetCareAction, now: numbe
     health = roundMetric(health + (targetHealth - health) * 0.28);
   }
 
-  return {
+  return finalizePetDeathState({
     ...base,
     satiety,
     mood,
@@ -570,9 +755,12 @@ function applyPetCareAction(pet: CompletedPet, action: PetCareAction, now: numbe
     digestionLoad,
     poopProgress,
     wasteCount,
+    wasteSpots: poopResolved.createdWaste > 0
+      ? appendWasteSpots(base, poopResolved.createdWaste, now)
+      : base.wasteSpots ?? [],
     health,
     statusUpdatedAt: now,
-  };
+  }, now);
 }
 
 const createAllocation = (type: ActivityType, hours: number, offset = 0): Allocation => ({
@@ -1122,12 +1310,21 @@ export const useStore = create<AppState>()(
           digestionLoad: roundMetric(Math.random() * 8),
           poopProgress: initialPoopState.poopProgress,
           wasteCount: initialPoopState.wasteCount,
+          wasteSpots: [],
+          isDead: false,
+          deathAt: null,
           statusUpdatedAt: Date.now(),
         };
+        const hasUnlockedSpecies =
+          state.completedPets.some((pet) => pet.petId === petId)
+          || Boolean(state.unlockedPets[petId]?.length)
+          || state.customPets.some((pet) => pet.id === petId);
+        const hatchCoinGain = HATCH_COIN_REWARD + (hasUnlockedSpecies ? 0 : FIRST_SPECIES_HATCH_BONUS);
         
         const updates: Partial<AppState> = {
           completedPets: [...state.completedPets, newCompleted],
-          currentEgg: getInitialEgg(state.currentTheme === 'custom' ? 'A' : state.currentTheme)
+          currentEgg: getInitialEgg(state.currentTheme === 'custom' ? 'A' : state.currentTheme),
+          coins: state.coins + hatchCoinGain,
         };
 
         if (customPet) {
@@ -1141,6 +1338,50 @@ export const useStore = create<AppState>()(
 
         set(updates);
         return newCompleted;
+      },
+      coins: INITIAL_COINS,
+      foodInventory: createInitialFoodInventory(),
+      selectedFoodId: DEFAULT_FOOD_ID,
+      buyFood: (foodId, quantity) => {
+        const normalizedQuantity = Math.max(0, Math.floor(quantity));
+        if (normalizedQuantity <= 0) return false;
+
+        const state = get();
+        const foodItem = getFoodItemById(foodId);
+        const totalPrice = foodItem.price * normalizedQuantity;
+        if (state.coins < totalPrice) return false;
+
+        set({
+          coins: state.coins - totalPrice,
+          foodInventory: {
+            ...state.foodInventory,
+            [foodId]: (state.foodInventory[foodId] ?? 0) + normalizedQuantity,
+          },
+        });
+        return true;
+      },
+      consumeFood: (foodId, quantity = 1) => {
+        const normalizedQuantity = Math.max(0, Math.floor(quantity));
+        if (normalizedQuantity <= 0) return false;
+
+        const state = get();
+        const currentStock = state.foodInventory[foodId] ?? 0;
+        if (currentStock < normalizedQuantity) return false;
+
+        set({
+          foodInventory: {
+            ...state.foodInventory,
+            [foodId]: currentStock - normalizedQuantity,
+          },
+        });
+        return true;
+      },
+      setSelectedFood: (foodId) => {
+        set((state) => (
+          state.selectedFoodId === foodId
+            ? state
+            : {selectedFoodId: foodId}
+        ));
       },
       
       unlockedPets: {}, // Start empty, unlock via hatching
@@ -1163,24 +1404,7 @@ export const useStore = create<AppState>()(
             floatDelay: pet.floatDelay ?? -Math.random() * 10,
           };
           const patchedPet = applyPetPassiveStatus(patchedBase, now);
-          const hasPatched =
-            patchedPet.quality !== pet.quality ||
-            patchedPet.x !== pet.x ||
-            patchedPet.y !== pet.y ||
-            patchedPet.variant !== pet.variant ||
-            patchedPet.scale !== pet.scale ||
-            patchedPet.jumpDelay !== pet.jumpDelay ||
-            patchedPet.moveDelay !== pet.moveDelay ||
-            patchedPet.floatDelay !== pet.floatDelay ||
-            patchedPet.health !== pet.health ||
-            patchedPet.satiety !== pet.satiety ||
-            patchedPet.mood !== pet.mood ||
-            patchedPet.hygiene !== pet.hygiene ||
-            patchedPet.wasteLevel !== pet.wasteLevel ||
-            patchedPet.digestionLoad !== pet.digestionLoad ||
-            patchedPet.poopProgress !== pet.poopProgress ||
-            patchedPet.wasteCount !== pet.wasteCount ||
-            patchedPet.statusUpdatedAt !== pet.statusUpdatedAt;
+          const hasPatched = hasPetRuntimeChanged(pet, patchedPet);
 
           if (hasPatched) {
             changed = true;
@@ -1192,7 +1416,7 @@ export const useStore = create<AppState>()(
           set({ completedPets: updatedPets });
         }
       },
-      feedCompletedPet: (instanceId) => {
+      feedCompletedPet: (instanceId, options) => {
         const state = get();
         const now = Date.now();
         let changed = false;
@@ -1205,23 +1429,13 @@ export const useStore = create<AppState>()(
 
           if (pet.instanceId === instanceId) {
             found = true;
-            if ((passivePet.satiety ?? 0) < FEED_BLOCK_SATIETY) {
-              nextPet = applyPetCareAction(passivePet, 'feed', now);
+            if (!(passivePet.isDead ?? false) && (passivePet.satiety ?? 0) < FEED_BLOCK_SATIETY) {
+              nextPet = applyPetCareAction(passivePet, 'feed', now, options);
               fed = true;
             }
           }
 
-          if (
-            nextPet.health !== pet.health ||
-            nextPet.satiety !== pet.satiety ||
-            nextPet.mood !== pet.mood ||
-            nextPet.hygiene !== pet.hygiene ||
-            nextPet.wasteLevel !== pet.wasteLevel ||
-            nextPet.digestionLoad !== pet.digestionLoad ||
-            nextPet.poopProgress !== pet.poopProgress ||
-            nextPet.wasteCount !== pet.wasteCount ||
-            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
-          ) {
+          if (hasPetRuntimeChanged(pet, nextPet)) {
             changed = true;
           }
           return nextPet;
@@ -1236,6 +1450,7 @@ export const useStore = create<AppState>()(
         const now = Date.now();
         let changed = false;
         let found = false;
+        let cheered = false;
 
         const nextPets = state.completedPets.map((pet) => {
           const passivePet = applyPetPassiveStatus(pet, now);
@@ -1243,20 +1458,13 @@ export const useStore = create<AppState>()(
 
           if (pet.instanceId === instanceId) {
             found = true;
-            nextPet = applyPetCareAction(passivePet, 'cheer', now);
+            if (!(passivePet.isDead ?? false)) {
+              nextPet = applyPetCareAction(passivePet, 'cheer', now);
+              cheered = true;
+            }
           }
 
-          if (
-            nextPet.health !== pet.health ||
-            nextPet.satiety !== pet.satiety ||
-            nextPet.mood !== pet.mood ||
-            nextPet.hygiene !== pet.hygiene ||
-            nextPet.wasteLevel !== pet.wasteLevel ||
-            nextPet.digestionLoad !== pet.digestionLoad ||
-            nextPet.poopProgress !== pet.poopProgress ||
-            nextPet.wasteCount !== pet.wasteCount ||
-            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
-          ) {
+          if (hasPetRuntimeChanged(pet, nextPet)) {
             changed = true;
           }
           return nextPet;
@@ -1264,9 +1472,9 @@ export const useStore = create<AppState>()(
 
         if (!found) return false;
         if (changed) set({completedPets: nextPets});
-        return true;
+        return cheered;
       },
-      cleanCompletedPetWaste: (instanceId) => {
+      cleanCompletedPetWaste: (instanceId, wasteSpotId) => {
         const state = get();
         const now = Date.now();
         let changed = false;
@@ -1280,22 +1488,53 @@ export const useStore = create<AppState>()(
           if (pet.instanceId === instanceId) {
             found = true;
             if ((passivePet.wasteCount ?? 0) > 0) {
-              nextPet = applyPetWasteCleanup(passivePet, 1, now);
+              nextPet = applyPetWasteCleanup(passivePet, 1, now, wasteSpotId);
               cleaned = true;
             }
           }
 
-          if (
-            nextPet.health !== pet.health ||
-            nextPet.satiety !== pet.satiety ||
-            nextPet.mood !== pet.mood ||
-            nextPet.hygiene !== pet.hygiene ||
-            nextPet.wasteLevel !== pet.wasteLevel ||
-            nextPet.digestionLoad !== pet.digestionLoad ||
-            nextPet.poopProgress !== pet.poopProgress ||
-            nextPet.wasteCount !== pet.wasteCount ||
-            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
-          ) {
+          if (hasPetRuntimeChanged(pet, nextPet)) {
+            changed = true;
+          }
+          return nextPet;
+        });
+
+        if (!found) return false;
+        if (changed || cleaned) {
+          const nextState: Partial<AppState> = {};
+          if (changed) {
+            nextState.completedPets = nextPets;
+          }
+          if (cleaned) {
+            nextState.coins = state.coins + WASTE_CLEAN_COIN_REWARD;
+          }
+          set(nextState);
+        }
+        return cleaned;
+      },
+      debugKillCompletedPet: (instanceId) => {
+        const state = get();
+        const now = Date.now();
+        let changed = false;
+        let found = false;
+        let killed = false;
+
+        const nextPets = state.completedPets.map((pet) => {
+          const passivePet = applyPetPassiveStatus(pet, now);
+          let nextPet = passivePet;
+
+          if (pet.instanceId === instanceId) {
+            found = true;
+            if (!(passivePet.isDead ?? false)) {
+              nextPet = finalizePetDeathState({
+                ...passivePet,
+                health: 0,
+              }, now);
+              killed = true;
+            }
+          }
+
+          if (hasPetRuntimeChanged(pet, nextPet)) {
             changed = true;
           }
           return nextPet;
@@ -1303,7 +1542,7 @@ export const useStore = create<AppState>()(
 
         if (!found) return false;
         if (changed) set({completedPets: nextPets});
-        return cleaned;
+        return killed;
       },
       cleanSceneWaste: (theme) => {
         const normalizedTheme = theme === 'C' ? 'A' : theme;
@@ -1320,28 +1559,26 @@ export const useStore = create<AppState>()(
             passivePet.theme === normalizedTheme
             && (passivePet.wasteCount ?? 0) > 0
           ) {
-            cleanedCount += 1;
-            nextPet = applyPetCareAction(passivePet, 'clean', now);
+            const removedWasteCount = passivePet.wasteCount ?? 0;
+            cleanedCount += removedWasteCount;
+            nextPet = applyPetWasteCleanup(passivePet, removedWasteCount, now);
           }
 
-          if (
-            nextPet.health !== pet.health ||
-            nextPet.satiety !== pet.satiety ||
-            nextPet.mood !== pet.mood ||
-            nextPet.hygiene !== pet.hygiene ||
-            nextPet.wasteLevel !== pet.wasteLevel ||
-            nextPet.digestionLoad !== pet.digestionLoad ||
-            nextPet.poopProgress !== pet.poopProgress ||
-            nextPet.wasteCount !== pet.wasteCount ||
-            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
-          ) {
+          if (hasPetRuntimeChanged(pet, nextPet)) {
             changed = true;
           }
 
           return nextPet;
         });
 
-        if (changed) set({completedPets: nextPets});
+        if (changed) {
+          set({
+            completedPets: nextPets,
+            coins: cleanedCount > 0
+              ? state.coins + cleanedCount * WASTE_CLEAN_COIN_REWARD
+              : state.coins,
+          });
+        }
         return cleanedCount;
       },
       updatePetPosition: (instanceId, x, y) => {
@@ -1461,6 +1698,15 @@ export const useStore = create<AppState>()(
             }
           : currentState.currentEgg;
         const now = Date.now();
+        const persistedSelectedFoodId = typedPersistedState?.selectedFoodId;
+        const nextSelectedFoodId =
+          typeof persistedSelectedFoodId === 'string' && persistedSelectedFoodId in FOOD_ITEM_MAP
+            ? persistedSelectedFoodId as FoodId
+            : currentState.selectedFoodId;
+        const nextCoins =
+          typeof typedPersistedState?.coins === 'number' && Number.isFinite(typedPersistedState.coins)
+            ? Math.max(0, Math.floor(typedPersistedState.coins))
+            : currentState.coins;
         const completedPets =
           typedPersistedState?.completedPets?.map((pet) =>
             applyPetPassiveStatus(
@@ -1479,6 +1725,9 @@ export const useStore = create<AppState>()(
           currentTheme: nextTheme,
           currentEgg: nextEgg,
           completedPets,
+          coins: nextCoins,
+          foodInventory: normalizeFoodInventory(typedPersistedState?.foodInventory),
+          selectedFoodId: nextSelectedFoodId,
           planTemplates: rawTemplates.map((template, index) =>
             normalizePlanTemplate(template, Date.now() + index),
           ),
