@@ -187,3 +187,27 @@ body {
 .scene-fade-out {
   animation: scene-fade-out 420ms ease-out forwards;
 }
+
+@keyframes scene-feedback-rise {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -72%) scale(0.92);
+  }
+  14% {
+    opacity: 1;
+    transform: translate(-50%, -100%) scale(1);
+  }
+  72% {
+    opacity: 1;
+    transform: translate(-50%, -126%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -154%) scale(0.98);
+  }
+}
+
+.scene-feedback-bubble {
+  animation: scene-feedback-rise 1450ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+  will-change: transform, opacity;
+}

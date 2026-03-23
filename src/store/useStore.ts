@@ -55,6 +55,8 @@ export interface CompletedPet {
   hygiene?: number;
   wasteLevel?: number;
   digestionLoad?: number;
+  poopProgress?: number;
+  wasteCount?: number;
   statusUpdatedAt?: number;
 }
 
@@ -126,6 +128,7 @@ interface AppState {
   syncPetData: () => void;
   feedCompletedPet: (instanceId: string) => boolean;
   cheerCompletedPet: (instanceId: string) => boolean;
+  cleanCompletedPetWaste: (instanceId: string) => boolean;
   cleanSceneWaste: (theme: ThemeType) => number;
   updatePetPosition: (instanceId: string, x: number, y: number) => void;
   updatePetPositionsBatch: (updates: Array<{instanceId: string; x: number; y: number}>) => void;
@@ -242,6 +245,7 @@ function createSceneSeedPet(
   spawnPosition?: {x: number; y: number},
 ): CompletedPet {
   const now = Date.now();
+  const initialPoopState = createInitialPoopState();
   return {
     instanceId: Math.random().toString(36).substring(2, 9),
     petId,
@@ -259,8 +263,10 @@ function createSceneSeedPet(
     satiety: roundMetric(PET_STATUS_DEFAULTS.satiety + (Math.random() - 0.5) * 10),
     mood: roundMetric(PET_STATUS_DEFAULTS.mood + (Math.random() - 0.5) * 12),
     hygiene: roundMetric(PET_STATUS_DEFAULTS.hygiene + (Math.random() - 0.5) * 10),
-    wasteLevel: roundMetric(PET_STATUS_DEFAULTS.wasteLevel + (Math.random() - 0.5) * 8),
+    wasteLevel: initialPoopState.wasteLevel,
     digestionLoad: roundMetric(Math.random() * 8),
+    poopProgress: initialPoopState.poopProgress,
+    wasteCount: initialPoopState.wasteCount,
     statusUpdatedAt: now,
   };
 }
@@ -311,31 +317,123 @@ function getHatchSpawnPosition(theme: ThemeType, existingPets: CompletedPet[]) {
 }
 
 type PetCareAction = 'feed' | 'cheer' | 'clean';
-const BASE_WASTE_GAIN_PER_HOUR = 1.9;
-const DIGESTION_TO_WASTE_PER_HOUR = 18;
-const FEED_BLOCK_SATIETY = 92;
+const BASE_POOP_PROGRESS_GAIN_PER_HOUR = 0.4;
+const DIGESTION_TO_POOP_PROGRESS_PER_HOUR = 24;
+const FEED_BLOCK_SATIETY = 100;
+const FEED_SATIETY_GAIN = 5;
+const FEED_DIGESTION_GAIN = 18;
+const FEED_POOP_PROGRESS_GAIN = 4;
+const FEED_HYGIENE_LOSS = 0.6;
+const FEED_HEALTH_GAIN = 1.6;
+const POOP_PROGRESS_THRESHOLD = 40;
+const POOP_HYGIENE_LOSS = 7;
+const POOP_MOOD_LOSS = 2.5;
+const WASTE_LEVEL_PER_POOP = 28;
+const WASTE_PROGRESS_LEVEL_MAX = 10;
+const WASTE_CLEANLINESS_PENALTY_PER_POOP = 18;
+const WASTE_MOOD_LOSS_PER_HOUR = 0.85;
+const WASTE_HEALTH_LOSS_PER_HOUR = 0.9;
+const CHEER_MOOD_GAIN = 5;
 
 function getDigestionLoad(value: number | undefined) {
   if (typeof value !== 'number' || Number.isNaN(value)) return 0;
   return clampMetric(value);
 }
 
+function clampPoopProgress(value: number | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(POOP_PROGRESS_THRESHOLD - 0.1, value));
+}
+
+function getWasteCount(value: number | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0;
+  return Math.max(0, Math.round(value));
+}
+
+function getWasteLevelFromPoopState(wasteCount: number, poopProgress: number) {
+  return roundMetric(
+    wasteCount * WASTE_LEVEL_PER_POOP
+    + (poopProgress / POOP_PROGRESS_THRESHOLD) * WASTE_PROGRESS_LEVEL_MAX,
+  );
+}
+
+function derivePoopStateFromLegacyWaste(wasteLevel: number) {
+  const safeWasteLevel = clampMetric(wasteLevel);
+  const wasteCount = Math.floor(safeWasteLevel / WASTE_LEVEL_PER_POOP);
+  const remainder = Math.max(0, safeWasteLevel - wasteCount * WASTE_LEVEL_PER_POOP);
+  const poopProgress = roundMetric((remainder / WASTE_LEVEL_PER_POOP) * POOP_PROGRESS_THRESHOLD);
+
+  return {
+    wasteCount,
+    poopProgress: clampPoopProgress(poopProgress),
+  };
+}
+
+function createInitialPoopState() {
+  const poopProgress = roundMetric(Math.random() * 8);
+  const wasteCount = 0;
+
+  return {
+    poopProgress,
+    wasteCount,
+    wasteLevel: getWasteLevelFromPoopState(wasteCount, poopProgress),
+  };
+}
+
 function withPetStatus(pet: CompletedPet, fallbackNow: number): CompletedPet {
+  const legacyWasteLevel = getPetMetric(pet, 'wasteLevel');
+  const legacyPoopState = derivePoopStateFromLegacyWaste(legacyWasteLevel);
+  const wasteCount = typeof pet.wasteCount === 'number'
+    ? getWasteCount(pet.wasteCount)
+    : legacyPoopState.wasteCount;
+  const poopProgress = typeof pet.poopProgress === 'number'
+    ? clampPoopProgress(pet.poopProgress)
+    : legacyPoopState.poopProgress;
+
   return {
     ...pet,
     health: getPetMetric(pet, 'health'),
     satiety: getPetMetric(pet, 'satiety'),
     mood: getPetMetric(pet, 'mood'),
     hygiene: getPetMetric(pet, 'hygiene'),
-    wasteLevel: getPetMetric(pet, 'wasteLevel'),
+    wasteLevel: getWasteLevelFromPoopState(wasteCount, poopProgress),
     digestionLoad: getDigestionLoad(pet.digestionLoad),
+    wasteCount,
+    poopProgress,
     statusUpdatedAt: pet.statusUpdatedAt ?? fallbackNow,
   };
 }
 
-function getHealthTarget(satiety: number, mood: number, hygiene: number, wasteLevel: number) {
-  const cleanlinessScore = clampMetric(hygiene - Math.max(0, wasteLevel - 45) * 0.72);
+function getHealthTarget(satiety: number, mood: number, hygiene: number, wasteCount: number) {
+  const cleanlinessScore = clampMetric(hygiene - wasteCount * WASTE_CLEANLINESS_PENALTY_PER_POOP);
   return clampMetric(satiety * 0.34 + mood * 0.31 + cleanlinessScore * 0.35);
+}
+
+function resolvePoopProgressState(input: {
+  poopProgress: number;
+  wasteCount: number;
+  hygiene: number;
+  mood: number;
+}) {
+  const createdWaste = Math.max(0, Math.floor(input.poopProgress / POOP_PROGRESS_THRESHOLD));
+  if (createdWaste === 0) {
+    return {
+      poopProgress: clampPoopProgress(input.poopProgress),
+      wasteCount: getWasteCount(input.wasteCount),
+      hygiene: roundMetric(input.hygiene),
+      mood: roundMetric(input.mood),
+      createdWaste: 0,
+    };
+  }
+
+  const remainder = input.poopProgress - createdWaste * POOP_PROGRESS_THRESHOLD;
+  return {
+    poopProgress: clampPoopProgress(remainder),
+    wasteCount: getWasteCount(input.wasteCount) + createdWaste,
+    hygiene: roundMetric(input.hygiene - createdWaste * POOP_HYGIENE_LOSS),
+    mood: roundMetric(input.mood - createdWaste * POOP_MOOD_LOSS),
+    createdWaste,
+  };
 }
 
 function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
@@ -345,27 +443,36 @@ function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
   if (elapsedHours < 1 / 120) return normalized;
 
   const satiety = roundMetric(normalized.satiety! - elapsedHours * 5.4);
-  const moodLoss = elapsedHours * (2 + (satiety < 35 ? 1.25 : 0));
-  const mood = roundMetric(normalized.mood! - moodLoss);
-  const hygiene = roundMetric(normalized.hygiene! - elapsedHours * 3.7);
+  let mood = roundMetric(
+    normalized.mood! - elapsedHours * (2 + (satiety < 35 ? 1.25 : 0) + normalized.wasteCount! * WASTE_MOOD_LOSS_PER_HOUR),
+  );
+  let hygiene = roundMetric(normalized.hygiene! - elapsedHours * 3.7);
   const digestionConverted = Math.min(
     normalized.digestionLoad!,
-    elapsedHours * DIGESTION_TO_WASTE_PER_HOUR,
+    elapsedHours * DIGESTION_TO_POOP_PROGRESS_PER_HOUR,
   );
   const digestionLoad = roundMetric(normalized.digestionLoad! - digestionConverted);
-  const wasteLevel = roundMetric(
-    normalized.wasteLevel! + elapsedHours * BASE_WASTE_GAIN_PER_HOUR + digestionConverted,
-  );
+  const poopResolved = resolvePoopProgressState({
+    poopProgress: normalized.poopProgress! + elapsedHours * BASE_POOP_PROGRESS_GAIN_PER_HOUR + digestionConverted,
+    wasteCount: normalized.wasteCount!,
+    hygiene,
+    mood,
+  });
+  mood = poopResolved.mood;
+  hygiene = poopResolved.hygiene;
+  const wasteCount = poopResolved.wasteCount;
+  const poopProgress = poopResolved.poopProgress;
+  const wasteLevel = getWasteLevelFromPoopState(wasteCount, poopProgress);
 
   let health = normalized.health!;
-  const targetHealth = getHealthTarget(satiety, mood, hygiene, wasteLevel);
+  const targetHealth = getHealthTarget(satiety, mood, hygiene, wasteCount);
   health = roundMetric(health + (targetHealth - health) * Math.min(0.9, elapsedHours * 0.34));
 
   if (satiety < 24) {
     health = roundMetric(health - elapsedHours * 1.35);
   }
-  if (wasteLevel > 74) {
-    health = roundMetric(health - elapsedHours * 1.2);
+  if (wasteCount > 2) {
+    health = roundMetric(health - elapsedHours * (wasteCount - 2) * WASTE_HEALTH_LOSS_PER_HOUR);
   }
 
   return {
@@ -375,46 +482,84 @@ function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
     hygiene,
     wasteLevel,
     digestionLoad,
+    poopProgress,
+    wasteCount,
     health,
+    statusUpdatedAt: now,
+  };
+}
+
+function applyPetWasteCleanup(base: CompletedPet, cleanedWasteCount: number, now: number): CompletedPet {
+  const resolvedCleanedWasteCount = Math.max(0, Math.min(base.wasteCount ?? 0, Math.round(cleanedWasteCount)));
+  if (resolvedCleanedWasteCount <= 0) {
+    return {
+      ...base,
+      statusUpdatedAt: now,
+    };
+  }
+
+  const hygiene = roundMetric(base.hygiene! + Math.min(42, resolvedCleanedWasteCount * 14));
+  const mood = roundMetric(base.mood! + resolvedCleanedWasteCount * 3);
+  let health = roundMetric(base.health! + resolvedCleanedWasteCount * 1.5);
+  const wasteCount = Math.max(0, (base.wasteCount ?? 0) - resolvedCleanedWasteCount);
+  const wasteLevel = getWasteLevelFromPoopState(wasteCount, base.poopProgress!);
+  const targetHealth = getHealthTarget(base.satiety!, mood, hygiene, wasteCount);
+  health = roundMetric(health + (targetHealth - health) * 0.28);
+
+  return {
+    ...base,
+    hygiene,
+    mood,
+    health,
+    wasteLevel,
+    wasteCount,
     statusUpdatedAt: now,
   };
 }
 
 function applyPetCareAction(pet: CompletedPet, action: PetCareAction, now: number): CompletedPet {
   const base = applyPetPassiveStatus(pet, now);
+  if (action === 'clean') {
+    return applyPetWasteCleanup(base, base.wasteCount ?? 0, now);
+  }
+
   let satiety = base.satiety!;
   let mood = base.mood!;
   let hygiene = base.hygiene!;
-  let wasteLevel = base.wasteLevel!;
   let digestionLoad = base.digestionLoad!;
+  let poopProgress = base.poopProgress!;
+  let wasteCount = base.wasteCount!;
   let health = base.health!;
 
   if (action === 'feed') {
-    satiety = roundMetric(satiety + 14);
+    satiety = roundMetric(satiety + FEED_SATIETY_GAIN);
     mood = roundMetric(mood + 4);
-    hygiene = roundMetric(hygiene - 1.2);
-    digestionLoad = roundMetric(digestionLoad + 10);
-    wasteLevel = roundMetric(wasteLevel + 1.1);
-    health = roundMetric(health + 2);
+    hygiene = roundMetric(hygiene - FEED_HYGIENE_LOSS);
+    digestionLoad = roundMetric(digestionLoad + FEED_DIGESTION_GAIN);
+    poopProgress = roundMetric(poopProgress + FEED_POOP_PROGRESS_GAIN);
+    health = roundMetric(health + FEED_HEALTH_GAIN);
   }
 
   if (action === 'cheer') {
-    satiety = roundMetric(satiety + 1.2);
-    mood = roundMetric(mood + 11);
-    hygiene = roundMetric(hygiene - 0.8);
-    wasteLevel = roundMetric(wasteLevel + 0.25);
-    health = roundMetric(health + 1.6);
+    mood = roundMetric(mood + CHEER_MOOD_GAIN);
   }
 
-  if (action === 'clean') {
-    hygiene = roundMetric(hygiene + 36);
-    wasteLevel = roundMetric(wasteLevel - 78);
-    mood = roundMetric(mood + 4.5);
-    health = roundMetric(health + 2.2);
-  }
+  const poopResolved = resolvePoopProgressState({
+    poopProgress,
+    wasteCount,
+    hygiene,
+    mood,
+  });
+  poopProgress = poopResolved.poopProgress;
+  wasteCount = poopResolved.wasteCount;
+  hygiene = poopResolved.hygiene;
+  mood = poopResolved.mood;
 
-  const targetHealth = getHealthTarget(satiety, mood, hygiene, wasteLevel);
-  health = roundMetric(health + (targetHealth - health) * 0.28);
+  const wasteLevel = getWasteLevelFromPoopState(wasteCount, poopProgress);
+  if (action !== 'cheer') {
+    const targetHealth = getHealthTarget(satiety, mood, hygiene, wasteCount);
+    health = roundMetric(health + (targetHealth - health) * 0.28);
+  }
 
   return {
     ...base,
@@ -423,6 +568,8 @@ function applyPetCareAction(pet: CompletedPet, action: PetCareAction, now: numbe
     hygiene,
     wasteLevel,
     digestionLoad,
+    poopProgress,
+    wasteCount,
     health,
     statusUpdatedAt: now,
   };
@@ -951,6 +1098,7 @@ export const useStore = create<AppState>()(
           if (spriteOption?.scene === 'draw') theme = 'custom';
         }
         const spawnPosition = getHatchSpawnPosition(theme, state.completedPets);
+        const initialPoopState = createInitialPoopState();
 
         const newCompleted: CompletedPet = {
           instanceId: Math.random().toString(36).substring(2, 9),
@@ -970,8 +1118,10 @@ export const useStore = create<AppState>()(
           satiety: roundMetric(PET_STATUS_DEFAULTS.satiety + (Math.random() - 0.5) * 10),
           mood: roundMetric(PET_STATUS_DEFAULTS.mood + (Math.random() - 0.5) * 12),
           hygiene: roundMetric(PET_STATUS_DEFAULTS.hygiene + (Math.random() - 0.5) * 10),
-          wasteLevel: roundMetric(PET_STATUS_DEFAULTS.wasteLevel + (Math.random() - 0.5) * 8),
+          wasteLevel: initialPoopState.wasteLevel,
           digestionLoad: roundMetric(Math.random() * 8),
+          poopProgress: initialPoopState.poopProgress,
+          wasteCount: initialPoopState.wasteCount,
           statusUpdatedAt: Date.now(),
         };
         
@@ -1028,6 +1178,8 @@ export const useStore = create<AppState>()(
             patchedPet.hygiene !== pet.hygiene ||
             patchedPet.wasteLevel !== pet.wasteLevel ||
             patchedPet.digestionLoad !== pet.digestionLoad ||
+            patchedPet.poopProgress !== pet.poopProgress ||
+            patchedPet.wasteCount !== pet.wasteCount ||
             patchedPet.statusUpdatedAt !== pet.statusUpdatedAt;
 
           if (hasPatched) {
@@ -1066,6 +1218,8 @@ export const useStore = create<AppState>()(
             nextPet.hygiene !== pet.hygiene ||
             nextPet.wasteLevel !== pet.wasteLevel ||
             nextPet.digestionLoad !== pet.digestionLoad ||
+            nextPet.poopProgress !== pet.poopProgress ||
+            nextPet.wasteCount !== pet.wasteCount ||
             nextPet.statusUpdatedAt !== pet.statusUpdatedAt
           ) {
             changed = true;
@@ -1099,6 +1253,8 @@ export const useStore = create<AppState>()(
             nextPet.hygiene !== pet.hygiene ||
             nextPet.wasteLevel !== pet.wasteLevel ||
             nextPet.digestionLoad !== pet.digestionLoad ||
+            nextPet.poopProgress !== pet.poopProgress ||
+            nextPet.wasteCount !== pet.wasteCount ||
             nextPet.statusUpdatedAt !== pet.statusUpdatedAt
           ) {
             changed = true;
@@ -1109,6 +1265,45 @@ export const useStore = create<AppState>()(
         if (!found) return false;
         if (changed) set({completedPets: nextPets});
         return true;
+      },
+      cleanCompletedPetWaste: (instanceId) => {
+        const state = get();
+        const now = Date.now();
+        let changed = false;
+        let found = false;
+        let cleaned = false;
+
+        const nextPets = state.completedPets.map((pet) => {
+          const passivePet = applyPetPassiveStatus(pet, now);
+          let nextPet = passivePet;
+
+          if (pet.instanceId === instanceId) {
+            found = true;
+            if ((passivePet.wasteCount ?? 0) > 0) {
+              nextPet = applyPetWasteCleanup(passivePet, 1, now);
+              cleaned = true;
+            }
+          }
+
+          if (
+            nextPet.health !== pet.health ||
+            nextPet.satiety !== pet.satiety ||
+            nextPet.mood !== pet.mood ||
+            nextPet.hygiene !== pet.hygiene ||
+            nextPet.wasteLevel !== pet.wasteLevel ||
+            nextPet.digestionLoad !== pet.digestionLoad ||
+            nextPet.poopProgress !== pet.poopProgress ||
+            nextPet.wasteCount !== pet.wasteCount ||
+            nextPet.statusUpdatedAt !== pet.statusUpdatedAt
+          ) {
+            changed = true;
+          }
+          return nextPet;
+        });
+
+        if (!found) return false;
+        if (changed) set({completedPets: nextPets});
+        return cleaned;
       },
       cleanSceneWaste: (theme) => {
         const normalizedTheme = theme === 'C' ? 'A' : theme;
@@ -1123,7 +1318,7 @@ export const useStore = create<AppState>()(
 
           if (
             passivePet.theme === normalizedTheme
-            && (passivePet.wasteLevel ?? 0) > 6
+            && (passivePet.wasteCount ?? 0) > 0
           ) {
             cleanedCount += 1;
             nextPet = applyPetCareAction(passivePet, 'clean', now);
@@ -1136,6 +1331,8 @@ export const useStore = create<AppState>()(
             nextPet.hygiene !== pet.hygiene ||
             nextPet.wasteLevel !== pet.wasteLevel ||
             nextPet.digestionLoad !== pet.digestionLoad ||
+            nextPet.poopProgress !== pet.poopProgress ||
+            nextPet.wasteCount !== pet.wasteCount ||
             nextPet.statusUpdatedAt !== pet.statusUpdatedAt
           ) {
             changed = true;

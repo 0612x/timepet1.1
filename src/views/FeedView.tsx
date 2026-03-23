@@ -214,7 +214,7 @@ export function FeedView() {
                 <div className="mt-2 flex items-center justify-between px-1">
                   <span className="text-[11px] font-black tracking-wide">{spriteOption.label}</span>
                   <span className="rounded-full border border-current/20 bg-white/70 px-2 py-0.5 text-[10px] font-black">
-                    {currentEgg.stage === 'evolved' ? getQualityLabel(displayQuality) : '幼体'}
+                    幼体
                   </span>
                 </div>
               </div>

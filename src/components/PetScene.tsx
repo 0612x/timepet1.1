@@ -9,7 +9,7 @@ import {
   isPetSpriteKey,
   type PetSpriteAction,
 } from '../data/petSprites';
-import {SpriteActor} from './SpriteActor';
+import {getSpriteActionLoopMs, SpriteActor} from './SpriteActor';
 import {ensureSpritePathLoaded, preloadSpritePaths} from '../utils/spriteAssetLoader';
 import {
   SCENE_BOTTOM_MAX,
@@ -36,11 +36,29 @@ interface SceneSpritePetLite {
 interface SpritePetInstanceProps {
   pet: CompletedPet;
   mini: boolean;
+  isDarkBackdrop?: boolean;
   onMove: (id: string, x: number, y: number) => void;
+  onRuntimePetPointChange?: (
+    id: string,
+    points: {
+      interactionX: number;
+      interactionY: number;
+      bubbleX: number;
+      bubbleY: number;
+      feedX: number;
+      feedY: number;
+      feedLeftX: number;
+      feedLeftY: number;
+      feedRightX: number;
+      feedRightY: number;
+    },
+  ) => void;
   onSelect?: (pet: CompletedPet) => void;
   actionRequest?: ScenePetActionRequest | null;
   feedMoveRequest?: ScenePetFeedMoveRequest | null;
-  onFeedArrived?: (payload: {instanceId: string; dropId: string}) => void;
+  activeFeedDropIds: Set<string>;
+  onFeedStarted?: (payload: {instanceId: string; dropId: string}) => boolean;
+  onFeedArrived?: (payload: {instanceId: string; dropId: string; x: number; y: number}) => void;
   onFeedChaseFailed?: (payload: {instanceId: string; dropId: string}) => void;
   debugHitArea?: boolean;
   sceneSize: {width: number; height: number};
@@ -69,16 +87,32 @@ export interface ScenePetFeedMoveRequest {
   nonce: number;
 }
 
+export interface SceneWasteSpot {
+  instanceId: string;
+  x: number;
+  y: number;
+  count: number;
+}
+
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const SPRITE_ACTIONS: PetSpriteAction[] = ['idle', 'move', 'feed', 'happy'];
 const getLayerZIndex = (y: number) => 100 + Math.round(y * 10);
+const FEED_EAT_DURATION_MS = 1300;
+const FEED_ARRIVE_X_TOLERANCE = 1.1;
+const FEED_ARRIVE_Y_TOLERANCE = 0.95;
+const FEED_NEAR_SNAP_X_TOLERANCE = 1.7;
+const FEED_NEAR_SNAP_Y_TOLERANCE = 1.3;
+const FEED_APPROACH_SNAP_X_TOLERANCE = 1.1;
+const FEED_APPROACH_SNAP_Y_TOLERANCE = 0.82;
+const FEED_APPROACH_SNAP_DISTANCE = 1.3;
+const FEED_CHASE_NEAR_DISTANCE = 2.2;
+const FEED_CHASE_STUCK_LIMIT = 8;
 const SHOW_SCENE_MOVE_BOUNDS = false;
 const SCENE_POOP_ICON_PATHS = [
   '/images/pets/farm/farm_poop.png',
   '/images/pets/farm/poop.png',
   '/images/pets/farm/farm_waste.png',
 ] as const;
-const WASTE_VISIBLE_THRESHOLD = 28;
 const SPECIES_SIZE_FACTOR: Record<string, number> = {
   farm_frog: 0.74,
   farm_littlefox: 0.62,
@@ -150,7 +184,7 @@ const hashToUnit = (input: string) => {
   return (hash >>> 0) / 4294967295;
 };
 
-const WasteIcon: React.FC<{mini?: boolean}> = ({mini = false}) => {
+const WasteIcon: React.FC<{mini?: boolean; count?: number}> = ({mini = false, count = 1}) => {
   const [imageError, setImageError] = useState(false);
   const [iconPathIndex, setIconPathIndex] = useState(0);
 
@@ -158,7 +192,7 @@ const WasteIcon: React.FC<{mini?: boolean}> = ({mini = false}) => {
   const iconPath = SCENE_POOP_ICON_PATHS[iconPathIndex];
 
   return (
-    <div className="pointer-events-none">
+    <div className="pointer-events-none relative">
       {!imageError && iconPath ? (
         <img
           src={iconPath}
@@ -176,6 +210,11 @@ const WasteIcon: React.FC<{mini?: boolean}> = ({mini = false}) => {
         />
       ) : (
         <span className="text-[12px] leading-none opacity-90">💩</span>
+      )}
+      {count > 1 && (
+        <span className="absolute -right-2 -top-1 inline-flex min-w-4 items-center justify-center rounded-full border border-white/80 bg-amber-400 px-1 text-[8px] font-black leading-4 text-amber-950 shadow-[0_2px_5px_rgba(15,23,42,0.18)]">
+          {count}
+        </span>
       )}
     </div>
   );
@@ -227,12 +266,14 @@ const BasicPetInstance: React.FC<BasicPetInstanceProps> = ({pet, mini, theme, on
   return (
     <div
       className={cn(
-        'absolute whitespace-nowrap pointer-events-auto',
+        'absolute whitespace-nowrap',
+        onSelect ? 'pointer-events-auto' : 'pointer-events-none',
         getAnimationClass(pet.variant, theme),
       )}
       onClick={(event) => {
+        if (!onSelect) return;
         event.stopPropagation();
-        onSelect?.(pet);
+        onSelect(pet);
       }}
       style={{
         left: `${pet.x}%`,
@@ -250,10 +291,14 @@ const BasicPetInstance: React.FC<BasicPetInstanceProps> = ({pet, mini, theme, on
 const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   pet,
   mini,
+  isDarkBackdrop = false,
   onMove,
+  onRuntimePetPointChange,
   onSelect,
   actionRequest,
   feedMoveRequest,
+  activeFeedDropIds,
+  onFeedStarted,
   onFeedArrived,
   onFeedChaseFailed,
   debugHitArea = false,
@@ -265,6 +310,9 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   const [faceRight, setFaceRight] = useState(true);
   const [actionSeed, setActionSeed] = useState(0);
   const [motionReady, setMotionReady] = useState(false);
+  const [feedProgress, setFeedProgress] = useState<number | null>(null);
+  const [motionTransitionMs, setMotionTransitionMs] = useState(mini ? 1600 : 2200);
+  const [motionTimingFunction, setMotionTimingFunction] = useState<'linear' | 'ease-in-out'>('linear');
   const territorySeed = useMemo(
     () => ({
       x: hashToUnit(`${pet.instanceId}:x`),
@@ -279,9 +327,22 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   const forcedActionUntilRef = useRef(0);
   const forcedActionNonceRef = useRef(-1);
   const feedMoveNonceRef = useRef(-1);
-  const feedMoveTargetRef = useRef<{x: number; y: number; dropId: string} | null>(null);
+  const feedMoveTargetRef = useRef<{
+    x: number;
+    y: number;
+    dropId: string;
+    dropX: number;
+    dropY: number;
+    faceRight: boolean;
+  } | null>(null);
   const feedCommitTimerRef = useRef<number | null>(null);
   const feedStuckAttemptsRef = useRef(0);
+  const eatingDropIdRef = useRef<string | null>(null);
+  const eatingResolvePointRef = useRef<{x: number; y: number} | null>(null);
+  const eatingUntilRef = useRef(0);
+  const feedProgressRef = useRef<number | null>(null);
+  const feedProgressTickTimerRef = useRef<number | null>(null);
+  const onFeedStartedRef = useRef(onFeedStarted);
   const onFeedArrivedRef = useRef(onFeedArrived);
   const onFeedChaseFailedRef = useRef(onFeedChaseFailed);
   const forcedIdleTimerRef = useRef<number | null>(null);
@@ -302,6 +363,10 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
     expiresAt: Date.now() + 7000 + Math.random() * 8000,
   });
   const moveDuration = mini ? 1600 : 2200;
+  const moveLoopMs = useMemo(
+    () => getSpriteActionLoopMs(pet.petId, 'move') ?? 980,
+    [pet.petId],
+  );
   const idleConfig = getPetSpriteConfigByKey(pet.petId, 'idle')
     ?? getPetSpriteConfigByKey(pet.petId, 'move');
   const frameWidth = idleConfig?.frameWidth ?? 32;
@@ -315,6 +380,8 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   const actorHeightPx = frameHeight * scale;
   const spriteWidthPx = actorWidthPx * visualScale;
   const spriteHeightPx = actorHeightPx * visualScale;
+  const spriteWidthPercent = sceneSize.width > 0 ? (spriteWidthPx / sceneSize.width) * 100 : (mini ? 8 : 10);
+  const spriteHeightPercent = sceneSize.height > 0 ? (spriteHeightPx / sceneSize.height) * 100 : (mini ? 10 : 14);
   const maxFrameEdge = Math.max(frameWidth, frameHeight);
   const baseHitRatio = maxFrameEdge >= 96 ? 0.3 : maxFrameEdge >= 64 ? 0.36 : 0.5;
   const sizePressure = clamp(actorWidthPx / (mini ? 80 : 120), 0, 1.5);
@@ -337,6 +404,33 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
     0,
     Math.max(0, actorHeightPx - hitHeightPx),
   );
+  const hitCenterPx = {
+    x: hitLeftPx + hitWidthPx * 0.5,
+    y: hitTopPx + hitHeightPx * 0.5,
+  };
+  const feedAnchorPx = {
+    x: hitLeftPx + hitWidthPx * (faceRight ? 0.72 : 0.28),
+    y: hitTopPx + hitHeightPx * 0.56,
+  };
+  const hitCenterOffsetXPercent = sceneSize.width > 0
+    ? ((hitLeftPx + hitWidthPx * 0.5) * visualScale / sceneSize.width) * 100
+    : spriteWidthPercent * 0.5;
+  const hitCenterOffsetYPercent = sceneSize.height > 0
+    ? ((hitTopPx + hitHeightPx * 0.5) * visualScale / sceneSize.height) * 100
+    : spriteHeightPercent * 0.62;
+  const bubbleOffsetXPercent = hitCenterOffsetXPercent;
+  const bubbleOffsetYPercent = sceneSize.height > 0
+    ? (Math.max(0, hitTopPx - 2) * visualScale / sceneSize.height) * 100
+    : spriteHeightPercent * 0.22;
+  const feedAnchorRightOffsetXPercent = sceneSize.width > 0
+    ? ((hitLeftPx + hitWidthPx * 0.72) * visualScale / sceneSize.width) * 100
+    : spriteWidthPercent * 0.68;
+  const feedAnchorLeftOffsetXPercent = sceneSize.width > 0
+    ? ((hitLeftPx + hitWidthPx * 0.28) * visualScale / sceneSize.width) * 100
+    : spriteWidthPercent * 0.32;
+  const feedAnchorOffsetYPercent = sceneSize.height > 0
+    ? ((hitTopPx + hitHeightPx * 0.56) * visualScale / sceneSize.height) * 100
+    : spriteHeightPercent * 0.68;
 
   const bounds = useMemo(
     () => {
@@ -416,8 +510,171 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
     return availableActions[0] ?? 'idle';
   }, [availableActions]);
 
+  const getInteractionCenter = useCallback((point: {x: number; y: number}) => ({
+    x: point.x + hitCenterOffsetXPercent,
+    y: point.y + hitCenterOffsetYPercent,
+  }), [hitCenterOffsetXPercent, hitCenterOffsetYPercent]);
+
+  const getFeedAnchorOffset = useCallback((faceRight: boolean) => ({
+    x: faceRight ? feedAnchorRightOffsetXPercent : feedAnchorLeftOffsetXPercent,
+    y: feedAnchorOffsetYPercent,
+  }), [feedAnchorLeftOffsetXPercent, feedAnchorOffsetYPercent, feedAnchorRightOffsetXPercent]);
+
+  const getFeedAnchorPosition = useCallback((point: {x: number; y: number}, faceRight: boolean) => {
+    const offset = getFeedAnchorOffset(faceRight);
+    return {
+      x: point.x + offset.x,
+      y: point.y + offset.y,
+    };
+  }, [getFeedAnchorOffset]);
+
+  const notifyRuntimePetPoints = useCallback((point: {x: number; y: number}, faceRightValue: boolean) => {
+    const interactionCenter = getInteractionCenter(point);
+    const feedAnchor = getFeedAnchorPosition(point, faceRightValue);
+    const feedLeftAnchor = getFeedAnchorPosition(point, false);
+    const feedRightAnchor = getFeedAnchorPosition(point, true);
+    onRuntimePetPointChange?.(pet.instanceId, {
+      interactionX: interactionCenter.x,
+      interactionY: interactionCenter.y,
+      bubbleX: point.x + bubbleOffsetXPercent,
+      bubbleY: point.y + bubbleOffsetYPercent,
+      feedX: feedAnchor.x,
+      feedY: feedAnchor.y,
+      feedLeftX: feedLeftAnchor.x,
+      feedLeftY: feedLeftAnchor.y,
+      feedRightX: feedRightAnchor.x,
+      feedRightY: feedRightAnchor.y,
+    });
+  }, [bubbleOffsetXPercent, bubbleOffsetYPercent, getFeedAnchorPosition, getInteractionCenter, onRuntimePetPointChange, pet.instanceId]);
+
+  const getCollisionHalfWidthPercent = useCallback((petId: string) => {
+    if (sceneSize.width <= 0) return mini ? 2.2 : 2.8;
+    const cfg = getPetSpriteConfigByKey(petId, 'idle') ?? getPetSpriteConfigByKey(petId, 'move');
+    const width = cfg?.frameWidth ?? 32;
+    const height = cfg?.frameHeight ?? 32;
+    const targetHeight = mini ? 46 : 72;
+    const actorScale = (targetHeight / height) * (mini ? 1 : 1.02) * (mini ? 0.92 : 1.06);
+    const widthPercent = (width * actorScale / sceneSize.width) * 100;
+    return Math.max(2.6, widthPercent * 0.34);
+  }, [mini, sceneSize.width]);
+
+  const getCollisionPressure = useCallback((x: number, y: number, relaxed = false) => {
+    const selfHalfWidth = getCollisionHalfWidthPercent(pet.petId);
+    const verticalThreshold = (mini ? 2.4 : 3.4) * (relaxed ? 0.58 : 1);
+
+    return sceneSpritePetsRef.current.reduce((pressure, other) => {
+      if (other.instanceId === pet.instanceId) return pressure;
+      const otherHalfWidth = getCollisionHalfWidthPercent(other.petId);
+      const minGapX = (selfHalfWidth + otherHalfWidth) * (relaxed ? 0.52 : 0.9);
+      const overlapX = minGapX - Math.abs(other.x - x);
+      const overlapY = verticalThreshold - Math.abs(other.y - y);
+      if (overlapX <= 0 || overlapY <= 0) return pressure;
+      return pressure + overlapX * 0.82 + overlapY * 0.48;
+    }, 0);
+  }, [getCollisionHalfWidthPercent, mini, pet.instanceId, pet.petId, sceneSpritePetsRef]);
+
+  const isPositionBlocked = useCallback((x: number, y: number, relaxed = false) => (
+    getCollisionPressure(x, y, relaxed) > 0.01
+  ), [getCollisionPressure]);
+
+  const pickFeedApproachTarget = useCallback((
+    dropX: number,
+    dropY: number,
+    current: {x: number; y: number},
+  ) => {
+    const yOffsets = [0, mini ? 0.38 : 0.56, mini ? -0.38 : -0.56];
+    const currentCenter = getInteractionCenter(current);
+    const baseCandidates = [
+      {
+        faceRight: true,
+      },
+      {
+        faceRight: false,
+      },
+    ];
+
+    return baseCandidates
+      .flatMap((baseCandidate) => yOffsets.map((offsetY) => {
+        const feedAnchorOffset = getFeedAnchorOffset(baseCandidate.faceRight);
+        const candidateX = clamp(dropX - feedAnchorOffset.x, bounds.xMin, bounds.xMax);
+        const candidateY = clamp(
+          dropY - feedAnchorOffset.y + offsetY,
+          bounds.yMin,
+          bounds.yMax,
+        );
+        const candidateCenter = getInteractionCenter({x: candidateX, y: candidateY});
+        const pressure = getCollisionPressure(candidateX, candidateY, true);
+        return {
+          faceRight: baseCandidate.faceRight,
+          x: candidateX,
+          y: candidateY,
+          feedX: candidateX + feedAnchorOffset.x,
+          feedY: candidateY + feedAnchorOffset.y,
+          pressure,
+          blocked: pressure > 0.01,
+          chaseDistance: Math.hypot(candidateCenter.x - currentCenter.x, (candidateCenter.y - currentCenter.y) * 1.18),
+          dropDistance: Math.hypot(dropX - (candidateX + feedAnchorOffset.x), (dropY - (candidateY + feedAnchorOffset.y)) * 1.18),
+        };
+      }))
+      .sort((left, right) =>
+        Number(left.blocked) - Number(right.blocked)
+        || left.pressure - right.pressure
+        || left.chaseDistance - right.chaseDistance
+        || left.dropDistance - right.dropDistance
+      )[0];
+  }, [
+    bounds.xMax,
+    bounds.xMin,
+    bounds.yMax,
+    bounds.yMin,
+    getFeedAnchorOffset,
+    getCollisionPressure,
+    getInteractionCenter,
+    mini,
+  ]);
+
   const [action, setAction] = useState<PetSpriteAction>(defaultAction);
   const actionRef = useRef<PetSpriteAction>(defaultAction);
+  const setMotionTransitionProfile = useCallback((
+    duration: number,
+    timingFunction: 'linear' | 'ease-in-out' = 'linear',
+  ) => {
+    setMotionTransitionMs((previous) => (previous === duration ? previous : duration));
+    setMotionTimingFunction((previous) => (previous === timingFunction ? previous : timingFunction));
+  }, []);
+  const setFeedProgressValue = (nextValue: number | null) => {
+    const normalized = nextValue === null ? null : clamp(nextValue, 0, 1);
+    const previous = feedProgressRef.current;
+    if (previous === null && normalized === null) return;
+    if (previous !== null && normalized !== null && Math.abs(previous - normalized) < 0.04) return;
+    if (previous === normalized) return;
+    feedProgressRef.current = normalized;
+    setFeedProgress(normalized);
+  };
+  const clearFeedProgressTimer = useCallback(() => {
+    if (feedProgressTickTimerRef.current !== null) {
+      window.clearTimeout(feedProgressTickTimerRef.current);
+      feedProgressTickTimerRef.current = null;
+    }
+  }, []);
+  const finalizeFeedSession = useCallback((dropId: string) => {
+    if (feedCommitTimerRef.current !== null) {
+      window.clearTimeout(feedCommitTimerRef.current);
+      feedCommitTimerRef.current = null;
+    }
+    clearFeedProgressTimer();
+    eatingDropIdRef.current = null;
+    eatingUntilRef.current = 0;
+    setFeedProgressValue(null);
+    const feedAnchor = eatingResolvePointRef.current ?? getFeedAnchorPosition(posRef.current, faceRightRef.current);
+    eatingResolvePointRef.current = null;
+    onFeedArrivedRef.current?.({
+      instanceId: pet.instanceId,
+      dropId,
+      x: feedAnchor.x,
+      y: feedAnchor.y,
+    });
+  }, [clearFeedProgressTimer, getFeedAnchorPosition, pet.instanceId]);
 
   const playForcedAction = (requestedAction: PetSpriteAction) => {
     if (forcedIdleTimerRef.current !== null) {
@@ -476,11 +733,16 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
 
   useEffect(() => {
     posRef.current = pos;
-  }, [pos]);
+    notifyRuntimePetPoints(pos, faceRightRef.current);
+  }, [notifyRuntimePetPoints, pos]);
 
   useEffect(() => {
     actionRef.current = action;
   }, [action]);
+
+  useEffect(() => {
+    onFeedStartedRef.current = onFeedStarted;
+  }, [onFeedStarted]);
 
   useEffect(() => {
     onFeedArrivedRef.current = onFeedArrived;
@@ -492,7 +754,8 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
 
   useEffect(() => {
     faceRightRef.current = faceRight;
-  }, [faceRight]);
+    notifyRuntimePetPoints(posRef.current, faceRight);
+  }, [faceRight, notifyRuntimePetPoints]);
 
   useEffect(() => {
     const id = window.requestAnimationFrame(() => setMotionReady(true));
@@ -507,10 +770,15 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       if (feedCommitTimerRef.current !== null) {
         window.clearTimeout(feedCommitTimerRef.current);
       }
+      clearFeedProgressTimer();
       queuedActionIntentRef.current = null;
       movingUntilRef.current = 0;
       feedMoveTargetRef.current = null;
       feedStuckAttemptsRef.current = 0;
+      eatingDropIdRef.current = null;
+      eatingResolvePointRef.current = null;
+      eatingUntilRef.current = 0;
+      setFeedProgressValue(null);
     };
   }, []);
 
@@ -533,9 +801,10 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
 
     const nextPos = {x: clampedX, y: clampedY};
     posRef.current = nextPos;
+    setMotionTransitionProfile(0, 'linear');
     setPos(nextPos);
     onMove(pet.instanceId, clampedX, clampedY);
-  }, [bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, onMove, pet.instanceId]);
+  }, [bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, onMove, pet.instanceId, setMotionTransitionProfile]);
 
   useEffect(() => {
     territoryRef.current = {
@@ -566,13 +835,79 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
     if (!feedMoveRequest || feedMoveRequest.instanceId !== pet.instanceId) return;
     if (feedMoveNonceRef.current === feedMoveRequest.nonce) return;
     feedMoveNonceRef.current = feedMoveRequest.nonce;
+    if (forcedIdleTimerRef.current !== null) {
+      window.clearTimeout(forcedIdleTimerRef.current);
+      forcedIdleTimerRef.current = null;
+    }
+    if (feedCommitTimerRef.current !== null) {
+      window.clearTimeout(feedCommitTimerRef.current);
+      feedCommitTimerRef.current = null;
+    }
+    clearFeedProgressTimer();
+    forcedActionUntilRef.current = 0;
+    movingUntilRef.current = 0;
+    queuedActionIntentRef.current = null;
+    const currentPos = posRef.current;
+    const preferredApproach = pickFeedApproachTarget(feedMoveRequest.x, feedMoveRequest.y, currentPos);
     feedMoveTargetRef.current = {
-      x: clamp(feedMoveRequest.x, bounds.xMin, bounds.xMax),
-      y: clamp(feedMoveRequest.y, bounds.yMin, bounds.yMax),
+      x: preferredApproach.x,
+      y: preferredApproach.y,
       dropId: feedMoveRequest.dropId,
+      dropX: preferredApproach.feedX,
+      dropY: preferredApproach.feedY,
+      faceRight: preferredApproach.faceRight,
     };
+    if (faceRightRef.current !== preferredApproach.faceRight) {
+      faceRightRef.current = preferredApproach.faceRight;
+      setFaceRight(preferredApproach.faceRight);
+    }
+    eatingDropIdRef.current = null;
+    eatingResolvePointRef.current = null;
+    eatingUntilRef.current = 0;
+    setFeedProgressValue(null);
     feedStuckAttemptsRef.current = 0;
-  }, [bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, feedMoveRequest, pet.instanceId]);
+  }, [feedMoveRequest, pet.instanceId, pickFeedApproachTarget]);
+  useEffect(() => {
+    const currentTarget = feedMoveTargetRef.current;
+    if (currentTarget && !activeFeedDropIds.has(currentTarget.dropId)) {
+      feedMoveTargetRef.current = null;
+      movingUntilRef.current = 0;
+      feedStuckAttemptsRef.current = 0;
+      setFeedProgressValue(null);
+      if (availableActions.includes('idle')) {
+        actionRef.current = 'idle';
+        setAction('idle');
+      }
+    }
+    const currentEatingDropId = eatingDropIdRef.current;
+    if (currentEatingDropId && !activeFeedDropIds.has(currentEatingDropId)) {
+      eatingDropIdRef.current = null;
+      eatingResolvePointRef.current = null;
+      eatingUntilRef.current = 0;
+      if (feedCommitTimerRef.current !== null) {
+        window.clearTimeout(feedCommitTimerRef.current);
+        feedCommitTimerRef.current = null;
+      }
+      clearFeedProgressTimer();
+      setFeedProgressValue(null);
+      if (availableActions.includes('idle')) {
+        actionRef.current = 'idle';
+        setAction('idle');
+      }
+    }
+  }, [activeFeedDropIds, availableActions]);
+  useEffect(() => {
+    if (feedMoveRequest) return;
+    if (eatingDropIdRef.current || !feedMoveTargetRef.current) return;
+    feedMoveTargetRef.current = null;
+    movingUntilRef.current = 0;
+    feedStuckAttemptsRef.current = 0;
+    setFeedProgressValue(null);
+    if (availableActions.includes('idle')) {
+      actionRef.current = 'idle';
+      setAction('idle');
+    }
+  }, [availableActions, feedMoveRequest]);
 
   useEffect(() => {
     let timer: number;
@@ -588,28 +923,6 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       if (actionRef.current === nextAction) return;
       actionRef.current = nextAction;
       setAction(nextAction);
-    };
-
-    const getCollisionHalfWidthPercent = (petId: string) => {
-      if (sceneSize.width <= 0) return mini ? 2.2 : 2.8;
-      const cfg = getPetSpriteConfigByKey(petId, 'idle') ?? getPetSpriteConfigByKey(petId, 'move');
-      const width = cfg?.frameWidth ?? 32;
-      const height = cfg?.frameHeight ?? 32;
-      const targetHeight = mini ? 46 : 72;
-      const actorScale = (targetHeight / height) * (mini ? 1 : 1.02) * (mini ? 0.92 : 1.06);
-      const widthPercent = (width * actorScale / sceneSize.width) * 100;
-      return Math.max(2.6, widthPercent * 0.34);
-    };
-
-    const isPositionBlocked = (x: number, y: number) => {
-      const selfHalfWidth = getCollisionHalfWidthPercent(pet.petId);
-      const verticalThreshold = mini ? 2.4 : 3.4;
-      return sceneSpritePetsRef.current.some((other) => {
-        if (other.instanceId === pet.instanceId) return false;
-        const otherHalfWidth = getCollisionHalfWidthPercent(other.petId);
-        const minGapX = (selfHalfWidth + otherHalfWidth) * 0.9;
-        return Math.abs(other.x - x) < minGapX && Math.abs(other.y - y) < verticalThreshold;
-      });
     };
 
     const getCloseBlockerCount = (x: number, y: number) =>
@@ -679,6 +992,135 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       if (restartIdle && actionRef.current === 'idle') {
         setActionSeed((previous) => previous + 1);
       }
+    };
+
+    const startEatingSession = (
+      drop: Pick<SceneFeedDrop, 'id' | 'x' | 'y'>,
+      nextFaceRight: boolean,
+      resolvePoint: {x: number; y: number},
+      sourceTargetDropId: string | null = null,
+    ) => {
+      const granted = onFeedStartedRef.current?.({
+        instanceId: pet.instanceId,
+        dropId: drop.id,
+      }) ?? true;
+      if (!granted) return false;
+
+      if (sourceTargetDropId && sourceTargetDropId !== drop.id) {
+        onFeedChaseFailedRef.current?.({
+          instanceId: pet.instanceId,
+          dropId: sourceTargetDropId,
+        });
+      }
+
+      feedStuckAttemptsRef.current = 0;
+      feedMoveTargetRef.current = null;
+      movingUntilRef.current = 0;
+      eatingDropIdRef.current = drop.id;
+      eatingResolvePointRef.current = resolvePoint;
+      eatingUntilRef.current = Date.now() + FEED_EAT_DURATION_MS;
+      setFacingDirection(nextFaceRight);
+      clearFeedProgressTimer();
+      setFeedProgressValue(0);
+
+      const eatStartedAt = Date.now();
+      const updateFeedProgress = () => {
+        const progress = (Date.now() - eatStartedAt) / FEED_EAT_DURATION_MS;
+        setFeedProgressValue(progress);
+        if (progress >= 1) {
+          feedProgressTickTimerRef.current = null;
+          return;
+        }
+        feedProgressTickTimerRef.current = window.setTimeout(updateFeedProgress, 90);
+      };
+      updateFeedProgress();
+
+      const feedAction = availableActions.includes('feed')
+        ? 'feed'
+        : availableActions.includes('idle')
+          ? 'idle'
+          : defaultAction;
+      playForcedAction(feedAction);
+      forcedActionUntilRef.current = Math.max(forcedActionUntilRef.current, eatingUntilRef.current);
+
+      if (forcedIdleTimerRef.current !== null) {
+        window.clearTimeout(forcedIdleTimerRef.current);
+        forcedIdleTimerRef.current = null;
+      }
+      if (feedAction !== 'idle' && availableActions.includes('idle')) {
+        forcedIdleTimerRef.current = window.setTimeout(() => {
+          actionRef.current = 'idle';
+          setAction('idle');
+        }, FEED_EAT_DURATION_MS);
+      }
+
+      if (feedCommitTimerRef.current !== null) {
+        window.clearTimeout(feedCommitTimerRef.current);
+      }
+      feedCommitTimerRef.current = window.setTimeout(() => {
+        const currentEatingDropId = eatingDropIdRef.current;
+        if (!currentEatingDropId || currentEatingDropId !== drop.id) {
+          feedCommitTimerRef.current = null;
+          return;
+        }
+        finalizeFeedSession(currentEatingDropId);
+      }, FEED_EAT_DURATION_MS);
+
+      return true;
+    };
+
+    const tryStartAssignedFeed = (
+      current: {x: number; y: number},
+      target: {dropId: string; dropX: number; dropY: number; faceRight: boolean; x: number; y: number},
+    ) => {
+      const drop = {id: target.dropId, x: target.dropX, y: target.dropY};
+      const feedFaces = [target.faceRight, !target.faceRight];
+
+      const canStartFrom = (point: {x: number; y: number}, nextFaceRight: boolean) => {
+        const anchor = getFeedAnchorPosition(point, nextFaceRight);
+        const deltaX = drop.x - anchor.x;
+        const deltaY = drop.y - anchor.y;
+        const isWithin =
+          Math.abs(deltaX) <= FEED_ARRIVE_X_TOLERANCE
+          && Math.abs(deltaY) <= FEED_ARRIVE_Y_TOLERANCE;
+        const canSnap =
+          !isWithin
+          && Math.abs(deltaX) <= FEED_NEAR_SNAP_X_TOLERANCE
+          && Math.abs(deltaY) <= FEED_NEAR_SNAP_Y_TOLERANCE;
+
+        if (!isWithin && !canSnap) return false;
+        return startEatingSession(drop, nextFaceRight, anchor, target.dropId);
+      };
+
+      for (const feedFace of feedFaces) {
+        if (canStartFrom(current, feedFace)) {
+          return true;
+        }
+      }
+
+      const approachDeltaX = target.x - current.x;
+      const approachDeltaY = target.y - current.y;
+      const approachDistance = Math.hypot(approachDeltaX, approachDeltaY * 1.18);
+      const canSnapToApproach =
+        Math.abs(approachDeltaX) <= FEED_APPROACH_SNAP_X_TOLERANCE
+        && Math.abs(approachDeltaY) <= FEED_APPROACH_SNAP_Y_TOLERANCE;
+      const isNearApproach = canSnapToApproach || approachDistance <= FEED_APPROACH_SNAP_DISTANCE;
+
+      if (!isNearApproach) return false;
+
+      const snappedPos = {x: target.x, y: target.y};
+      posRef.current = snappedPos;
+      setMotionTransitionProfile(0, 'linear');
+      setPos(snappedPos);
+      onMove(pet.instanceId, snappedPos.x, snappedPos.y);
+
+      for (const feedFace of feedFaces) {
+        if (canStartFrom(snappedPos, feedFace)) {
+          return true;
+        }
+      }
+
+      return false;
     };
 
     const getLocalCrowdPenalty = (x: number, y: number) => {
@@ -933,92 +1375,157 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       to: {x: number; y: number},
     ) => getTravelDistance(from, to) >= (mini ? 0.72 : 0.95);
 
+    const pickFeedChaseCandidate = (
+      current: {x: number; y: number},
+      target: {x: number; y: number},
+    ) => {
+      const deltaX = target.x - current.x;
+      const deltaY = target.y - current.y;
+      const currentDistance = Math.hypot(deltaX, deltaY * 1.22) || 1;
+      const normalizedX = deltaX / currentDistance;
+      const normalizedY = deltaY / currentDistance;
+      const sideX = -normalizedY;
+      const sideY = normalizedX;
+      const forwardStride = clamp(currentDistance * 0.72, mini ? 1.8 : 2.4, mini ? 3.2 : 4.8);
+      const lateralStride = mini ? 0.38 : 0.62;
+      const verticalBias = mini ? 0.78 : 0.86;
+      const candidateVariants = [
+        {forward: 1, lateral: 0},
+        {forward: 0.88, lateral: 0},
+        {forward: 1, lateral: 0.55},
+        {forward: 1, lateral: -0.55},
+        {forward: 0.78, lateral: 1.05},
+        {forward: 0.78, lateral: -1.05},
+      ];
+
+      const rankedCandidates = candidateVariants
+        .map((variant) => {
+          const candidateX = clamp(
+            current.x + normalizedX * forwardStride * variant.forward + sideX * lateralStride * variant.lateral,
+            bounds.xMin,
+            bounds.xMax,
+          );
+          const candidateY = clamp(
+            current.y + normalizedY * forwardStride * verticalBias * variant.forward + sideY * lateralStride * 0.55 * variant.lateral,
+            bounds.yMin,
+            bounds.yMax,
+          );
+          const pressure = getCollisionPressure(candidateX, candidateY, true);
+          const blocked = pressure > 0.01;
+          const targetDistance = Math.hypot(target.x - candidateX, (target.y - candidateY) * 1.22);
+          const progress = currentDistance - targetDistance;
+          const crowdPenalty = getLocalCrowdPenalty(candidateX, candidateY);
+
+          return {
+            x: candidateX,
+            y: candidateY,
+            blocked,
+            pressure,
+            progress,
+            targetDistance,
+            crowdPenalty,
+            score: progress * 2.8 - pressure * 2.2 - crowdPenalty * 0.12,
+          };
+        })
+        .filter((candidate) => hasEnoughDisplacement(current, candidate))
+        .sort((left, right) =>
+          Number(left.blocked) - Number(right.blocked)
+          || right.score - left.score
+          || left.targetDistance - right.targetDistance
+        );
+
+      const openCandidate = rankedCandidates.find((candidate) => !candidate.blocked && candidate.progress > 0.05);
+      if (openCandidate) return openCandidate;
+
+      const softCandidate = rankedCandidates.find((candidate) => candidate.pressure < 0.18 && candidate.progress > 0.08);
+      if (softCandidate) return softCandidate;
+
+      if (currentDistance <= FEED_CHASE_NEAR_DISTANCE) {
+        const nearCandidate = rankedCandidates.find((candidate) => !candidate.blocked) ?? rankedCandidates[0];
+        if (nearCandidate) return nearCandidate;
+      }
+
+      return null;
+    };
+
     const run = () => {
       if (!alive) return;
       const now = Date.now();
-      if (now < forcedActionUntilRef.current) {
-        timer = schedule(run, 130 + Math.random() * 120);
+    if (now < forcedActionUntilRef.current) {
+      timer = schedule(run, 130 + Math.random() * 120);
+      return;
+    }
+    if (eatingDropIdRef.current) {
+      if (now >= eatingUntilRef.current + 120) {
+        finalizeFeedSession(eatingDropIdRef.current);
+        timer = schedule(run, 90 + Math.random() * 90);
         return;
       }
-      if (queuedActionIntentRef.current && now >= movingUntilRef.current) {
-        const queuedIntent = queuedActionIntentRef.current;
-        queuedActionIntentRef.current = null;
+      timer = schedule(run, 80);
+      return;
+    }
+    if (queuedActionIntentRef.current && now >= movingUntilRef.current) {
+      const queuedIntent = queuedActionIntentRef.current;
+      queuedActionIntentRef.current = null;
         triggerAction(queuedIntent);
         timer = schedule(run, 120 + Math.random() * 140);
         return;
       }
       const currentAtStart = posRef.current;
-      const feedTarget = feedMoveTargetRef.current;
+      let feedTarget = feedMoveTargetRef.current;
       if (feedTarget) {
-        const deltaX = feedTarget.x - currentAtStart.x;
-        const deltaY = feedTarget.y - currentAtStart.y;
-        const distance = Math.hypot(deltaX, deltaY * 1.28);
-
-        if (distance <= 1.35) {
-          feedStuckAttemptsRef.current = 0;
-          feedMoveTargetRef.current = null;
-          movingUntilRef.current = 0;
-          const feedAction = availableActions.includes('feed')
-            ? 'feed'
-            : availableActions.includes('idle')
-              ? 'idle'
-              : defaultAction;
-          playForcedAction(feedAction);
-
-          if (feedCommitTimerRef.current !== null) {
-            window.clearTimeout(feedCommitTimerRef.current);
-          }
-          feedCommitTimerRef.current = window.setTimeout(() => {
-            onFeedArrivedRef.current?.({
-              instanceId: pet.instanceId,
-              dropId: feedTarget.dropId,
-            });
-            feedCommitTimerRef.current = null;
-          }, 220 + Math.random() * 120);
-
+        if (activeFeedDropIds.has(feedTarget.dropId) && tryStartAssignedFeed(currentAtStart, feedTarget)) {
           timer = schedule(run, 180 + Math.random() * 100);
           return;
         }
-
-        const stepX = Math.min(Math.abs(deltaX), mini ? 3.2 : 4.2);
-        const stepY = Math.min(Math.abs(deltaY), mini ? 1.2 : 1.6);
-        let nextX = clamp(
-          currentAtStart.x + Math.sign(deltaX || 1) * stepX,
-          bounds.xMin,
-          bounds.xMax,
-        );
-        let nextY = clamp(
-          currentAtStart.y + Math.sign(deltaY || 1) * stepY,
-          bounds.yMin,
-          bounds.yMax,
-        );
-
-        if (isPositionBlocked(nextX, nextY) && distance > 2.4) {
-          const sidestepY = clamp(
-            currentAtStart.y + (Math.random() > 0.5 ? 1 : -1) * (mini ? 0.8 : 1.1),
-            bounds.yMin,
-            bounds.yMax,
-          );
-          if (!isPositionBlocked(nextX, sidestepY)) {
-            nextY = sidestepY;
-          } else {
-            const sidestepX = clamp(
-              currentAtStart.x + (Math.random() > 0.5 ? 1 : -1) * (mini ? 1.8 : 2.6),
-              bounds.xMin,
-              bounds.xMax,
-            );
-            if (!isPositionBlocked(sidestepX, nextY)) {
-              nextX = sidestepX;
-            }
+        if (feedStuckAttemptsRef.current > 0) {
+          const reroutedTarget = pickFeedApproachTarget(feedTarget.dropX, feedTarget.dropY, currentAtStart);
+          const currentPressure = getCollisionPressure(feedTarget.x, feedTarget.y, true);
+          if (
+            reroutedTarget
+            && (
+              reroutedTarget.pressure + 0.02 < currentPressure
+              || reroutedTarget.faceRight !== feedTarget.faceRight
+            )
+          ) {
+            feedTarget = {
+              ...feedTarget,
+              x: reroutedTarget.x,
+              y: reroutedTarget.y,
+              faceRight: reroutedTarget.faceRight,
+            };
+            feedMoveTargetRef.current = feedTarget;
           }
         }
+        const approachDeltaX = feedTarget.x - currentAtStart.x;
+        const approachDeltaY = feedTarget.y - currentAtStart.y;
+        const approachDistance = Math.hypot(approachDeltaX, approachDeltaY * 1.18);
+        const shouldSnapToApproach =
+          (
+            Math.abs(approachDeltaX) <= FEED_APPROACH_SNAP_X_TOLERANCE
+            && Math.abs(approachDeltaY) <= FEED_APPROACH_SNAP_Y_TOLERANCE
+          )
+          || approachDistance <= FEED_APPROACH_SNAP_DISTANCE;
 
-        if (isPositionBlocked(nextX, nextY)) {
+        if (shouldSnapToApproach) {
+          const snappedPos = {x: feedTarget.x, y: feedTarget.y};
+          posRef.current = snappedPos;
+          setMotionTransitionProfile(0, 'linear');
+          setPos(snappedPos);
+          onMove(pet.instanceId, snappedPos.x, snappedPos.y);
+          setFacingDirection(feedTarget.faceRight);
+
+          if (activeFeedDropIds.has(feedTarget.dropId) && tryStartAssignedFeed(snappedPos, feedTarget)) {
+            timer = schedule(run, 180 + Math.random() * 100);
+            return;
+          }
+
           feedStuckAttemptsRef.current += 1;
-          if (feedStuckAttemptsRef.current >= 2) {
+          if (feedStuckAttemptsRef.current >= FEED_CHASE_STUCK_LIMIT) {
             const failedDropId = feedTarget.dropId;
             feedMoveTargetRef.current = null;
             movingUntilRef.current = 0;
+            setFeedProgressValue(null);
             setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
             onFeedChaseFailedRef.current?.({
               instanceId: pet.instanceId,
@@ -1027,18 +1534,22 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
             timer = schedule(run, 130 + Math.random() * 110);
             return;
           }
-          setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
-          movingUntilRef.current = 0;
-          timer = schedule(run, 120 + Math.random() * 100);
+
+          timer = schedule(run, 90 + Math.random() * 70);
           return;
         }
 
-        if (!hasEnoughDisplacement(currentAtStart, {x: nextX, y: nextY})) {
+        const chaseCandidate = pickFeedChaseCandidate(currentAtStart, feedTarget);
+        const nextX = chaseCandidate?.x ?? currentAtStart.x;
+        const nextY = chaseCandidate?.y ?? currentAtStart.y;
+
+        if (!chaseCandidate || !hasEnoughDisplacement(currentAtStart, {x: nextX, y: nextY})) {
           feedStuckAttemptsRef.current += 1;
-          if (feedStuckAttemptsRef.current >= 2) {
+          if (feedStuckAttemptsRef.current >= FEED_CHASE_STUCK_LIMIT) {
             const failedDropId = feedTarget.dropId;
             feedMoveTargetRef.current = null;
             movingUntilRef.current = 0;
+            setFeedProgressValue(null);
             setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
             onFeedChaseFailedRef.current?.({
               instanceId: pet.instanceId,
@@ -1048,19 +1559,29 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
             return;
           }
           setNextAction(availableActions.includes('idle') ? 'idle' : defaultAction);
-          timer = schedule(run, 120 + Math.random() * 90);
+          setFeedProgressValue(null);
+          timer = schedule(run, 170 + Math.random() * 110);
           return;
         }
         feedStuckAttemptsRef.current = 0;
 
         const nextPos = {x: nextX, y: nextY};
+        const chaseTravelDistance = getTravelDistance(currentAtStart, nextPos);
+        const chaseCycles = clamp(chaseTravelDistance / (mini ? 2.4 : 3.1), 0.72, 1.42);
+        const chaseDuration = clamp(
+          Math.round(moveLoopMs * chaseCycles),
+          mini ? 420 : 520,
+          mini ? 980 : 1320,
+        );
         posRef.current = nextPos;
+        setMotionTransitionProfile(chaseDuration, 'linear');
         setPos(nextPos);
         onMove(pet.instanceId, nextX, nextY);
-        setFacingDirection(nextX >= currentAtStart.x);
+        if (Math.abs(nextX - currentAtStart.x) > 0.16) {
+          setFacingDirection(nextX >= currentAtStart.x);
+        }
         setNextAction(availableActions.includes('move') ? 'move' : defaultAction);
 
-        const chaseDuration = mini ? 900 : 1200;
         movingUntilRef.current = Date.now() + chaseDuration;
         schedule(() => {
           if (!alive) return;
@@ -1144,6 +1665,7 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
           }
           const nextPos = {x: nextX, y: nextY};
           posRef.current = nextPos;
+          setMotionTransitionProfile(moveDuration, 'linear');
           setPos(nextPos);
           onMove(pet.instanceId, nextX, nextY);
           setNextAction('move');
@@ -1172,13 +1694,14 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       timer = schedule(run, getRestDelay(nextRestAction));
     };
 
-    timer = schedule(run, 1200 + Math.random() * 1000);
+    const initialDelay = feedMoveRequest?.instanceId === pet.instanceId ? 36 : 1200 + Math.random() * 1000;
+    timer = schedule(run, initialDelay);
     return () => {
       alive = false;
       window.clearTimeout(timer);
       timers.forEach((id) => window.clearTimeout(id));
     };
-  }, [availableActions, bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, defaultAction, mini, moveDuration, onMove, pet.instanceId, pet.petId, pet.state, sceneSize.width]);
+  }, [activeFeedDropIds, availableActions, bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, clearFeedProgressTimer, defaultAction, feedMoveRequest?.nonce, finalizeFeedSession, getCollisionPressure, getFeedAnchorPosition, getInteractionCenter, isPositionBlocked, mini, moveDuration, moveLoopMs, onMove, pet.instanceId, pet.petId, pet.state, pickFeedApproachTarget, sceneSize.width, setMotionTransitionProfile]);
 
   if (!spriteOption) return null;
 
@@ -1193,9 +1716,34 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
         top: `${pos.y}%`,
         zIndex: getLayerZIndex(pos.y),
         transform: `scale(${visualScale})`,
-        transitionDuration: motionReady ? `${moveDuration}ms` : '0ms',
+        transitionDuration: motionReady ? `${motionTransitionMs}ms` : '0ms',
+        transitionTimingFunction: motionTimingFunction,
       }}>
       <div className="relative">
+        {feedProgress !== null && (
+          <div
+            className="pointer-events-none absolute z-30"
+            style={{
+              left: `${hitCenterPx.x}px`,
+              top: `${Math.max(0, hitTopPx - 4)}px`,
+              width: `${clamp(hitWidthPx + 10, 28, 44)}px`,
+              transform: 'translate(-50%, -100%)',
+            }}>
+            <div
+              className={cn(
+                'h-1.5 overflow-hidden rounded-full border backdrop-blur-sm',
+                isDarkBackdrop ? 'border-white/15 bg-white/15' : 'border-slate-200/90 bg-slate-200/95',
+              )}>
+              <div
+                className={cn(
+                  'h-full rounded-full transition-[width] duration-120 ease-out',
+                  isDarkBackdrop ? 'bg-amber-300' : 'bg-amber-500',
+                )}
+                style={{width: `${Math.round(feedProgress * 100)}%`}}
+              />
+            </div>
+          </div>
+        )}
         <SpriteActor
           spriteKey={spriteOption.key}
           action={action}
@@ -1205,6 +1753,42 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
           ariaLabel={spriteOption.label}
           className="pointer-events-none relative z-10 drop-shadow-[0_5px_8px_rgba(15,23,42,0.18)]"
         />
+        {debugHitArea && (
+          <>
+            <span
+              className="pointer-events-none absolute z-20 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-cyan-100 bg-cyan-400 shadow-[0_0_0_2px_rgba(8,145,178,0.18)]"
+              style={{
+                left: `${hitCenterPx.x}px`,
+                top: `${hitCenterPx.y}px`,
+              }}
+            />
+            <span
+              className="pointer-events-none absolute z-20 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-amber-100 bg-amber-400 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]"
+              style={{
+                left: `${feedAnchorPx.x}px`,
+                top: `${feedAnchorPx.y}px`,
+              }}
+            />
+            <span
+              className="pointer-events-none absolute z-20 rounded bg-cyan-500/85 px-1 py-[1px] text-[8px] font-semibold leading-none text-white"
+              style={{
+                left: `${hitCenterPx.x}px`,
+                top: `${Math.max(0, hitCenterPx.y - 16)}px`,
+                transform: 'translateX(-50%)',
+              }}>
+              点击中心
+            </span>
+            <span
+              className="pointer-events-none absolute z-20 rounded bg-amber-500/85 px-1 py-[1px] text-[8px] font-semibold leading-none text-white"
+              style={{
+                left: `${feedAnchorPx.x}px`,
+                top: `${Math.max(0, feedAnchorPx.y - 16)}px`,
+                transform: 'translateX(-50%)',
+              }}>
+              吃食点
+            </span>
+          </>
+        )}
         {onSelect && (
           <button
             type="button"
@@ -1242,12 +1826,32 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
 
 interface PetSceneProps {
   mini?: boolean;
+  isDarkBackdrop?: boolean;
+  sceneSurfaceRef?: React.MutableRefObject<HTMLDivElement | null>;
   onPetSelect?: (pet: CompletedPet) => void;
   onSceneBlankClick?: () => void;
   onSceneBlankPointer?: (point: {x: number; y: number}) => void;
+  onWasteSpotsChange?: (spots: SceneWasteSpot[]) => void;
+  highlightedWasteInstanceId?: string | null;
+  onRuntimePetPointChange?: (
+    instanceId: string,
+    points: {
+      interactionX: number;
+      interactionY: number;
+      bubbleX: number;
+      bubbleY: number;
+      feedX: number;
+      feedY: number;
+      feedLeftX: number;
+      feedLeftY: number;
+      feedRightX: number;
+      feedRightY: number;
+    },
+  ) => void;
   actionRequest?: ScenePetActionRequest | null;
-  feedMoveRequest?: ScenePetFeedMoveRequest | null;
-  onPetFeedArrived?: (payload: {instanceId: string; dropId: string}) => void;
+  feedMoveRequests?: Record<string, ScenePetFeedMoveRequest>;
+  onPetFeedStarted?: (payload: {instanceId: string; dropId: string}) => boolean;
+  onPetFeedArrived?: (payload: {instanceId: string; dropId: string; x: number; y: number}) => void;
   onPetFeedChaseFailed?: (payload: {instanceId: string; dropId: string}) => void;
   feedDrops?: SceneFeedDrop[];
   debugHitArea?: boolean;
@@ -1255,11 +1859,17 @@ interface PetSceneProps {
 
 export function PetScene({
   mini = false,
+  isDarkBackdrop = false,
+  sceneSurfaceRef,
   onPetSelect,
   onSceneBlankClick,
   onSceneBlankPointer,
+  onWasteSpotsChange,
+  highlightedWasteInstanceId = null,
+  onRuntimePetPointChange,
   actionRequest,
-  feedMoveRequest,
+  feedMoveRequests = {},
+  onPetFeedStarted,
   onPetFeedArrived,
   onPetFeedChaseFailed,
   feedDrops = [],
@@ -1273,11 +1883,17 @@ export function PetScene({
   const sceneRef = useRef<HTMLDivElement | null>(null);
   const [sceneSize, setSceneSize] = useState({width: 0, height: 0});
   const [spriteAssetsReady, setSpriteAssetsReady] = useState(false);
-  const [sceneWasteSpots, setSceneWasteSpots] = useState<Record<string, {x: number; y: number}>>({});
+  const [sceneWasteSpots, setSceneWasteSpots] = useState<Record<string, {x: number; y: number; count: number}>>({});
   const runtimeSceneSpritePetsRef = useRef<SceneSpritePetLite[]>([]);
   const runtimeSceneSpriteIndexRef = useRef(new Map<string, number>());
   const pendingPositionUpdatesRef = useRef(new Map<string, {x: number; y: number}>());
   const lastFlushAtRef = useRef(0);
+  const setSceneElementRef = useCallback((node: HTMLDivElement | null) => {
+    sceneRef.current = node;
+    if (sceneSurfaceRef) {
+      sceneSurfaceRef.current = node;
+    }
+  }, [sceneSurfaceRef]);
 
   useEffect(() => {
     syncPetData();
@@ -1326,15 +1942,19 @@ export function PetScene({
       });
 
       petsInTheme.forEach((pet) => {
-        const wasteLevel = pet.wasteLevel ?? 0;
-        if (wasteLevel >= WASTE_VISIBLE_THRESHOLD) {
-          if (!next[pet.instanceId]) {
-            next[pet.instanceId] = getPetWasteDropPosition(pet, mini, sceneSize);
+        const wasteCount = Math.max(0, Math.round(pet.wasteCount ?? 0));
+        if (wasteCount > 0) {
+          const existing = next[pet.instanceId];
+          if (!existing || existing.count !== wasteCount) {
+            next[pet.instanceId] = {
+              ...getPetWasteDropPosition(pet, mini, sceneSize),
+              count: wasteCount,
+            };
             changed = true;
           }
           return;
         }
-        if (wasteLevel < WASTE_VISIBLE_THRESHOLD && next[pet.instanceId]) {
+        if (next[pet.instanceId]) {
           delete next[pet.instanceId];
           changed = true;
         }
@@ -1409,6 +2029,24 @@ export function PetScene({
   const sceneSpritePetIdKey = useMemo(() => (
     Array.from(new Set(sceneSpritePets.map((pet) => pet.petId))).sort().join('|')
   ), [sceneSpritePets]);
+  const activeFeedDropIds = useMemo(
+    () => new Set(feedDrops.map((drop) => drop.id)),
+    [feedDrops],
+  );
+  const sceneWasteEntries = useMemo(
+    () => Object.entries(sceneWasteSpots) as Array<[string, {x: number; y: number; count: number}]>,
+    [sceneWasteSpots],
+  );
+  useEffect(() => {
+    onWasteSpotsChange?.(
+      sceneWasteEntries.map(([instanceId, position]) => ({
+        instanceId,
+        x: position.x,
+        y: position.y,
+        count: position.count,
+      })),
+    );
+  }, [onWasteSpotsChange, sceneWasteEntries]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1463,7 +2101,7 @@ export function PetScene({
         }}
       />
       <div
-        ref={sceneRef}
+        ref={setSceneElementRef}
         className="absolute inset-x-0 top-0 bottom-24 overflow-hidden pointer-events-auto"
         onClick={(event) => {
           const rect = event.currentTarget.getBoundingClientRect();
@@ -1486,7 +2124,7 @@ export function PetScene({
             }}
           />
         )}
-        {Object.entries(sceneWasteSpots).map(([instanceId, position]) => (
+        {sceneWasteEntries.map(([instanceId, position]) => (
           <div
             key={`waste-${instanceId}`}
             className="pointer-events-none absolute -translate-x-1/2 -translate-y-full"
@@ -1495,7 +2133,16 @@ export function PetScene({
               top: `${position.y}%`,
               zIndex: getLayerZIndex(position.y) - 1,
             }}>
-            <WasteIcon mini={mini} />
+            <div
+              className={cn(
+                'relative transition-all duration-150',
+                highlightedWasteInstanceId === instanceId ? 'scale-[1.08] -translate-y-0.5' : '',
+              )}>
+              {highlightedWasteInstanceId === instanceId && (
+                <div className="absolute left-1/2 top-1/2 h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full border border-emerald-200/90 bg-emerald-200/25 shadow-[0_0_0_3px_rgba(110,231,183,0.2)]" />
+              )}
+              <WasteIcon mini={mini} count={position.count} />
+            </div>
           </div>
         ))}
         {feedDrops.map((drop) => (
@@ -1526,10 +2173,14 @@ export function PetScene({
                 key={pet.instanceId}
                 pet={pet}
                 mini={mini}
+                isDarkBackdrop={isDarkBackdrop}
                 onMove={handleSpriteMove}
+                onRuntimePetPointChange={onRuntimePetPointChange}
                 onSelect={onPetSelect}
                 actionRequest={actionRequest}
-                feedMoveRequest={feedMoveRequest}
+                feedMoveRequest={feedMoveRequests[pet.instanceId] ?? null}
+                activeFeedDropIds={activeFeedDropIds}
+                onFeedStarted={onPetFeedStarted}
                 onFeedArrived={onPetFeedArrived}
                 onFeedChaseFailed={onPetFeedChaseFailed}
                 debugHitArea={debugHitArea}

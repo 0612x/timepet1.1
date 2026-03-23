@@ -26,6 +26,18 @@ const ACTION_TIMING_PROFILE: Record<
   happy: {targetLoopMs: 940, minFps: 2.6, maxFps: 8.2},
 };
 
+export function getSpriteActionLoopMs(spriteKey: string, action: PetSpriteAction) {
+  const config = getPetSpriteConfigByKey(spriteKey, action);
+  if (!config || config.frameCount <= 0) return null;
+
+  const profile = ACTION_TIMING_PROFILE[action];
+  const targetFps = config.frameCount / (profile.targetLoopMs / 1000);
+  const effectiveFps = clamp(targetFps, profile.minFps, profile.maxFps);
+  if (effectiveFps <= 0) return null;
+
+  return Math.round((config.frameCount / effectiveFps) * 1000);
+}
+
 export function SpriteActor({
   spriteKey,
   action = 'idle',
@@ -119,10 +131,10 @@ export function SpriteActor({
 
   const effectiveFps = useMemo(() => {
     if (!config) return 0;
-    const profile = ACTION_TIMING_PROFILE[action];
-    const targetFps = config.frameCount / (profile.targetLoopMs / 1000);
-    return clamp(targetFps, profile.minFps, profile.maxFps);
-  }, [action, config]);
+    const loopMs = getSpriteActionLoopMs(spriteKey, action);
+    if (!loopMs || loopMs <= 0) return 0;
+    return config.frameCount / (loopMs / 1000);
+  }, [action, config, spriteKey]);
 
   useEffect(() => {
     if (!config || config.frameCount <= 1 || effectiveFps <= 0) return;
