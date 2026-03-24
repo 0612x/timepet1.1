@@ -46,6 +46,7 @@ import {
   type PetSpriteAction,
 } from '../data/petSprites';
 import {SpriteActor} from '../components/SpriteActor';
+import {getEggTierById} from '../data/eggs';
 
 const RING_CIRCUMFERENCE = 352;
 const EMPTY_ALLOCATIONS: Allocation[] = [];
@@ -909,6 +910,7 @@ export function HomeView() {
     updatePlanTemplate,
     updateUnusedAllocation,
     homeTabEnterSignal,
+    dailyAllocationRewarded,
   } = useStore();
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [selectedDetailDateKey, setSelectedDetailDateKey] = useState<string | null>(null);
@@ -947,15 +949,19 @@ export function HomeView() {
 
   const handleAllocate = (type: ActivityType, hours: number) => {
     if (hours <= 0 || hours > remaining) return false;
+    const getsStarterReward = !dailyAllocationRewarded[todayStr];
     const success = allocateTime(todayStr, type, hours);
     if (!success) return false;
-    setActionFeedback('已新增分配');
+    setActionFeedback(getsStarterReward ? '已新增分配 · 今日首次 +50 金币' : '已新增分配');
     return true;
   };
 
-  const totalEggProgress = currentEgg.progress.focus + currentEgg.progress.heal + currentEgg.progress.active;
-  const eggTarget = currentEgg.stage === 'egg' ? 8 : 24;
-  const progressPercent = Math.min(100, (totalEggProgress / eggTarget) * 100);
+  const totalEggProgress = currentEgg
+    ? currentEgg.progress.focus + currentEgg.progress.heal + currentEgg.progress.active
+    : 0;
+  const eggTier = currentEgg ? getEggTierById(currentEgg.tierId) : null;
+  const eggTarget = eggTier?.totalHours ?? 0;
+  const progressPercent = eggTarget > 0 ? Math.min(100, (totalEggProgress / eggTarget) * 100) : 0;
 
   const distribution = useMemo(() => {
     const data = createEmptyActivityTotals();
@@ -1601,15 +1607,17 @@ export function HomeView() {
   }, [hasSecondaryActions]);
 
   const handleCopyYesterday = () => {
+    const getsStarterReward = !dailyAllocationRewarded[todayStr];
     if (!copyAllocationsFromDate(yesterdayDateKey, todayStr)) {
       setActionFeedback(canQuickFill ? '昨天还没有分布可复制' : '已投喂后无法覆盖分布');
       return;
     }
 
-    setActionFeedback('已复制昨天');
+    setActionFeedback(getsStarterReward ? '已复制昨天 · 今日首次 +50 金币' : '已复制昨天');
   };
 
   const handleApplyTemplate = (template: Pick<PlanTemplate, 'id' | 'label' | 'drafts'>) => {
+    const getsStarterReward = !dailyAllocationRewarded[todayStr];
     if (!applyAllocationDrafts(todayStr, template.drafts)) {
       setActionFeedback(canQuickFill ? '模板应用失败' : '已投喂后无法应用模板');
       return;
@@ -1617,7 +1625,9 @@ export function HomeView() {
 
     markPlanTemplateUsed(template.id);
     setTemplateSheetMode(null);
-    setActionFeedback(`已套用${template.label}`);
+    setActionFeedback(
+      getsStarterReward ? `已套用${template.label} · 今日首次 +50 金币` : `已套用${template.label}`,
+    );
   };
 
   const handleOpenTemplateSheet = () => {
@@ -2283,17 +2293,18 @@ export function HomeView() {
               <div>
                 <h4 className="text-lg font-black flex items-center gap-2">
                   <Sparkles size={18} className="text-indigo-500" />
-                  {currentEgg.stage === 'egg' ? '当前养成状态' : '当前成长状态'}
+                  {currentEgg ? (currentEgg.stage === 'ready' ? '待破壳状态' : '当前孵化状态') : '培育舱待命'}
                 </h4>
                 <p className="text-xs opacity-60 font-medium">
-                  {currentEgg.theme === 'A'
-                    ? '农场'
-                    : currentEgg.theme === 'B'
-                      ? '深海（暂未开放）'
-                      : currentEgg.theme === 'custom'
-                        ? '手绘乐园'
-                        : '农场'}{' '}
-                  · {currentEgg.stage === 'egg' ? '幼体期' : '成长期'}
+                  {currentEgg
+                    ? `${currentEgg.theme === 'A'
+                      ? '农场'
+                      : currentEgg.theme === 'B'
+                        ? '深海（暂未开放）'
+                        : currentEgg.theme === 'custom'
+                          ? '手绘乐园'
+                          : '农场'} · ${eggTier?.label ?? '田园蛋'}${currentEgg.stage === 'ready' ? ' · 待破壳' : ''}`
+                    : '蛋库里选择下一枚蛋，开始新的孵化循环'}
                 </p>
               </div>
               <div className="p-2 bg-indigo-500/10 rounded-xl text-indigo-600">
@@ -2301,23 +2312,32 @@ export function HomeView() {
               </div>
             </div>
 
-            <div className="space-y-3">
-              <div className="flex justify-between items-end">
-                <div className="text-3xl font-mono font-black tracking-tighter">
-                  {totalEggProgress.toFixed(1)} <span className="text-sm opacity-40">/ {eggTarget}h</span>
+            {currentEgg ? (
+              <div className="space-y-3">
+                <div className="flex justify-between items-end">
+                  <div className="text-3xl font-mono font-black tracking-tighter">
+                    {totalEggProgress.toFixed(1)} <span className="text-sm opacity-40">/ {eggTarget}h</span>
+                  </div>
+                  <div className="rounded-lg bg-indigo-50 px-2 py-1 text-xs font-bold text-indigo-600">
+                    {progressPercent.toFixed(0)}%
+                  </div>
                 </div>
-                <div className="text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-1 rounded-lg">
-                  {progressPercent.toFixed(0)}%
-                </div>
-              </div>
 
-              <div className="w-full bg-slate-200/50 h-3 rounded-full overflow-hidden p-0.5 border border-white/50">
-                <div
-                  className="bg-gradient-to-r from-indigo-500 to-purple-500 h-full rounded-full transition-all duration-1000 ease-out shadow-[0_0_10px_rgba(79,70,229,0.3)]"
-                  style={{width: `${progressPercent}%`}}
-                />
+                <div className="h-3 w-full overflow-hidden rounded-full border border-white/50 bg-slate-200/50 p-0.5">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 shadow-[0_0_10px_rgba(79,70,229,0.3)] transition-all duration-1000 ease-out"
+                    style={{width: `${progressPercent}%`}}
+                  />
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="rounded-[24px] border border-dashed border-slate-200 bg-white/60 px-4 py-5 text-center">
+                <p className="text-sm font-black text-slate-700">当前没有正在培育的蛋</p>
+                <p className="mt-1 text-xs font-medium leading-5 text-slate-400">
+                  去培育舱把蛋库里的蛋放进来，或者先去场景商店购买新蛋。
+                </p>
+              </div>
+            )}
           </div>
           <div className="absolute -right-4 -bottom-4 w-24 h-24 bg-indigo-500/5 rounded-full blur-2xl" />
         </section>

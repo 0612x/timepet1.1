@@ -2,11 +2,17 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {createPortal} from 'react-dom';
 import {AnimatePresence, motion} from 'motion/react';
 import {Coins, Package2, Sparkles, Store, Wheat, X} from 'lucide-react';
-import {type FoodId, type FoodInventory, FOOD_ITEMS, getFoodItemById} from '../data/foods';
+import {type FoodId, type FoodInventory, FOOD_ITEMS} from '../data/foods';
+import {type EggInventory, EGG_TIERS, getEggTierQualityEntries, type EggTierId} from '../data/eggs';
+import {FACILITY_ITEMS, type FacilityId, type FacilityInventory} from '../data/facilities';
+import {getEggSpriteOffsetY, getEggSpriteScale} from '../data/eggSprites';
 import {getSceneUiAssetPath} from '../data/sceneUiAssets';
 import {FoodSprite} from './FoodSprite';
+import {EggActor} from './EggActor';
+import {BroomActor} from './BroomActor';
 import {UiTextureLayer} from './UiTextureLayer';
 import {cn} from '../utils/cn';
+import {getPetQualityBadgeClass} from '../utils/petQuality';
 
 type ShopTab = 'food' | 'facility' | 'egg';
 
@@ -26,7 +32,13 @@ interface SceneShopSheetProps {
   coins: number;
   selectedFoodId: FoodId;
   foodInventory: FoodInventory;
+  eggInventory: EggInventory;
+  facilityInventory: FacilityInventory;
   onBuyFood: (foodId: FoodId, quantity: number) => boolean;
+  onBuyEgg: (tierId: EggTierId, quantity?: number) => boolean;
+  onBuyFacility: (facilityId: FacilityId) => boolean;
+  onStartFacilityPlacement?: (facilityId: FacilityId) => void;
+  onInteract?: () => void;
   onClose: () => void;
 }
 
@@ -50,23 +62,41 @@ const SHOP_TABS: Array<{id: ShopTab; label: string}> = [
   {id: 'egg', label: '蛋'},
 ];
 
+function formatEggDayLabel(totalHours: number) {
+  const days = totalHours / 24;
+  if (Number.isInteger(days)) return `${days} 天`;
+  return `${days.toFixed(1)} 天`;
+}
+
 export function SceneShopSheet({
   open,
   anchor,
   coins,
   selectedFoodId,
   foodInventory,
+  eggInventory,
+  facilityInventory,
   onBuyFood,
+  onBuyEgg,
+  onBuyFacility,
+  onStartFacilityPlacement,
+  onInteract,
   onClose,
 }: SceneShopSheetProps) {
   const [activeTab, setActiveTab] = useState<ShopTab>('food');
   const [feedback, setFeedback] = useState<string | null>(null);
   const feedbackTimerRef = useRef<number | null>(null);
-  const selectedFood = useMemo(() => getFoodItemById(selectedFoodId), [selectedFoodId]);
-  const selectedFoodStock = foodInventory[selectedFoodId] ?? 0;
   const totalFoodStock = useMemo(
     () => FOOD_ITEMS.reduce((sum, item) => sum + (foodInventory[item.id] ?? 0), 0),
     [foodInventory],
+  );
+  const totalEggStock = useMemo(
+    () => EGG_TIERS.reduce((sum, item) => sum + (eggInventory[item.id] ?? 0), 0),
+    [eggInventory],
+  );
+  const totalFacilityOwned = useMemo(
+    () => FACILITY_ITEMS.reduce((sum, item) => sum + Math.min(1, facilityInventory[item.id] ?? 0), 0),
+    [facilityInventory],
   );
 
   const panelLayout = useMemo<ShopPanelLayout | null>(() => {
@@ -182,7 +212,7 @@ export function SceneShopSheet({
             </div>
 
             <div className="mt-2 flex items-center justify-between gap-2">
-              <div className="inline-flex items-center gap-1.5 rounded-[10px] border border-[#d9bf8f] bg-[#fff8e8] px-2.5 py-1 text-[10px] font-semibold text-[#7a5f39]">
+              <div className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[10px] border border-[#d9bf8f] bg-[#fff8e8] px-2.5 py-1 text-[10px] font-semibold text-[#7a5f39]">
                 <Package2 size={11} className="text-[#a58961]" />
                 <span>库存 {stock}</span>
               </div>
@@ -214,7 +244,7 @@ export function SceneShopSheet({
                     'inline-flex h-8 min-w-[60px] items-center justify-center rounded-[8px] border-[2px] px-3 text-[11px] font-black transition-all active:translate-y-px',
                     buyFiveDisabled
                       ? 'cursor-not-allowed border-[#d7c39a] bg-[#ebe0c2] text-[#b49b75] shadow-none'
-                      : 'border-[#a36b1e] bg-[linear-gradient(180deg,#ffe17f,#f6b43b)] text-[#654008] shadow-[0_2px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.24)] hover:brightness-105 active:shadow-[0_1px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.1)]',
+                      : 'border-[#a36b1e] bg-[linear-gradient(180deg,#ffd968,#f2ae2b)] text-[#654008] shadow-[0_2px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.24)] hover:brightness-105 active:shadow-[0_1px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.1)]',
                   )}>
                   买 5
                 </button>
@@ -225,6 +255,201 @@ export function SceneShopSheet({
       </section>
     );
   }), [coins, foodInventory, onBuyFood, pushFeedback, selectedFoodId]);
+  const eggCards = useMemo(() => EGG_TIERS.map((tier) => {
+    const stock = eggInventory[tier.id] ?? 0;
+    const buyOneDisabled = coins < tier.price;
+    const buyTwoDisabled = coins < tier.price * 2;
+    const qualityEntries = getEggTierQualityEntries(tier.id);
+
+    return (
+      <section
+        key={tier.id}
+        className="rounded-[20px] border-[2px] border-[#b78e5f] bg-[linear-gradient(180deg,#fff7df,#f1ddb6)] px-3.5 py-3.5 shadow-[0_3px_0_#d6b17a,0_12px_18px_rgba(84,57,28,0.12)] transition-colors">
+        <div className="flex items-start gap-3">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-[14px] border-[2px] border-[#d7bc8c] bg-[#fff8e8] shadow-[inset_0_1px_0_rgba(255,255,255,0.85)]">
+            <div
+              style={{
+                transform: `translateY(${getEggSpriteOffsetY(tier.id, 'library')}px)`,
+              }}>
+              <EggActor
+                tierId={tier.id}
+                animation="static"
+                scale={getEggSpriteScale(tier.id, 'library', 'static')}
+                ariaLabel={tier.label}
+              />
+            </div>
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <p className="truncate text-[14px] font-black text-[#5c4023]">{tier.label}</p>
+                  <span className="rounded-[999px] border border-[#d4a14a] bg-[#fff1c8] px-2 py-0.5 text-[9px] font-black text-[#8c5711] shadow-[0_2px_0_#ecd59b]">
+                    {tier.totalHours}h
+                  </span>
+                </div>
+              </div>
+
+              <div className="shrink-0 text-right">
+                <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[#9a7548]">价格</p>
+                <div className="mt-1 inline-flex items-center gap-1.5 rounded-[8px] border border-[#d8bf8d] bg-[#fbf2d8] px-2.5 py-1 text-[12px] font-black text-[#6b5230]">
+                  <Coins size={11} className="text-[#b6893a]" />
+                  <span>{tier.price}</span>
+                  <span className="text-[10px] font-semibold text-[#9a7548]">金币</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-2 grid grid-cols-3 gap-1.5">
+              {qualityEntries.map((entry) => (
+                <div
+                  key={`${tier.id}-${entry.quality}`}
+                  className={cn(
+                    'rounded-[9px] border px-1 py-[3px] text-center',
+                    getPetQualityBadgeClass(entry.quality),
+                  )}>
+                  <p className="text-[8px] font-black leading-none">{entry.label}</p>
+                  <p className="mt-0.5 text-[11px] font-black leading-none">{entry.chance}%</p>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <div className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[10px] border border-[#d9bf8f] bg-[#fff8e8] px-2.5 py-1 text-[10px] font-semibold text-[#7a5f39]">
+                <Package2 size={11} className="text-[#a58961]" />
+                <span>库存 {stock}</span>
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={buyOneDisabled}
+                  onClick={() => {
+                    const bought = onBuyEgg(tier.id, 1);
+                    pushFeedback(bought ? `${tier.label} +1` : '金币不够啦');
+                  }}
+                  className={cn(
+                    'inline-flex h-8 min-w-[60px] items-center justify-center rounded-[8px] border-[2px] px-3 text-[11px] font-black transition-all active:translate-y-px',
+                    buyOneDisabled
+                      ? 'cursor-not-allowed border-[#d7c39a] bg-[#ebe0c2] text-[#b49b75] shadow-none'
+                      : 'border-[#a36b1e] bg-[linear-gradient(180deg,#ffd968,#f2ae2b)] text-[#654008] shadow-[0_2px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.22)] hover:brightness-105 active:shadow-[0_1px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.1)]',
+                  )}>
+                  买 1
+                </button>
+                <button
+                  type="button"
+                  disabled={buyTwoDisabled}
+                  onClick={() => {
+                    const bought = onBuyEgg(tier.id, 2);
+                    pushFeedback(bought ? `${tier.label} +2` : '金币不够啦');
+                  }}
+                  className={cn(
+                    'inline-flex h-8 min-w-[60px] items-center justify-center rounded-[8px] border-[2px] px-3 text-[11px] font-black transition-all active:translate-y-px',
+                    buyTwoDisabled
+                      ? 'cursor-not-allowed border-[#d7c39a] bg-[#ebe0c2] text-[#b49b75] shadow-none'
+                      : 'border-[#a36b1e] bg-[linear-gradient(180deg,#ffd968,#f2ae2b)] text-[#654008] shadow-[0_2px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.24)] hover:brightness-105 active:shadow-[0_1px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.1)]',
+                  )}>
+                  买 2
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  }), [coins, eggInventory, onBuyEgg, pushFeedback]);
+  const facilityCards = useMemo(() => FACILITY_ITEMS.map((facility) => {
+    const owned = (facilityInventory[facility.id] ?? 0) > 0;
+    const buyDisabled = owned || coins < facility.price;
+
+    return (
+      <section
+        key={facility.id}
+        className={cn(
+          'rounded-[20px] border-[2px] px-3.5 py-3.5 shadow-[0_3px_0_#d6b17a,0_12px_18px_rgba(84,57,28,0.12)] transition-colors',
+          owned
+            ? 'border-[#8a6137] bg-[linear-gradient(180deg,#fff8de,#f5e2b1)]'
+            : 'border-[#b78e5f] bg-[linear-gradient(180deg,#fff7df,#f1ddb6)]',
+        )}>
+        <div className="flex items-start gap-3">
+          <div
+            className={cn(
+              'flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-[14px] border-[2px] shadow-[inset_0_1px_0_rgba(255,255,255,0.85)]',
+              owned
+                ? 'border-[#d8b57c] bg-[#fffaf0]'
+                : 'border-[#d7bc8c] bg-[#fff8e8]',
+            )}>
+            <BroomActor action="static" scale={0.3} ariaLabel={facility.label} />
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <p className="truncate text-[14px] font-black text-[#5c4023]">{facility.label}</p>
+                  {owned && (
+                    <span className="shrink-0 whitespace-nowrap rounded-[999px] border border-[#6cbf8f] bg-[#dff8e7] px-2 py-0.5 text-[9px] font-black text-[#24724a] shadow-[0_2px_0_#bde5ca]">
+                      已拥有
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1 text-[11px] font-medium leading-4 text-[#8d6b43]">{facility.description}</p>
+              </div>
+
+              <div className="shrink-0 text-right">
+                <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[#9a7548]">价格</p>
+                <div className="mt-1 inline-flex items-center gap-1.5 rounded-[8px] border border-[#d8bf8d] bg-[#fbf2d8] px-2.5 py-1 text-[12px] font-black text-[#6b5230]">
+                  <Coins size={11} className="text-[#b6893a]" />
+                  <span>{facility.price}</span>
+                  <span className="text-[10px] font-semibold text-[#9a7548]">金币</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <div className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[10px] border border-[#d9bf8f] bg-[#fff8e8] px-2.5 py-1 text-[10px] font-semibold text-[#7a5f39]">
+                <Package2 size={11} className="text-[#a58961]" />
+                <span>{owned ? '已解锁' : '未拥有'}</span>
+              </div>
+
+              {owned ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onStartFacilityPlacement?.(facility.id);
+                    pushFeedback('点场景设置扫把家');
+                  }}
+                  className="inline-flex h-8 min-w-[76px] items-center justify-center rounded-[8px] border-[2px] border-[#2d8a57] bg-[linear-gradient(180deg,#c7f2d9,#84ddaa)] px-3 text-[11px] font-black text-[#14532d] shadow-[0_2px_0_#5cb884,inset_0_1px_0_rgba(255,255,255,0.28)] transition-all active:translate-y-px">
+                  摆位置
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={buyDisabled}
+                  onClick={() => {
+                    const bought = onBuyFacility(facility.id);
+                    pushFeedback(
+                      bought
+                        ? `${facility.label} 已入驻`
+                        : '金币不够啦',
+                    );
+                  }}
+                  className={cn(
+                    'inline-flex h-8 min-w-[76px] items-center justify-center rounded-[8px] border-[2px] px-3 text-[11px] font-black transition-all active:translate-y-px',
+                    buyDisabled
+                      ? 'cursor-not-allowed border-[#d7c39a] bg-[#ebe0c2] text-[#b49b75] shadow-none'
+                      : 'border-[#a36b1e] bg-[linear-gradient(180deg,#ffd968,#f2ae2b)] text-[#654008] shadow-[0_2px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.24)] hover:brightness-105 active:shadow-[0_1px_0_#cb8918,inset_0_1px_0_rgba(255,255,255,0.1)]',
+                  )}>
+                  购买
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  }), [coins, facilityInventory, onBuyFacility, onStartFacilityPlacement, pushFeedback]);
 
   const panelContent = (
     <>
@@ -238,7 +463,7 @@ export function SceneShopSheet({
             <div className="min-w-0">
               <p className="text-[10px] font-black uppercase tracking-[0.2em] text-[#a07a4b]">Farm Shop</p>
               <h3 className="truncate text-[16px] font-black text-[#5d4022]">农场补给铺</h3>
-              <p className="mt-0.5 text-[11px] font-medium text-[#8b6b43]">像在货架上挑食物一样，先补货再去投喂。</p>
+              <p className="mt-0.5 text-[11px] font-medium text-[#8b6b43]">补食物、囤蛋，再去照料农场的小家伙们。</p>
             </div>
           </div>
         </div>
@@ -281,7 +506,11 @@ export function SceneShopSheet({
         <div className="rounded-[10px] border border-[#d5bd8d] bg-[#fff8e7] px-2.5 py-1 text-[10px] font-semibold text-[#7a5f39] shadow-[0_2px_8px_rgba(84,57,28,0.05)]">
           <span className="inline-flex items-center gap-1">
             <Package2 size={11} className="text-[#a68a5d]" />
-            总库存 {totalFoodStock}
+            {activeTab === 'food'
+              ? `总库存 ${totalFoodStock}`
+              : activeTab === 'egg'
+                ? `蛋库 ${totalEggStock}`
+                : `已拥有 ${totalFacilityOwned}`}
           </span>
         </div>
       </div>
@@ -294,40 +523,24 @@ export function SceneShopSheet({
               ? 'border-[#d4a14a] bg-[linear-gradient(180deg,#ffe9b6,#ffd98b)] text-[#8b5610] shadow-[0_2px_0_#e8c06c,0_8px_14px_rgba(117,73,27,0.08)]'
               : 'border-[#d7bf91] bg-[linear-gradient(180deg,#fbf1d7,#f2e1b9)] text-[#a2855b] shadow-[inset_0_1px_0_rgba(255,255,255,0.45)]',
           )}>
-          <div className="flex items-center gap-1.5">
-            <Sparkles size={12} className={feedback ? '' : 'opacity-55'} />
-            <span>{feedback ?? '暂无补给消息'}</span>
+          <div className={cn('flex items-center gap-1.5', feedback ? '' : 'justify-center')}>
+            <Sparkles size={12} className={feedback ? '' : 'opacity-45'} />
+            {feedback ? <span>{feedback}</span> : null}
           </div>
         </div>
       </div>
 
-      {activeTab === 'food' && (
-        <div className="rounded-[18px] border-[2px] border-[#b58b58] bg-[linear-gradient(180deg,#fff7dc,#f4e0b4)] px-3.5 py-3.5 shadow-[0_3px_0_#d3ae77,0_10px_18px_rgba(84,57,28,0.08)]">
-          <p className="text-[10px] font-black uppercase tracking-[0.18em] text-[#a07a4b]">当前投喂</p>
-          <div className="mt-2 flex items-center gap-3">
-            <div className="flex h-12 w-12 items-center justify-center rounded-[14px] border-[2px] border-[#d6b780] bg-[#fffaf0] shadow-[inset_0_1px_0_rgba(255,255,255,0.85)]">
-              <FoodSprite foodId={selectedFood.id} size={24} />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <p className="truncate text-[15px] font-black text-[#5d4022]">{selectedFood.label}</p>
-                <span className="rounded-[999px] border border-[#d8b370] bg-[#fff0c9] px-2 py-0.5 text-[9px] font-black text-[#8c5711]">
-                  饱食 +{selectedFood.satietyGain}
-                </span>
-              </div>
-              <p className="mt-1 text-[11px] font-medium text-[#8b6b43]">长按左下投喂按钮，可以切换成别的食物。</p>
-            </div>
-            <div className="shrink-0 text-right">
-              <p className="text-[10px] font-semibold text-[#9a7548]">库存</p>
-              <p className="mt-0.5 text-[16px] font-black text-[#5d4022]">{selectedFoodStock}</p>
-            </div>
-          </div>
-        </div>
-      )}
-
       {activeTab === 'food' ? (
-        <div className="mt-3 pr-1">
+        <div className="pr-1">
           <div className="space-y-2.5">{foodCards}</div>
+        </div>
+      ) : activeTab === 'egg' ? (
+        <div className="pr-1">
+          <div className="space-y-2.5">{eggCards}</div>
+        </div>
+      ) : activeTab === 'facility' ? (
+        <div className="pr-1">
+          <div className="space-y-2.5">{facilityCards}</div>
         </div>
       ) : (
         <div className="mt-3 rounded-[22px] border border-dashed border-slate-200 bg-white/88 px-4 py-7 text-center shadow-[0_8px_24px_rgba(15,23,42,0.04)]">
@@ -338,7 +551,7 @@ export function SceneShopSheet({
           <p className="mt-1 text-[11px] font-medium leading-5 text-slate-400">
             {activeTab === 'facility'
               ? '后面会接扫把、装饰和自动化设施。'
-              : '后面会接蛋的购买和稀有蛋池。'}
+              : '后面会继续扩充更多特殊蛋与稀有池。'}
           </p>
         </div>
       )}
@@ -379,6 +592,8 @@ export function SceneShopSheet({
                   <div className="relative z-[1] mx-auto mt-2 h-1.5 w-11 rounded-full bg-[#f3d3a2]/90" />
                   <div
                     className="relative z-[1] m-2 min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-[22px] border border-[#e6cd98] bg-[linear-gradient(180deg,#fbf2d6,#f2dfb4)] px-4 pb-4 pt-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]"
+                    onPointerDownCapture={onInteract}
+                    onWheelCapture={onInteract}
                     style={{
                       touchAction: 'pan-y',
                       WebkitOverflowScrolling: 'touch',
@@ -409,6 +624,8 @@ export function SceneShopSheet({
                   <UiTextureLayer path={FLOATING_PANEL_ASSET_PATH} className="rounded-[inherit]" opacity={0.14} />
                   <div
                     className="relative z-[1] m-2 h-[calc(100%-1rem)] overflow-y-auto rounded-[20px] border border-[#e6cd98] bg-[linear-gradient(180deg,#fbf2d6,#f2dfb4)] px-3.5 pb-3.5 pt-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]"
+                    onPointerDownCapture={onInteract}
+                    onWheelCapture={onInteract}
                     style={{
                       touchAction: 'pan-y',
                       WebkitOverflowScrolling: 'touch',

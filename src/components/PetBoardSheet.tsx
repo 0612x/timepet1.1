@@ -55,14 +55,40 @@ const STATE_LABEL: Record<CompletedPet['state'], string> = {
 
 const QUALITY_LABEL: Record<PetQuality, string> = {
   common: '普通',
-  rare: '稀有',
-  epic: '史诗',
+  rare: '优秀',
+  epic: '完美',
 };
 
 const QUALITY_CLASS: Record<PetQuality, string> = {
   common: 'bg-slate-100 text-slate-500',
   rare: 'bg-amber-50 text-amber-600',
-  epic: 'bg-violet-50 text-violet-600',
+  epic: 'bg-emerald-50 text-emerald-600',
+};
+
+const QUALITY_CARD_CLASS: Record<PetQuality, string> = {
+  common: 'border-slate-200/90 bg-[linear-gradient(180deg,rgba(255,255,255,0.97),rgba(248,250,252,0.95))] shadow-[0_12px_30px_rgba(15,23,42,0.08)]',
+  rare: 'border-amber-200/90 bg-[linear-gradient(180deg,rgba(255,252,244,0.98),rgba(255,247,230,0.95))] shadow-[0_14px_34px_rgba(217,119,6,0.12)]',
+  epic: 'border-emerald-200/90 bg-[linear-gradient(180deg,rgba(245,255,251,0.98),rgba(235,251,244,0.95))] shadow-[0_14px_34px_rgba(5,150,105,0.12)]',
+};
+
+const QUALITY_BADGE_CLASS: Record<PetQuality, string> = {
+  common: 'border border-slate-200 bg-slate-100 text-slate-600 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]',
+  rare: 'border border-amber-200 bg-[linear-gradient(180deg,#fff6db,#ffe7b0)] text-amber-700 shadow-[0_2px_0_#f0cf7e]',
+  epic: 'border border-emerald-200 bg-[linear-gradient(180deg,#e8fff5,#c8f5df)] text-emerald-700 shadow-[0_2px_0_#9fe3bf]',
+};
+
+const STATE_CLASS: Record<CompletedPet['state'], string> = {
+  base: 'border-slate-200 bg-slate-100 text-slate-600',
+  focus: 'border-rose-200 bg-rose-50 text-rose-700',
+  heal: 'border-sky-200 bg-sky-50 text-sky-700',
+  active: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+};
+
+const STATE_PREVIEW_CLASS: Record<CompletedPet['state'], string> = {
+  base: 'bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(241,245,249,0.9))]',
+  focus: 'bg-[radial-gradient(circle_at_top,rgba(251,113,133,0.14),rgba(255,255,255,0.96)_48%),linear-gradient(180deg,rgba(255,255,255,0.96),rgba(255,241,242,0.9))]',
+  heal: 'bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.14),rgba(255,255,255,0.96)_48%),linear-gradient(180deg,rgba(255,255,255,0.96),rgba(240,249,255,0.92))]',
+  active: 'bg-[radial-gradient(circle_at_top,rgba(52,211,153,0.14),rgba(255,255,255,0.96)_48%),linear-gradient(180deg,rgba(255,255,255,0.96),rgba(236,253,245,0.9))]',
 };
 
 const THEME_LABEL: Record<CompletedPet['theme'], string> = {
@@ -330,12 +356,15 @@ export function PetBoardSheet({
                       return (
                         <div
                           key={item.pet.instanceId}
-                          className="min-w-[86%] snap-center rounded-[24px] border border-slate-200/90 bg-white/95 p-3 shadow-sm sm:min-w-[58%]">
+                          className={cn(
+                            'min-w-[86%] snap-center rounded-[24px] border p-3 sm:min-w-[58%]',
+                            QUALITY_CARD_CLASS[item.pet.quality],
+                          )}>
                           <div className="flex items-center justify-between gap-2">
                             <p className="text-[10px] font-black text-slate-400">No.{String(index + 1).padStart(3, '0')}</p>
                             <div className="flex items-center gap-2">
-                              <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-black', QUALITY_CLASS[item.pet.quality])}>
-                                {QUALITY_LABEL[item.pet.quality]}
+                              <span className={cn('rounded-full px-2.5 py-0.5 text-[10px] font-black', QUALITY_BADGE_CLASS[item.pet.quality])}>
+                                品质 · {QUALITY_LABEL[item.pet.quality]}
                               </span>
                               <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-500">
                                 {item.sceneLabel}
@@ -363,11 +392,14 @@ export function PetBoardSheet({
                               <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">
                                 品种 · {item.speciesName}
                               </span>
-                              <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-bold text-indigo-500">
+                              <span className={cn(
+                                'rounded-full border px-2 py-0.5 text-[10px] font-bold',
+                                item.isDead ? 'border-slate-300 bg-slate-100 text-slate-500' : STATE_CLASS[item.pet.state],
+                              )}>
                                 {item.isDead ? '状态' : '形态'} · {item.stateLabel}
                               </span>
                             </div>
-                            <div className="mt-1.5 space-y-1.5 rounded-xl border border-slate-100 bg-slate-50/75 px-2 py-1.5">
+                            <div className="mt-1.5 space-y-1.5">
                               {[
                                 {label: '健康', value: item.health, tip: item.healthLabel, tone: 'bg-emerald-500'},
                                 {label: '饱腹', value: item.satiety, tip: item.satietyLabel, tone: 'bg-amber-500'},
@@ -375,14 +407,22 @@ export function PetBoardSheet({
                               ].map((metric) => {
                                 const value = Math.max(0, Math.min(100, metric.value));
                                 return (
-                                  <div key={metric.label} className="space-y-1">
+                                  <div key={metric.label} className="space-y-1 rounded-lg px-0.5">
                                     <div className="flex items-center justify-between gap-2">
-                                      <span className="text-[10px] font-semibold text-slate-500">
+                                      <span className={cn(
+                                        'text-[10px] font-semibold',
+                                        item.isDead ? 'text-slate-500' : 'text-slate-500',
+                                      )}>
                                         {metric.label} · {metric.tip}
                                       </span>
-                                      <span className="text-[10px] font-black tabular-nums text-slate-700">{value}</span>
+                                      <span className={cn(
+                                        'text-[10px] font-black tabular-nums',
+                                        item.isDead ? 'text-slate-700' : 'text-slate-700',
+                                      )}>
+                                        {value}
+                                      </span>
                                     </div>
-                                    <div className="h-1.5 overflow-hidden rounded-full bg-slate-200">
+                                    <div className="h-1.5 overflow-hidden rounded-full bg-slate-200/80">
                                       <div
                                         className={cn('h-full rounded-full transition-[width] duration-300', metric.tone)}
                                         style={{width: `${value}%`}}
@@ -425,7 +465,12 @@ export function PetBoardSheet({
                             )}
                           </div>
 
-                          <div className="relative mt-3 h-[122px] rounded-[18px] border border-slate-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(241,245,249,0.9))] shadow-inner">
+                          <div className={cn(
+                            'relative mt-3 h-[122px] rounded-[18px] border border-white/80 shadow-inner',
+                            item.isDead
+                              ? 'bg-[linear-gradient(180deg,rgba(248,250,252,0.96),rgba(226,232,240,0.9))]'
+                              : STATE_PREVIEW_CLASS[item.pet.state],
+                          )}>
                             <div className="absolute inset-x-0 bottom-2 flex justify-center">
                               <div className="flex h-[104px] w-[104px] items-end justify-center overflow-visible">
                                 {item.isDead ? (

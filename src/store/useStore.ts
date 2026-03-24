@@ -21,11 +21,29 @@ import {
   type FoodId,
   type FoodInventory,
 } from '../data/foods';
+import {
+  createInitialEggInventory,
+  getEggTierById,
+  normalizeEggInventory,
+  type EggInventory,
+  type EggTierId,
+} from '../data/eggs';
+import {
+  createInitialFacilityInventory,
+  getFacilityById,
+  normalizeMagicBroomHomePosition,
+  normalizeFacilityInventory,
+  type FacilityId,
+  type FacilityInventory,
+  type FacilityPoint,
+} from '../data/facilities';
+import {getDateKey, getSimulatedDate} from '../utils/date';
 import {PET_STATUS_DEFAULTS, clampMetric, getPetMetric, roundMetric} from '../utils/petStatus';
 
 export type TabType = 'home' | 'feed' | 'scene' | 'pokedex' | 'stats';
 export type ActivityType = 'work' | 'study' | 'entertainment' | 'rest' | 'exercise';
 export type PetQuality = 'common' | 'rare' | 'epic';
+export type EggStage = 'egg' | 'ready';
 
 export interface PetWasteSpot {
   id: string;
@@ -43,12 +61,27 @@ export interface Allocation {
 }
 
 export interface EggState {
+  tierId: EggTierId;
   theme: ThemeType;
   progress: { focus: number; heal: number; active: number };
   petId: string | null;
-  stage: 'egg' | 'base' | 'evolved';
+  stage: EggStage;
   finalState: PetState | null;
   quality: PetQuality | null;
+  lastFedStat: 'focus' | 'heal' | 'active' | null;
+}
+
+export interface FeedEggResult {
+  coinGain: number;
+  rewardLines: Array<{label: string; amount: number}>;
+  stageAdvanced: 'none' | 'ready';
+}
+
+export interface CompleteEggResult {
+  pet: CompletedPet;
+  coinGain: number;
+  rewardLines: Array<{label: string; amount: number}>;
+  isFirstSpecies: boolean;
 }
 
 export interface CompletedPet {
@@ -137,11 +170,20 @@ interface AppState {
   togglePlanTemplatePinned: (id: string) => boolean;
   markPlanTemplateUsed: (id: string) => void;
   
-  currentEgg: EggState;
-  feedEgg: (date: string, allocationId: string) => boolean;
-  completeEgg: (customPet?: CustomPet, nickname?: string) => CompletedPet | null;
+  currentEgg: EggState | null;
+  eggInventory: EggInventory;
+  facilityInventory: FacilityInventory;
+  magicBroomHomePosition: FacilityPoint;
+  feedEgg: (date: string, allocationId: string) => FeedEggResult | null;
+  completeEgg: (customPet?: CustomPet, nickname?: string) => CompleteEggResult | null;
   coins: number;
+  dailyCoinLedger: Record<string, number>;
+  dailyAllocationRewarded: Record<string, boolean>;
   foodInventory: FoodInventory;
+  buyEgg: (tierId: EggTierId, quantity?: number) => boolean;
+  buyFacility: (facilityId: FacilityId) => boolean;
+  setMagicBroomHomePosition: (x: number, y: number) => void;
+  activateEgg: (tierId: EggTierId) => boolean;
   selectedFoodId: FoodId;
   buyFood: (foodId: FoodId, quantity: number) => boolean;
   consumeFood: (foodId: FoodId, quantity?: number) => boolean;
@@ -154,6 +196,8 @@ interface AppState {
   feedCompletedPet: (instanceId: string, options?: {satietyGain?: number}) => boolean;
   cheerCompletedPet: (instanceId: string) => boolean;
   cleanCompletedPetWaste: (instanceId: string, wasteSpotId?: string) => boolean;
+  debugAddCoins: (amount?: number) => void;
+  debugAddCompletedPetWaste: (instanceId: string, count?: number) => boolean;
   debugKillCompletedPet: (instanceId: string) => boolean;
   cleanSceneWaste: (theme: ThemeType) => number;
   updatePetPosition: (instanceId: string, x: number, y: number) => void;
@@ -220,13 +264,15 @@ const DEFAULT_PLAN_TEMPLATES: PlanTemplate[] = [
   },
 ];
 
-const getInitialEgg = (theme: ThemeType): EggState => ({
+const getInitialEgg = (theme: ThemeType, tierId: EggTierId = 'pasture'): EggState => ({
+  tierId,
   theme: theme === 'C' ? 'A' : theme,
   progress: { focus: 0, heal: 0, active: 0 },
   petId: null,
   stage: 'egg',
   finalState: null,
-  quality: null,
+  quality: rollEggQuality(tierId),
+  lastFedStat: null,
 });
 
 function getSpriteSceneByTheme(theme: ThemeType): PetSpriteScene {
@@ -235,9 +281,14 @@ function getSpriteSceneByTheme(theme: ThemeType): PetSpriteScene {
   return 'draw';
 }
 
-function getHatchSpritePool(theme: ThemeType) {
+function getHatchSpritePool(theme: ThemeType, tierId?: EggTierId) {
   const targetScene = getSpriteSceneByTheme(theme);
   const sceneMatched = PET_SPRITE_OPTIONS.filter((option) => option.scene === targetScene);
+  if (sceneMatched.length > 0 && tierId) {
+    const tier = getEggTierById(tierId);
+    const tierMatched = sceneMatched.filter((option) => tier.speciesKeys.includes(option.key));
+    if (tierMatched.length > 0) return tierMatched;
+  }
   if (sceneMatched.length > 0) return sceneMatched;
 
   const farmFallback = PET_SPRITE_OPTIONS.filter((option) => option.scene === 'farm');
@@ -246,17 +297,35 @@ function getHatchSpritePool(theme: ThemeType) {
   return PET_SPRITE_OPTIONS;
 }
 
-function getEggQuality(progress: EggState['progress']): PetQuality {
-  const values = [progress.focus, progress.heal, progress.active];
-  const total = values.reduce((sum, value) => sum + value, 0);
-  if (total <= 0) return 'common';
+function rollEggQuality(tierId: EggTierId): PetQuality {
+  const {qualityRates} = getEggTierById(tierId);
+  const roll = Math.random() * 100;
 
-  const maxShare = Math.max(...values) / total;
-  const minShare = Math.min(...values) / total;
-
-  if (maxShare <= 0.52 && minShare >= 0.15) return 'epic';
-  if (maxShare <= 0.7) return 'rare';
+  if (roll < qualityRates.epic) return 'epic';
+  if (roll < qualityRates.epic + qualityRates.rare) return 'rare';
   return 'common';
+}
+
+function resolveEggFinalState(
+  progress: EggState['progress'],
+  lastFedStat: EggState['lastFedStat'],
+): PetState {
+  const entries: Array<{key: 'focus' | 'heal' | 'active'; value: number}> = [
+    {key: 'focus', value: progress.focus},
+    {key: 'heal', value: progress.heal},
+    {key: 'active', value: progress.active},
+  ];
+  const maxValue = Math.max(...entries.map((item) => item.value));
+  const topEntries = entries.filter((item) => item.value === maxValue);
+
+  if (topEntries.length === 1) return topEntries[0].key;
+  if (lastFedStat && topEntries.some((item) => item.key === lastFedStat)) return lastFedStat;
+  return topEntries[0].key;
+}
+
+function normalizeEggStage(stage: string | null | undefined): EggStage {
+  if (stage === 'ready' || stage === 'evolved') return 'ready';
+  return 'egg';
 }
 
 function getThemeBySpriteScene(scene: PetSpriteScene): ThemeType {
@@ -349,8 +418,15 @@ type PetCareAction = 'feed' | 'cheer' | 'clean';
 const BASE_POOP_PROGRESS_GAIN_PER_HOUR = 0.4;
 const DIGESTION_TO_POOP_PROGRESS_PER_HOUR = 24;
 const INITIAL_COINS = 200;
-const HATCH_COIN_REWARD = 20;
-const FIRST_SPECIES_HATCH_BONUS = 50;
+const ALLOCATION_COIN_PER_HALF_HOUR = 1;
+const DAILY_COIN_MILESTONES = [
+  {hours: 8, reward: 10},
+  {hours: 16, reward: 14},
+  {hours: 24, reward: 18},
+] as const;
+const DAILY_FIRST_ALLOCATION_REWARD = 50;
+const FULL_DAY_COMPLETION_REWARD = 20;
+const FIRST_SPECIES_HATCH_BONUS = 60;
 const WASTE_CLEAN_COIN_REWARD = 1;
 const FEED_BLOCK_SATIETY = 100;
 const FEED_SATIETY_GAIN = 5;
@@ -369,6 +445,53 @@ const WASTE_HEALTH_LOSS_PER_HOUR = 0.9;
 const CHEER_MOOD_GAIN = 5;
 const WASTE_SPAWN_X_JITTER = 2.4;
 const WASTE_SPAWN_Y_JITTER = 1.2;
+
+function getAllocationCoinReward(hours: number) {
+  return Math.max(0, Math.round(hours * 2) * ALLOCATION_COIN_PER_HALF_HOUR);
+}
+
+function buildFirstAllocationReward(
+  date: string,
+  state: Pick<AppState, 'dailyAllocationRewarded' | 'dailyCoinLedger'>,
+) {
+  if (state.dailyAllocationRewarded[date]) {
+    return {
+      rewarded: false,
+      coinGain: 0,
+      dailyAllocationRewarded: state.dailyAllocationRewarded,
+      dailyCoinLedger: state.dailyCoinLedger,
+    };
+  }
+
+  return {
+    rewarded: true,
+    coinGain: DAILY_FIRST_ALLOCATION_REWARD,
+    dailyAllocationRewarded: {
+      ...state.dailyAllocationRewarded,
+      [date]: true,
+    },
+    dailyCoinLedger: {
+      ...state.dailyCoinLedger,
+      [date]: (state.dailyCoinLedger[date] ?? 0) + DAILY_FIRST_ALLOCATION_REWARD,
+    },
+  };
+}
+
+function getDailyCoinKeyFromOffset(simulatedDateOffset: number) {
+  return getDateKey(getSimulatedDate(simulatedDateOffset));
+}
+
+function getQualityDecayMultiplier(quality: PetQuality) {
+  if (quality === 'epic') return 0.68;
+  if (quality === 'rare') return 0.82;
+  return 1;
+}
+
+function getQualityPoopMultiplier(quality: PetQuality) {
+  if (quality === 'epic') return 0.7;
+  if (quality === 'rare') return 0.85;
+  return 1;
+}
 
 function hashToUnit(input: string) {
   let hash = 2166136261;
@@ -593,21 +716,24 @@ function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
   const normalized = finalizePetDeathState(withPetStatus(pet, now), now);
   if (normalized.isDead) return normalized;
   const elapsedHours = Math.max(0, (now - (normalized.statusUpdatedAt ?? now)) / 3_600_000);
+  const quality = normalized.quality ?? 'common';
+  const decayMultiplier = getQualityDecayMultiplier(quality);
+  const poopMultiplier = getQualityPoopMultiplier(quality);
 
   if (elapsedHours < 1 / 120) return normalized;
 
-  const satiety = roundMetric(normalized.satiety! - elapsedHours * 5.4);
+  const satiety = roundMetric(normalized.satiety! - elapsedHours * 5.4 * decayMultiplier);
   let mood = roundMetric(
-    normalized.mood! - elapsedHours * (2 + (satiety < 35 ? 1.25 : 0) + normalized.wasteCount! * WASTE_MOOD_LOSS_PER_HOUR),
+    normalized.mood! - elapsedHours * (2 + (satiety < 35 ? 1.25 : 0) + normalized.wasteCount! * WASTE_MOOD_LOSS_PER_HOUR) * decayMultiplier,
   );
-  let hygiene = roundMetric(normalized.hygiene! - elapsedHours * 3.7);
+  let hygiene = roundMetric(normalized.hygiene! - elapsedHours * 3.7 * decayMultiplier);
   const digestionConverted = Math.min(
     normalized.digestionLoad!,
-    elapsedHours * DIGESTION_TO_POOP_PROGRESS_PER_HOUR,
+    elapsedHours * DIGESTION_TO_POOP_PROGRESS_PER_HOUR * poopMultiplier,
   );
   const digestionLoad = roundMetric(normalized.digestionLoad! - digestionConverted);
   const poopResolved = resolvePoopProgressState({
-    poopProgress: normalized.poopProgress! + elapsedHours * BASE_POOP_PROGRESS_GAIN_PER_HOUR + digestionConverted,
+    poopProgress: normalized.poopProgress! + elapsedHours * BASE_POOP_PROGRESS_GAIN_PER_HOUR * poopMultiplier + digestionConverted,
     wasteCount: normalized.wasteCount!,
     hygiene,
     mood,
@@ -626,10 +752,10 @@ function applyPetPassiveStatus(pet: CompletedPet, now: number): CompletedPet {
   health = roundMetric(health + (targetHealth - health) * Math.min(0.9, elapsedHours * 0.34));
 
   if (satiety < 24) {
-    health = roundMetric(health - elapsedHours * 1.35);
+    health = roundMetric(health - elapsedHours * 1.35 * decayMultiplier);
   }
   if (wasteCount > 2) {
-    health = roundMetric(health - elapsedHours * (wasteCount - 2) * WASTE_HEALTH_LOSS_PER_HOUR);
+    health = roundMetric(health - elapsedHours * (wasteCount - 2) * WASTE_HEALTH_LOSS_PER_HOUR * decayMultiplier);
   }
 
   return finalizePetDeathState({
@@ -693,6 +819,42 @@ function applyPetWasteCleanup(
     wasteSpots: remainingWasteSpots,
     statusUpdatedAt: now,
   };
+}
+
+function applyDebugWasteSpawn(
+  pet: CompletedPet,
+  addedWasteCount: number,
+  now: number,
+): CompletedPet {
+  const base = applyPetPassiveStatus(pet, now);
+  if (base.isDead) return base;
+
+  const resolvedAddedWasteCount = Math.max(0, Math.round(addedWasteCount));
+  if (resolvedAddedWasteCount <= 0) {
+    return {
+      ...base,
+      statusUpdatedAt: now,
+    };
+  }
+
+  const wasteCount = (base.wasteCount ?? 0) + resolvedAddedWasteCount;
+  const wasteSpots = appendWasteSpots(base, resolvedAddedWasteCount, now);
+  const hygiene = roundMetric(base.hygiene! - resolvedAddedWasteCount * POOP_HYGIENE_LOSS);
+  const mood = roundMetric(base.mood! - resolvedAddedWasteCount * POOP_MOOD_LOSS);
+  const wasteLevel = getWasteLevelFromPoopState(wasteCount, base.poopProgress!);
+  const targetHealth = getHealthTarget(base.satiety!, mood, hygiene, wasteCount);
+  const health = roundMetric(base.health! + (targetHealth - base.health!) * 0.18);
+
+  return finalizePetDeathState({
+    ...base,
+    hygiene,
+    mood,
+    health,
+    wasteCount,
+    wasteLevel,
+    wasteSpots,
+    statusUpdatedAt: now,
+  }, now);
 }
 
 function applyPetCareAction(
@@ -891,12 +1053,16 @@ export const useStore = create<AppState>()(
         }
 
         const newAlloc = createAllocation(type, hours);
+        const starterReward = buildFirstAllocationReward(date, state);
         
         set({
+          coins: state.coins + starterReward.coinGain,
           allocations: {
             ...state.allocations,
             [date]: [...dailyAllocs, newAlloc]
-          }
+          },
+          dailyCoinLedger: starterReward.dailyCoinLedger,
+          dailyAllocationRewarded: starterReward.dailyAllocationRewarded,
         });
         return true;
       },
@@ -914,9 +1080,13 @@ export const useStore = create<AppState>()(
         const nextDailyAllocations = sanitizedDrafts.map((draft, index) =>
           createAllocation(draft.type, draft.hours, index),
         );
+        const starterReward = buildFirstAllocationReward(date, state);
 
         set({
+          coins: state.coins + starterReward.coinGain,
           allocations: setDailyAllocations(state.allocations, date, nextDailyAllocations),
+          dailyCoinLedger: starterReward.dailyCoinLedger,
+          dailyAllocationRewarded: starterReward.dailyAllocationRewarded,
         });
 
         return true;
@@ -933,9 +1103,13 @@ export const useStore = create<AppState>()(
         const nextDailyAllocations = sourceAllocations.map((allocation, index) =>
           createAllocation(allocation.type, allocation.hours, index),
         );
+        const starterReward = buildFirstAllocationReward(targetDate, state);
 
         set({
+          coins: state.coins + starterReward.coinGain,
           allocations: setDailyAllocations(state.allocations, targetDate, nextDailyAllocations),
+          dailyCoinLedger: starterReward.dailyCoinLedger,
+          dailyAllocationRewarded: starterReward.dailyAllocationRewarded,
         });
 
         return true;
@@ -1194,100 +1368,132 @@ export const useStore = create<AppState>()(
         });
       },
       
-      currentEgg: getInitialEgg('A'),
-      
+      currentEgg: null,
+      eggInventory: createInitialEggInventory(),
+      facilityInventory: createInitialFacilityInventory(),
+      magicBroomHomePosition: normalizeMagicBroomHomePosition(),
       feedEgg: (date, allocationId) => {
         const state = get();
+        const egg = state.currentEgg;
+        if (!egg) return null;
+
         const dailyAllocs = state.allocations[date] || [];
-        const allocIndex = dailyAllocs.findIndex(a => a.id === allocationId);
-        
-        if (allocIndex === -1 || dailyAllocs[allocIndex].used) return false;
-        
+        const allocIndex = dailyAllocs.findIndex((allocation) => allocation.id === allocationId);
+        if (allocIndex === -1 || dailyAllocs[allocIndex].used) return null;
+
         const alloc = dailyAllocs[allocIndex];
-        const newAllocs = [...dailyAllocs];
-        newAllocs[allocIndex] = { ...alloc, used: true };
-        
-        // Map activity to stat
+        const nextAllocs = [...dailyAllocs];
+        nextAllocs[allocIndex] = {...alloc, used: true};
+
         let stat: 'focus' | 'heal' | 'active' = 'focus';
         if (alloc.type === 'work' || alloc.type === 'study') stat = 'focus';
         if (alloc.type === 'entertainment' || alloc.type === 'rest') stat = 'heal';
         if (alloc.type === 'exercise') stat = 'active';
-        
-        const egg = { ...state.currentEgg };
-        egg.progress = { ...egg.progress, [stat]: egg.progress[stat] + alloc.hours };
-        
-        const totalProgress = egg.progress.focus + egg.progress.heal + egg.progress.active;
-        
-        // Check thresholds
-        if (totalProgress >= 8 && egg.stage === 'egg') {
-          const hatchPool = getHatchSpritePool(egg.theme);
-          const randomSprite = hatchPool[Math.floor(Math.random() * hatchPool.length)];
-          if (randomSprite) {
-            egg.petId = randomSprite.key;
-            egg.stage = 'base';
 
-            const currentUnlocked = state.unlockedPets[randomSprite.key] || [];
-            if (!currentUnlocked.includes('base')) {
-              set(s => ({
-                unlockedPets: { ...s.unlockedPets, [randomSprite.key]: [...currentUnlocked, 'base'] }
-              }));
-            }
-          }
+        const nextEgg: EggState = {
+          ...egg,
+          progress: {
+            ...egg.progress,
+            [stat]: egg.progress[stat] + alloc.hours,
+          },
+          lastFedStat: stat,
+        };
+        const tier = getEggTierById(nextEgg.tierId);
+        const totalProgress = nextEgg.progress.focus + nextEgg.progress.heal + nextEgg.progress.active;
+        let stageAdvanced: FeedEggResult['stageAdvanced'] = 'none';
+
+        if (totalProgress >= tier.totalHours && nextEgg.stage !== 'ready') {
+          const finalState = resolveEggFinalState(nextEgg.progress, nextEgg.lastFedStat);
+
+          nextEgg.finalState = finalState;
+          nextEgg.petId = null;
+          nextEgg.stage = 'ready';
+          nextEgg.quality = nextEgg.quality ?? rollEggQuality(nextEgg.tierId);
+          stageAdvanced = 'ready';
         }
-        
-        if (totalProgress >= 24 && egg.stage === 'base') {
-          // Evolve
-          const { focus, heal, active } = egg.progress;
-          let finalState: PetState = 'focus';
-          if (heal > focus && heal >= active) finalState = 'heal';
-          if (active > focus && active > heal) finalState = 'active';
-          
-          egg.finalState = finalState;
-          egg.stage = 'evolved';
-          egg.quality = getEggQuality(egg.progress);
-          
-          // Unlock evolved in pokedex
-          if (egg.petId) {
-            const currentUnlocked = get().unlockedPets[egg.petId] || [];
-            if (!currentUnlocked.includes(finalState)) {
-              set(s => ({
-                unlockedPets: { ...s.unlockedPets, [egg.petId!]: [...currentUnlocked, finalState] }
-              }));
-            }
-          }
+
+        const previouslyUsedHours = dailyAllocs
+          .filter((allocation) => allocation.used)
+          .reduce((sum, allocation) => sum + allocation.hours, 0);
+        const nextUsedHours = previouslyUsedHours + alloc.hours;
+        const rewardLines: FeedEggResult['rewardLines'] = [];
+        let coinGain = 0;
+
+        const allocationCoinReward = getAllocationCoinReward(alloc.hours);
+        if (allocationCoinReward > 0) {
+          coinGain += allocationCoinReward;
+          rewardLines.push({
+            label: `记录 ${alloc.hours}h`,
+            amount: allocationCoinReward,
+          });
         }
-        
-        set({
-          allocations: { ...state.allocations, [date]: newAllocs },
-          currentEgg: egg
+
+        DAILY_COIN_MILESTONES.forEach((milestone) => {
+          if (previouslyUsedHours < milestone.hours && nextUsedHours >= milestone.hours) {
+            coinGain += milestone.reward;
+            rewardLines.push({
+              label: `累计 ${milestone.hours}h`,
+              amount: milestone.reward,
+            });
+          }
         });
-        
-        return true;
+
+        const nextAllocatedTotal = nextAllocs.reduce((sum, allocation) => sum + allocation.hours, 0);
+        const finishedFullDay = nextAllocatedTotal >= 24 && nextAllocs.every((allocation) => allocation.used);
+        const hadFinishedFullDay = dailyAllocs.length > 0 && dailyAllocs.every((allocation) => allocation.used);
+        if (finishedFullDay && !hadFinishedFullDay) {
+          coinGain += FULL_DAY_COMPLETION_REWARD;
+          rewardLines.push({
+            label: '完整记录日',
+            amount: FULL_DAY_COMPLETION_REWARD,
+          });
+        }
+
+        set({
+          allocations: {...state.allocations, [date]: nextAllocs},
+          currentEgg: nextEgg,
+          coins: state.coins + coinGain,
+          dailyCoinLedger: {
+            ...state.dailyCoinLedger,
+            [date]: (state.dailyCoinLedger[date] ?? 0) + coinGain,
+          },
+        });
+
+        return {
+          coinGain,
+          rewardLines,
+          stageAdvanced,
+        };
       },
-      
       completeEgg: (customPet, nickname) => {
         const state = get();
         const egg = state.currentEgg;
-        
-        if (egg.stage !== 'evolved' || !egg.petId || !egg.finalState) return null;
-        
+
+        if (!egg || egg.stage !== 'ready' || !egg.finalState) return null;
+
         let petId = egg.petId;
         let theme = egg.theme;
-        const quality = egg.quality ?? getEggQuality(egg.progress);
+        const quality = egg.quality ?? rollEggQuality(egg.tierId);
         const normalizedNickname = nickname?.trim() || undefined;
-        
+
         if (customPet) {
           petId = customPet.id;
           theme = 'custom';
         } else {
+          if (!petId) {
+            const hatchPool = getHatchSpritePool(egg.theme, egg.tierId);
+            const randomSprite = hatchPool[Math.floor(Math.random() * hatchPool.length)];
+            petId = randomSprite?.key ?? null;
+          }
+          if (!petId) return null;
           const spriteOption = getPetSpriteOptionByKey(petId);
           if (spriteOption?.scene === 'farm') theme = 'A';
           if (spriteOption?.scene === 'ocean') theme = 'B';
           if (spriteOption?.scene === 'draw') theme = 'custom';
         }
+
         const spawnPosition = getHatchSpawnPosition(theme, state.completedPets);
         const initialPoopState = createInitialPoopState();
-
         const newCompleted: CompletedPet = {
           instanceId: Math.random().toString(36).substring(2, 9),
           petId,
@@ -1298,8 +1504,8 @@ export const useStore = create<AppState>()(
           x: spawnPosition.x,
           y: spawnPosition.y,
           variant: Math.floor(Math.random() * 4),
-          scale: 0.35 + Math.random() * 0.25, // Reduced scale further
-          jumpDelay: -Math.random() * 3, // Negative delay to start mid-animation
+          scale: 0.35 + Math.random() * 0.25,
+          jumpDelay: -Math.random() * 3,
           moveDelay: -Math.random() * 12,
           floatDelay: -Math.random() * 10,
           health: roundMetric(PET_STATUS_DEFAULTS.health + (Math.random() - 0.5) * 8),
@@ -1315,16 +1521,26 @@ export const useStore = create<AppState>()(
           deathAt: null,
           statusUpdatedAt: Date.now(),
         };
-        const hasUnlockedSpecies =
-          state.completedPets.some((pet) => pet.petId === petId)
-          || Boolean(state.unlockedPets[petId]?.length)
-          || state.customPets.some((pet) => pet.id === petId);
-        const hatchCoinGain = HATCH_COIN_REWARD + (hasUnlockedSpecies ? 0 : FIRST_SPECIES_HATCH_BONUS);
-        
+
+        const isFirstSpecies =
+          !state.completedPets.some((pet) => pet.petId === petId)
+          && !state.customPets.some((pet) => pet.id === petId);
+        const coinGain = isFirstSpecies ? FIRST_SPECIES_HATCH_BONUS : 0;
+        const rewardLines = coinGain > 0
+          ? [{label: '首次解锁物种', amount: coinGain}]
+          : [];
+        const todayKey = getDailyCoinKeyFromOffset(state.simulatedDateOffset);
+
         const updates: Partial<AppState> = {
           completedPets: [...state.completedPets, newCompleted],
-          currentEgg: getInitialEgg(state.currentTheme === 'custom' ? 'A' : state.currentTheme),
-          coins: state.coins + hatchCoinGain,
+          currentEgg: null,
+          coins: state.coins + coinGain,
+          dailyCoinLedger: coinGain > 0
+            ? {
+                ...state.dailyCoinLedger,
+                [todayKey]: (state.dailyCoinLedger[todayKey] ?? 0) + coinGain,
+              }
+            : state.dailyCoinLedger,
         };
 
         if (customPet) {
@@ -1332,15 +1548,83 @@ export const useStore = create<AppState>()(
           const currentUnlocked = state.unlockedPets[customPet.id] || [];
           updates.unlockedPets = {
             ...state.unlockedPets,
-            [customPet.id]: [...currentUnlocked, 'base', egg.finalState]
+            [customPet.id]: [...new Set<PetState>([...currentUnlocked, 'base', egg.finalState])],
+          };
+        } else {
+          const currentUnlocked = state.unlockedPets[petId] || [];
+          updates.unlockedPets = {
+            ...state.unlockedPets,
+            [petId]: [...new Set<PetState>([...currentUnlocked, 'base', egg.finalState])],
           };
         }
 
         set(updates);
-        return newCompleted;
+        return {
+          pet: newCompleted,
+          coinGain,
+          rewardLines,
+          isFirstSpecies,
+        };
       },
       coins: INITIAL_COINS,
+      dailyCoinLedger: {},
+      dailyAllocationRewarded: {},
       foodInventory: createInitialFoodInventory(),
+      buyEgg: (tierId, quantity = 1) => {
+        const normalizedQuantity = Math.max(0, Math.floor(quantity));
+        if (normalizedQuantity <= 0) return false;
+
+        const state = get();
+        const tier = getEggTierById(tierId);
+        const totalPrice = tier.price * normalizedQuantity;
+        if (state.coins < totalPrice) return false;
+
+        set({
+          coins: state.coins - totalPrice,
+          eggInventory: {
+            ...state.eggInventory,
+            [tierId]: (state.eggInventory[tierId] ?? 0) + normalizedQuantity,
+          },
+        });
+        return true;
+      },
+      buyFacility: (facilityId) => {
+        const state = get();
+        const facility = getFacilityById(facilityId);
+        const ownedCount = state.facilityInventory[facilityId] ?? 0;
+        if (ownedCount > 0) return false;
+        if (state.coins < facility.price) return false;
+
+        set({
+          coins: state.coins - facility.price,
+          facilityInventory: {
+            ...state.facilityInventory,
+            [facilityId]: 1,
+          },
+        });
+        return true;
+      },
+      setMagicBroomHomePosition: (x, y) => {
+        set({
+          magicBroomHomePosition: normalizeMagicBroomHomePosition({x, y}),
+        });
+      },
+      activateEgg: (tierId) => {
+        const state = get();
+        if (state.currentEgg) return false;
+        const currentStock = state.eggInventory[tierId] ?? 0;
+        if (currentStock <= 0) return false;
+        const nextTheme = state.currentTheme === 'B' ? 'B' : 'A';
+
+        set({
+          currentEgg: getInitialEgg(nextTheme, tierId),
+          eggInventory: {
+            ...state.eggInventory,
+            [tierId]: currentStock - 1,
+          },
+        });
+        return true;
+      },
       selectedFoodId: DEFAULT_FOOD_ID,
       buyFood: (foodId, quantity) => {
         const normalizedQuantity = Math.max(0, Math.floor(quantity));
@@ -1474,6 +1758,14 @@ export const useStore = create<AppState>()(
         if (changed) set({completedPets: nextPets});
         return cheered;
       },
+      debugAddCoins: (amount = 100) => {
+        const normalizedAmount = Math.max(0, Math.floor(amount));
+        if (normalizedAmount <= 0) return;
+
+        set((state) => ({
+          coins: state.coins + normalizedAmount,
+        }));
+      },
       cleanCompletedPetWaste: (instanceId, wasteSpotId) => {
         const state = get();
         const now = Date.now();
@@ -1502,15 +1794,41 @@ export const useStore = create<AppState>()(
         if (!found) return false;
         if (changed || cleaned) {
           const nextState: Partial<AppState> = {};
+          const todayKey = getDailyCoinKeyFromOffset(state.simulatedDateOffset);
           if (changed) {
             nextState.completedPets = nextPets;
           }
           if (cleaned) {
             nextState.coins = state.coins + WASTE_CLEAN_COIN_REWARD;
+            nextState.dailyCoinLedger = {
+              ...state.dailyCoinLedger,
+              [todayKey]: (state.dailyCoinLedger[todayKey] ?? 0) + WASTE_CLEAN_COIN_REWARD,
+            };
           }
           set(nextState);
         }
         return cleaned;
+      },
+      debugAddCompletedPetWaste: (instanceId, count = 1) => {
+        const state = get();
+        const now = Date.now();
+        const resolvedCount = Math.max(1, Math.round(count));
+        let found = false;
+        let changed = false;
+
+        const nextPets = state.completedPets.map((pet) => {
+          if (pet.instanceId !== instanceId) return pet;
+          found = true;
+          const nextPet = applyDebugWasteSpawn(pet, resolvedCount, now);
+          if (hasPetRuntimeChanged(pet, nextPet)) {
+            changed = true;
+          }
+          return nextPet;
+        });
+
+        if (!found || !changed) return false;
+        set({completedPets: nextPets});
+        return true;
       },
       debugKillCompletedPet: (instanceId) => {
         const state = get();
@@ -1572,11 +1890,18 @@ export const useStore = create<AppState>()(
         });
 
         if (changed) {
+          const todayKey = getDailyCoinKeyFromOffset(state.simulatedDateOffset);
           set({
             completedPets: nextPets,
             coins: cleanedCount > 0
               ? state.coins + cleanedCount * WASTE_CLEAN_COIN_REWARD
               : state.coins,
+            dailyCoinLedger: cleanedCount > 0
+              ? {
+                  ...state.dailyCoinLedger,
+                  [todayKey]: (state.dailyCoinLedger[todayKey] ?? 0) + cleanedCount * WASTE_CLEAN_COIN_REWARD,
+                }
+              : state.dailyCoinLedger,
           });
         }
         return cleanedCount;
@@ -1676,7 +2001,7 @@ export const useStore = create<AppState>()(
       advanceDay: () => set((state) => ({ simulatedDateOffset: state.simulatedDateOffset + 1 })),
     }),
     {
-      name: 'chronotext-storage-v3', // Change name to avoid conflicts with old schema
+      name: 'chronotext-storage-v3',
       merge: (persistedState, currentState) => {
         const typedPersistedState = persistedState as Partial<AppState> | undefined;
         const rawTemplates =
@@ -1687,15 +2012,43 @@ export const useStore = create<AppState>()(
           typedPersistedState?.currentTheme && typedPersistedState.currentTheme !== 'C'
             ? typedPersistedState.currentTheme
             : currentState.currentTheme;
-        const nextEgg = typedPersistedState?.currentEgg
-          ? {
-              ...typedPersistedState.currentEgg,
-              theme:
-                typedPersistedState.currentEgg.theme === 'C'
-                  ? 'A'
-                  : typedPersistedState.currentEgg.theme,
-              quality: typedPersistedState.currentEgg.quality ?? null,
-            }
+        const nextEgg = typedPersistedState?.currentEgg === null
+          ? null
+          : typedPersistedState?.currentEgg
+          ? (() => {
+              const persistedEgg = typedPersistedState.currentEgg;
+              const tierId = persistedEgg.tierId ?? 'pasture';
+              const progress = {
+                focus: persistedEgg.progress?.focus ?? 0,
+                heal: persistedEgg.progress?.heal ?? 0,
+                active: persistedEgg.progress?.active ?? 0,
+              };
+              const totalProgress = progress.focus + progress.heal + progress.active;
+              const tier = getEggTierById(tierId);
+              const normalizedStage = normalizeEggStage(persistedEgg.stage);
+              const resolvedFinalState =
+                persistedEgg.finalState
+                ?? (totalProgress >= tier.totalHours ? resolveEggFinalState(progress, persistedEgg.lastFedStat ?? null) : null);
+              const stage: EggStage =
+                totalProgress >= tier.totalHours && resolvedFinalState
+                  ? 'ready'
+                  : normalizedStage;
+
+              return {
+                ...persistedEgg,
+                tierId,
+                theme:
+                  persistedEgg.theme === 'C'
+                    ? 'A'
+                    : persistedEgg.theme ?? currentState.currentTheme,
+                progress,
+                petId: stage === 'ready' ? null : persistedEgg.petId ?? null,
+                stage,
+                finalState: resolvedFinalState,
+                quality: persistedEgg.quality ?? rollEggQuality(tierId),
+                lastFedStat: persistedEgg.lastFedStat ?? null,
+              };
+            })()
           : currentState.currentEgg;
         const now = Date.now();
         const persistedSelectedFoodId = typedPersistedState?.selectedFoodId;
@@ -1707,6 +2060,18 @@ export const useStore = create<AppState>()(
           typeof typedPersistedState?.coins === 'number' && Number.isFinite(typedPersistedState.coins)
             ? Math.max(0, Math.floor(typedPersistedState.coins))
             : currentState.coins;
+        const nextDailyCoinLedger = Object.fromEntries(
+          Object.entries(typedPersistedState?.dailyCoinLedger ?? {}).map(([key, value]) => [
+            key,
+            Math.max(0, Math.floor(typeof value === 'number' && Number.isFinite(value) ? value : 0)),
+          ]),
+        );
+        const nextDailyAllocationRewarded = Object.fromEntries(
+          Object.entries(typedPersistedState?.dailyAllocationRewarded ?? {}).map(([key, value]) => [
+            key,
+            Boolean(value),
+          ]),
+        );
         const completedPets =
           typedPersistedState?.completedPets?.map((pet) =>
             applyPetPassiveStatus(
@@ -1726,6 +2091,11 @@ export const useStore = create<AppState>()(
           currentEgg: nextEgg,
           completedPets,
           coins: nextCoins,
+          eggInventory: normalizeEggInventory(typedPersistedState?.eggInventory),
+          facilityInventory: normalizeFacilityInventory(typedPersistedState?.facilityInventory),
+          magicBroomHomePosition: normalizeMagicBroomHomePosition(typedPersistedState?.magicBroomHomePosition),
+          dailyCoinLedger: nextDailyCoinLedger,
+          dailyAllocationRewarded: nextDailyAllocationRewarded,
           foodInventory: normalizeFoodInventory(typedPersistedState?.foodInventory),
           selectedFoodId: nextSelectedFoodId,
           planTemplates: rawTemplates.map((template, index) =>

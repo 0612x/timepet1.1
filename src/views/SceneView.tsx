@@ -16,17 +16,20 @@ import {SpriteActor} from '../components/SpriteActor';
 import {UiTextureLayer} from '../components/UiTextureLayer';
 import {cn} from '../utils/cn';
 import {useStore, type CompletedPet} from '../store/useStore';
+import {type FacilityId} from '../data/facilities';
 import {FOOD_ITEMS, getFoodItemById, type FoodId} from '../data/foods';
 import {PETS, type ThemeType} from '../data/pets';
 import {getPetSpriteOptionByKey, hasPetSpriteAction, isPetSpriteKey, type PetSpriteAction} from '../data/petSprites';
 import {getSceneUiAssetPath} from '../data/sceneUiAssets';
-import {formatZhDate, getSimulatedDate} from '../utils/date';
+import {formatZhDate, getDateKey, getSimulatedDate} from '../utils/date';
 import {SCENE_BOTTOM_MAX, SCENE_BOTTOM_MIN, SCENE_X_MAX, SCENE_X_MIN} from '../constants/sceneBounds';
 import {assignFeedTargets} from '../utils/feedSystem';
+import {getSceneWorldEchoInsight, type SceneWorldEchoTone} from '../utils/sceneWorldEcho';
 import {
   getHealthLabel,
   getMoodLabel,
   getPetMetric,
+  getPetStatusBubbleMeta,
   getSatietyLabel,
 } from '../utils/petStatus';
 
@@ -62,9 +65,16 @@ const FARM_SKY_PHASE_LABELS: Record<FarmSkyPhase, string> = {
 
 const QUALITY_LABELS: Record<CompletedPet['quality'], string> = {
   common: '普通',
-  rare: '稀有',
-  epic: '史诗',
+  rare: '优秀',
+  epic: '完美',
 };
+
+const QUALITY_TONE: Record<CompletedPet['quality'], string> = {
+  common: 'border-slate-200 bg-slate-100 text-slate-600',
+  rare: 'border-amber-200 bg-[linear-gradient(180deg,#fff6db,#ffe7b0)] text-amber-700',
+  epic: 'border-emerald-200 bg-[linear-gradient(180deg,#e8fff5,#c8f5df)] text-emerald-700',
+};
+
 
 const STATE_LABELS: Record<CompletedPet['state'], string> = {
   base: '基础',
@@ -75,15 +85,16 @@ const STATE_LABELS: Record<CompletedPet['state'], string> = {
 
 const STATE_TONE: Record<CompletedPet['state'], string> = {
   base: 'border-slate-200 bg-slate-100 text-slate-600',
-  focus: 'border-indigo-200 bg-indigo-100 text-indigo-700',
-  heal: 'border-emerald-200 bg-emerald-100 text-emerald-700',
-  active: 'border-amber-200 bg-amber-100 text-amber-700',
+  focus: 'border-rose-200 bg-rose-100 text-rose-700',
+  heal: 'border-sky-200 bg-sky-100 text-sky-700',
+  active: 'border-emerald-200 bg-emerald-100 text-emerald-700',
 };
 const CARD_TRANSITION_MS = 180;
 const FARM_SCENE_TRANSITION_MS = 420;
 const CARD_DIRECT_FEED_MS = 1300;
 const CARD_DIRECT_CHEER_MS = 1100;
 const SCENE_FEEDBACK_TTL_MS = 1450;
+const SCENE_STATUS_BUBBLE_TTL_MS = 1700;
 const SCENE_DEBUG_HIT_AREAS = false;
 const FEED_DROP_TTL_MS = 30_000;
 const FEED_DROP_BURST_COUNT = 3;
@@ -131,6 +142,24 @@ interface SceneFeedbackItem {
   x: number;
   y: number;
   metrics: SceneFeedbackMetric[];
+}
+
+type SceneBubbleTone = SceneWorldEchoTone;
+
+interface SceneBubbleMeta {
+  icon: string;
+  label: string;
+  tone: SceneBubbleTone;
+}
+
+interface SceneStatusBubbleItem {
+  id: string;
+  instanceId: string;
+  x: number;
+  y: number;
+  icon: string;
+  label: string;
+  tone: SceneBubbleTone;
 }
 
 type SceneToolType = 'feed' | 'clean';
@@ -187,23 +216,33 @@ function resolveSceneCardAction(petId: string, state: CompletedPet['state']): Pe
 
 export function SceneView() {
   const {
+    currentTab,
     currentTheme,
     setCurrentTheme,
     simulatedDateOffset,
+    allocations,
     coins,
     completedPets,
     customPets,
+    eggInventory,
+    facilityInventory,
+    magicBroomHomePosition,
     foodInventory,
     selectedFoodId,
     renameCompletedPet,
     discardCompletedPet,
     clearScenePets,
     spawnAllScenePets,
+    buyEgg,
+    buyFacility,
     buyFood,
     consumeFood,
+    setMagicBroomHomePosition,
     feedCompletedPet,
     cheerCompletedPet,
     cleanCompletedPetWaste,
+    debugAddCoins,
+    debugAddCompletedPetWaste,
     debugKillCompletedPet,
     setSelectedFood,
   } = useStore();
@@ -228,17 +267,21 @@ export function SceneView() {
   const [foodSelectorAnchor, setFoodSelectorAnchor] = useState<FoodSelectorAnchor | null>(null);
   const [foodSelectorHoverId, setFoodSelectorHoverId] = useState<FoodId | null>(null);
   const [shopPanelAnchor, setShopPanelAnchor] = useState<FloatingPanelAnchor | null>(null);
+  const [placingMagicBroomHome, setPlacingMagicBroomHome] = useState(false);
   const [cardFeedSession, setCardFeedSession] = useState<CardFeedSession | null>(null);
   const [cardFeedProgress, setCardFeedProgress] = useState<number | null>(null);
   const [cardCheerSession, setCardCheerSession] = useState<CardFeedSession | null>(null);
   const [cardCheerProgress, setCardCheerProgress] = useState<number | null>(null);
   const [sceneFeedbackItems, setSceneFeedbackItems] = useState<SceneFeedbackItem[]>([]);
+  const [sceneStatusBubbleItems, setSceneStatusBubbleItems] = useState<SceneStatusBubbleItem[]>([]);
   const sceneFeedDropTimersRef = useRef<number[]>([]);
   const cardFeedTickTimerRef = useRef<number | null>(null);
   const cardFeedCompleteTimerRef = useRef<number | null>(null);
   const cardCheerTickTimerRef = useRef<number | null>(null);
   const cardCheerCompleteTimerRef = useRef<number | null>(null);
   const sceneFeedbackTimersRef = useRef<number[]>([]);
+  const sceneStatusBubbleTimersRef = useRef<number[]>([]);
+  const sceneStatusBubbleScheduleRef = useRef<number | null>(null);
   const sceneFeedDropsRef = useRef<SceneFeedDrop[]>([]);
   const sceneFeedbackItemsRef = useRef<SceneFeedbackItem[]>([]);
   const sceneSurfaceRef = useRef<HTMLDivElement | null>(null);
@@ -247,6 +290,10 @@ export function SceneView() {
   const shopToolButtonRef = useRef<HTMLButtonElement | null>(null);
   const sceneWasteSpotsRef = useRef<SceneWasteSpot[]>([]);
   const toolDragStateRef = useRef<SceneToolDragState | null>(null);
+  const livingPetsInThemeRef = useRef<CompletedPet[]>([]);
+  const sceneWorldEchoKickTimerRef = useRef<number | null>(null);
+  const lastWorldEchoPromptSignatureRef = useRef<string | null>(null);
+  const sceneWorldEchoLastLineRef = useRef<string | null>(null);
   const feedToolPressRef = useRef<{
     pointerId: number;
     startX: number;
@@ -263,9 +310,29 @@ export function SceneView() {
   const sceneFeedMoveNonceRef = useRef(0);
   const cardDismissUntilRef = useRef(0);
 
-  const today = useMemo(
-    () => formatZhDate(getSimulatedDate(simulatedDateOffset)),
-    [simulatedDateOffset],
+  const todayDate = useMemo(() => getSimulatedDate(simulatedDateOffset), [simulatedDateOffset]);
+  const todayKey = useMemo(() => getDateKey(todayDate), [todayDate]);
+  const yesterdayKey = useMemo(() => {
+    const previousDate = new Date(todayDate);
+    previousDate.setDate(previousDate.getDate() - 1);
+    return getDateKey(previousDate);
+  }, [todayDate]);
+  const today = useMemo(() => formatZhDate(todayDate), [todayDate]);
+  const todayAllocations = useMemo(
+    () => allocations[todayKey] ?? [],
+    [allocations, todayKey],
+  );
+  const yesterdayAllocations = useMemo(
+    () => allocations[yesterdayKey] ?? [],
+    [allocations, yesterdayKey],
+  );
+  const todayAllocationSignature = useMemo(
+    () => todayAllocations.map((allocation) => `${allocation.id}:${allocation.type}:${allocation.hours}`).join('|'),
+    [todayAllocations],
+  );
+  const worldEchoInsight = useMemo(
+    () => getSceneWorldEchoInsight(todayAllocations, yesterdayAllocations),
+    [todayAllocations, yesterdayAllocations],
   );
   const farmSkyPhase = useMemo(
     () => farmSkyPhaseOverride ?? getFarmSkyPhase(currentHour),
@@ -339,6 +406,12 @@ export function SceneView() {
   const hasAnyFoodStock = totalFoodStock > 0;
   const sceneFeedBurstCount = Math.max(0, Math.min(FEED_DROP_BURST_COUNT, selectedFoodStock));
   const currentThemeLabel = SCENE_TABS.find((item) => item.theme === effectiveTheme)?.label ?? '农场';
+  const hasMagicBroom = (facilityInventory.magicBroom ?? 0) > 0;
+
+  useEffect(() => {
+    if (hasMagicBroom && effectiveTheme === 'A') return;
+    setPlacingMagicBroomHome(false);
+  }, [effectiveTheme, hasMagicBroom]);
 
   const getThemeIcon = (theme: ThemeType) => {
     switch (theme) {
@@ -389,6 +462,7 @@ export function SceneView() {
   }, []);
   const handleSwitchTheme = (theme: ThemeType, locked?: boolean) => {
     if (locked) return;
+    setPlacingMagicBroomHome(false);
     setCurrentTheme(theme);
   };
   const handleCycleFarmSkyPhase = () => {
@@ -454,10 +528,16 @@ export function SceneView() {
     });
   }, []);
   const closeFoodSelector = useCallback(() => {
+    clearFeedToolLongPress();
+    feedToolPressRef.current = null;
     setShowFoodSelector(false);
     setFoodSelectorAnchor(null);
     setFoodSelectorHoverId(null);
-  }, []);
+  }, [clearFeedToolLongPress]);
+  const cancelSceneToolInteractions = useCallback(() => {
+    closeFoodSelector();
+    setToolDragState(null);
+  }, [closeFoodSelector]);
   const handleOpenSceneShop = useCallback(() => {
     const trigger = shopToolButtonRef.current;
     if (showSceneShop) {
@@ -465,7 +545,7 @@ export function SceneView() {
       return;
     }
     closeSelectedPetCard();
-    closeFoodSelector();
+    cancelSceneToolInteractions();
     setSceneShopDockOpen(true);
     if (!trigger) {
       setShopPanelAnchor({
@@ -485,7 +565,7 @@ export function SceneView() {
     startTransition(() => {
       setShowSceneShop(true);
     });
-  }, [closeFoodSelector, closeSelectedPetCard, closeShopPanel, showSceneShop]);
+  }, [cancelSceneToolInteractions, closeSelectedPetCard, closeShopPanel, showSceneShop]);
   const clearCardFeedTimers = useCallback(() => {
     if (cardFeedTickTimerRef.current !== null) {
       window.clearTimeout(cardFeedTickTimerRef.current);
@@ -544,7 +624,7 @@ export function SceneView() {
     const filteredMetrics = metrics
       .map((metric) => ({
         ...metric,
-        delta: Math.round(metric.delta * 10) / 10,
+        delta: Math.round(metric.delta),
       }))
       .filter((metric) => metric.delta > 0);
     if (filteredMetrics.length === 0) return;
@@ -578,6 +658,51 @@ export function SceneView() {
       sceneFeedbackTimersRef.current = sceneFeedbackTimersRef.current.filter((timer) => timer !== timerId);
     }, SCENE_FEEDBACK_TTL_MS);
     sceneFeedbackTimersRef.current.push(timerId);
+  }, [getFeedbackAnchor]);
+  const buildWorldEchoBubbleMeta = useCallback((insight: typeof worldEchoInsight): SceneBubbleMeta | null => {
+    if (!insight || insight.lines.length === 0) return null;
+
+    let chosenLine = insight.lines[Math.floor(Math.random() * insight.lines.length)];
+    if (insight.lines.length > 1 && chosenLine === sceneWorldEchoLastLineRef.current) {
+      const alternatives = insight.lines.filter((line) => line !== sceneWorldEchoLastLineRef.current);
+      chosenLine = alternatives[Math.floor(Math.random() * alternatives.length)] ?? chosenLine;
+    }
+
+    sceneWorldEchoLastLineRef.current = chosenLine;
+    return {
+      icon: insight.icon,
+      label: chosenLine,
+      tone: insight.tone,
+    };
+  }, [worldEchoInsight]);
+  const pushSceneBubble = useCallback((
+    instanceId: string,
+    meta: SceneBubbleMeta | null,
+  ) => {
+    if (!meta) return;
+
+    const baseAnchor = getFeedbackAnchor(instanceId, 'interaction');
+    const feedbackOffset = sceneFeedbackItemsRef.current.filter((item) => item.instanceId === instanceId).length * 1.8;
+    const item: SceneStatusBubbleItem = {
+      id: `scene-status-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      instanceId,
+      x: baseAnchor.x,
+      y: baseAnchor.y - feedbackOffset,
+      icon: meta.icon,
+      label: meta.label,
+      tone: meta.tone,
+    };
+
+    setSceneStatusBubbleItems((previous) => [
+      ...previous.filter((existing) => existing.instanceId !== instanceId),
+      item,
+    ]);
+
+    const timerId = window.setTimeout(() => {
+      setSceneStatusBubbleItems((previous) => previous.filter((bubble) => bubble.id !== item.id));
+      sceneStatusBubbleTimersRef.current = sceneStatusBubbleTimersRef.current.filter((timer) => timer !== timerId);
+    }, SCENE_STATUS_BUBBLE_TTL_MS);
+    sceneStatusBubbleTimersRef.current.push(timerId);
   }, [getFeedbackAnchor]);
 
   useEffect(() => {
@@ -674,8 +799,121 @@ export function SceneView() {
     toolDragStateRef.current = toolDragState;
   }, [toolDragState]);
   useEffect(() => {
+    livingPetsInThemeRef.current = livingPetsInTheme;
+  }, [livingPetsInTheme]);
+  useEffect(() => {
     sceneFeedbackItemsRef.current = sceneFeedbackItems;
   }, [sceneFeedbackItems]);
+  useEffect(() => {
+    if (sceneStatusBubbleScheduleRef.current !== null) {
+      window.clearTimeout(sceneStatusBubbleScheduleRef.current);
+      sceneStatusBubbleScheduleRef.current = null;
+    }
+    sceneStatusBubbleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    sceneStatusBubbleTimersRef.current = [];
+
+    if (currentTab !== 'scene' || isOceanLocked) {
+      setSceneStatusBubbleItems([]);
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const scheduleNext = (delay: number) => {
+      if (cancelled) return;
+      sceneStatusBubbleScheduleRef.current = window.setTimeout(() => {
+        if (cancelled) return;
+
+        const candidates = livingPetsInThemeRef.current
+          .map((pet) => ({
+            pet,
+            meta: getPetStatusBubbleMeta(pet),
+          }))
+          .filter((item): item is {pet: CompletedPet; meta: NonNullable<ReturnType<typeof getPetStatusBubbleMeta>>} => Boolean(item.meta));
+
+        const worldMeta = buildWorldEchoBubbleMeta(worldEchoInsight);
+        const shouldShowWorld =
+          Boolean(worldMeta)
+          && livingPetsInThemeRef.current.length > 0
+          && (candidates.length === 0 || Math.random() < 0.44);
+
+        if (shouldShowWorld && worldMeta) {
+          const pets = livingPetsInThemeRef.current;
+          const randomPet = pets[Math.floor(Math.random() * pets.length)];
+          if (randomPet) {
+            pushSceneBubble(randomPet.instanceId, worldMeta);
+          }
+        } else if (candidates.length > 0) {
+          const candidate = candidates[Math.floor(Math.random() * candidates.length)];
+          pushSceneBubble(candidate.pet.instanceId, candidate.meta);
+        }
+
+        scheduleNext(5200 + Math.random() * 4200);
+      }, delay);
+    };
+
+    scheduleNext(1800 + Math.random() * 1200);
+
+    return () => {
+      cancelled = true;
+      if (sceneStatusBubbleScheduleRef.current !== null) {
+        window.clearTimeout(sceneStatusBubbleScheduleRef.current);
+        sceneStatusBubbleScheduleRef.current = null;
+      }
+      sceneStatusBubbleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      sceneStatusBubbleTimersRef.current = [];
+      setSceneStatusBubbleItems([]);
+    };
+  }, [buildWorldEchoBubbleMeta, currentTab, isOceanLocked, pushSceneBubble, worldEchoInsight]);
+  useEffect(() => {
+    if (sceneWorldEchoKickTimerRef.current !== null) {
+      window.clearTimeout(sceneWorldEchoKickTimerRef.current);
+      sceneWorldEchoKickTimerRef.current = null;
+    }
+
+    if (
+      currentTab !== 'scene'
+      || isOceanLocked
+      || !worldEchoInsight
+      || livingPetsInThemeRef.current.length === 0
+      || todayAllocationSignature.length === 0
+    ) {
+      return undefined;
+    }
+
+    const signature = `${todayKey}:${worldEchoInsight.key}:${todayAllocationSignature}`;
+    if (lastWorldEchoPromptSignatureRef.current === signature) {
+      return undefined;
+    }
+
+    sceneWorldEchoKickTimerRef.current = window.setTimeout(() => {
+      const pets = livingPetsInThemeRef.current;
+      const meta = buildWorldEchoBubbleMeta(worldEchoInsight);
+      if (pets.length === 0 || !meta) return;
+
+      const randomPet = pets[Math.floor(Math.random() * pets.length)];
+      if (!randomPet) return;
+
+      pushSceneBubble(randomPet.instanceId, meta);
+      lastWorldEchoPromptSignatureRef.current = signature;
+      sceneWorldEchoKickTimerRef.current = null;
+    }, 1400 + Math.random() * 1200);
+
+    return () => {
+      if (sceneWorldEchoKickTimerRef.current !== null) {
+        window.clearTimeout(sceneWorldEchoKickTimerRef.current);
+        sceneWorldEchoKickTimerRef.current = null;
+      }
+    };
+  }, [
+    buildWorldEchoBubbleMeta,
+    currentTab,
+    isOceanLocked,
+    pushSceneBubble,
+    todayAllocationSignature,
+    todayKey,
+    worldEchoInsight,
+  ]);
   useEffect(() => {
     const nextPoints = new Map<string, RuntimePetPoints>();
     petsInTheme.forEach((pet) => {
@@ -710,6 +948,16 @@ export function SceneView() {
       sceneFeedDropTimersRef.current = [];
       sceneFeedbackTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       sceneFeedbackTimersRef.current = [];
+      if (sceneStatusBubbleScheduleRef.current !== null) {
+        window.clearTimeout(sceneStatusBubbleScheduleRef.current);
+        sceneStatusBubbleScheduleRef.current = null;
+      }
+      sceneStatusBubbleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      sceneStatusBubbleTimersRef.current = [];
+      if (sceneWorldEchoKickTimerRef.current !== null) {
+        window.clearTimeout(sceneWorldEchoKickTimerRef.current);
+        sceneWorldEchoKickTimerRef.current = null;
+      }
       feedingPetIdsRef.current.clear();
       feedDropAssignmentsRef.current.clear();
       petFeedAssignmentsRef.current.clear();
@@ -954,6 +1202,43 @@ export function SceneView() {
     setSelectedPetInstanceId(targetPet.instanceId);
     setSceneToolDockOpen(false);
   }, [debugKillCompletedPet, livingPetsInTheme, selectedPet]);
+  const handleDebugAddCoins = useCallback(() => {
+    debugAddCoins(100);
+  }, [debugAddCoins]);
+  const handleDebugAddWaste = useCallback(() => {
+    const targetPet = selectedPet && !selectedPet.isDead
+      ? selectedPet
+      : livingPetsInTheme[0] ?? null;
+    if (!targetPet) return;
+
+    const added = debugAddCompletedPetWaste(targetPet.instanceId, 1);
+    if (!added) return;
+    setSelectedPetInstanceId(targetPet.instanceId);
+    setSceneToolDockOpen(false);
+  }, [debugAddCompletedPetWaste, livingPetsInTheme, selectedPet]);
+  const handleToggleMagicBroomPlacement = useCallback(() => {
+    if (!hasMagicBroom || effectiveTheme !== 'A') return;
+    closeFoodSelector();
+    closeShopPanel();
+    setToolDragState(null);
+    setSelectedPetInstanceId(null);
+    setPlacingMagicBroomHome((previous) => !previous);
+  }, [closeFoodSelector, closeShopPanel, effectiveTheme, hasMagicBroom]);
+  const handleStartFacilityPlacement = useCallback((facilityId: FacilityId) => {
+    if (facilityId !== 'magicBroom' || !hasMagicBroom || effectiveTheme !== 'A') return;
+    closeFoodSelector();
+    closeShopPanel();
+    setSceneShopDockOpen(false);
+    setSceneToolDockOpen(false);
+    setToolDragState(null);
+    setSelectedPetInstanceId(null);
+    setPlacingMagicBroomHome(true);
+  }, [closeFoodSelector, closeShopPanel, effectiveTheme, hasMagicBroom]);
+  const handleSceneBlankPointer = useCallback((point: {x: number; y: number}) => {
+    if (!placingMagicBroomHome || !hasMagicBroom || effectiveTheme !== 'A') return;
+    setMagicBroomHomePosition(point.x, point.y);
+    setPlacingMagicBroomHome(false);
+  }, [effectiveTheme, hasMagicBroom, placingMagicBroomHome, setMagicBroomHomePosition]);
 
   const releasePetFeedAssignment = (instanceId: string) => {
     const assignedDropId = petFeedAssignmentsRef.current.get(instanceId);
@@ -1543,8 +1828,7 @@ export function SceneView() {
   };
 
   const formatFeedbackDelta = (value: number) => {
-    const rounded = Math.round(value * 10) / 10;
-    return Number.isInteger(rounded) ? `${rounded}` : rounded.toFixed(1);
+    return `${Math.round(value)}`;
   };
   const getFeedbackMetricMeta = (kind: SceneFeedbackMetricKind) => {
     if (kind === 'satiety') {
@@ -1571,6 +1855,21 @@ export function SceneView() {
     ? getSceneClientPoint(activeHoveredWaste.x, activeHoveredWaste.y)
     : null;
   const isSceneToolCancelHover = toolDragState ? shouldCancelSceneToolDrag(toolDragState) : false;
+  const getStatusBubbleToneClass = (tone: SceneStatusBubbleItem['tone']) => {
+    if (tone === 'rose') {
+      return isDarkBackdrop ? 'text-rose-100' : 'text-rose-600';
+    }
+    if (tone === 'violet') {
+      return isDarkBackdrop ? 'text-violet-100' : 'text-violet-600';
+    }
+    if (tone === 'emerald') {
+      return isDarkBackdrop ? 'text-emerald-100' : 'text-emerald-600';
+    }
+    if (tone === 'sky') {
+      return isDarkBackdrop ? 'text-sky-100' : 'text-sky-600';
+    }
+    return isDarkBackdrop ? 'text-amber-100' : 'text-amber-600';
+  };
 
   return (
     <div
@@ -1699,6 +1998,47 @@ export function SceneView() {
               时间测试：{farmSkyPhaseText}
             </button>
             <button
+              onClick={handleDebugAddCoins}
+              className={cn(
+                'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
+                isDarkBackdrop
+                  ? 'border-white/18 bg-black/28 text-white hover:bg-black/34'
+                  : 'border-slate-200 bg-white/90 text-slate-700 hover:bg-white',
+              )}>
+              +100 金币
+            </button>
+            <button
+              onClick={handleDebugAddWaste}
+              disabled={livingPetsInTheme.length === 0}
+              className={cn(
+                'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
+                livingPetsInTheme.length === 0
+                  ? (isDarkBackdrop
+                    ? 'cursor-not-allowed border-white/10 bg-white/8 text-white/38 active:scale-100'
+                    : 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400 active:scale-100')
+                  : (isDarkBackdrop
+                    ? 'border-white/18 bg-black/28 text-white hover:bg-black/34'
+                    : 'border-slate-200 bg-white/90 text-slate-700 hover:bg-white'),
+              )}>
+              加粑粑
+            </button>
+            {hasMagicBroom && (
+              <button
+                onClick={handleToggleMagicBroomPlacement}
+                className={cn(
+                  'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
+                  placingMagicBroomHome
+                    ? (isDarkBackdrop
+                      ? 'border-emerald-200/35 bg-emerald-300/14 text-emerald-50'
+                      : 'border-emerald-200 bg-emerald-50 text-emerald-700')
+                    : (isDarkBackdrop
+                      ? 'border-white/18 bg-black/28 text-white hover:bg-black/34'
+                      : 'border-slate-200 bg-white/90 text-slate-700 hover:bg-white'),
+                )}>
+                {placingMagicBroomHome ? '点场景放家' : '摆扫把'}
+              </button>
+            )}
+            <button
               onClick={spawnAllScenePets}
               className={cn(
                 'inline-flex h-7 shrink-0 items-center rounded-lg border px-2.5 text-[10px] font-bold transition-all active:scale-[0.98]',
@@ -1767,11 +2107,15 @@ export function SceneView() {
           <div className="absolute -left-[7%] -right-[7%] -top-[15%] -bottom-[25%]">
             <PetScene
               isDarkBackdrop={isDarkBackdrop}
+              magicBroomEnabled={hasMagicBroom}
+              magicBroomHomePosition={magicBroomHomePosition}
+              magicBroomPlacementActive={placingMagicBroomHome}
               sceneSurfaceRef={sceneSurfaceRef}
               onWasteSpotsChange={setSceneWasteSpots}
               highlightedWasteId={toolDragState?.tool === 'clean' ? toolDragState.hoveredWasteId : null}
               cleanedWasteRequest={sceneWasteCleanupRequest}
-              onPetSelect={isSceneToolDragging ? undefined : handlePetSelect}
+              onPetSelect={isSceneToolDragging || placingMagicBroomHome ? undefined : handlePetSelect}
+              onSceneBlankPointer={handleSceneBlankPointer}
               onSceneBlankClick={() => {
                 closeSelectedPetCard(true);
                 closeFoodSelector();
@@ -1857,6 +2201,40 @@ export function SceneView() {
                   </div>
                 );
               })}
+              {sceneStatusBubbleItems.map((item) => (
+                <div
+                  key={item.id}
+                  className="scene-feedback-bubble absolute"
+                  style={{
+                    left: `${item.x}%`,
+                    top: `${item.y}%`,
+                  }}>
+                  <div
+                    className={cn(
+                      'relative rounded-2xl border px-2.5 py-1.5 shadow-[0_5px_12px_rgba(15,23,42,0.14)] backdrop-blur-[6px]',
+                      isDarkBackdrop
+                        ? 'border-white/12 bg-black/28'
+                        : 'border-white/80 bg-white/84',
+                    )}>
+                    <div
+                      className={cn(
+                        'flex items-center gap-1 text-[10px] font-black leading-none',
+                        getStatusBubbleToneClass(item.tone),
+                      )}>
+                      <span className="text-[10px] leading-none">{item.icon}</span>
+                      <span>{item.label}</span>
+                    </div>
+                    <span
+                      className={cn(
+                        'absolute left-1/2 top-full h-2.5 w-2.5 -translate-x-1/2 -translate-y-[45%] rotate-45 border-r border-b',
+                        isDarkBackdrop
+                          ? 'border-white/12 bg-black/28'
+                          : 'border-white/80 bg-white/84',
+                      )}
+                    />
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}
@@ -1917,7 +2295,7 @@ export function SceneView() {
                       <FoodSprite foodId={selectedFoodId} size={16} />
                     </span>
                     <span className="relative z-[1] text-[11px] tracking-[0.01em] text-current [text-shadow:0_1px_0_rgba(255,255,255,0.72)]">
-                      {isSceneToolCancelHover ? '取消' : isSelectedFoodEmpty ? (hasAnyFoodStock ? '切粮' : '缺粮') : '投喂'}
+                      {isSceneToolCancelHover ? '取消' : hasAnyFoodStock ? '投喂' : '缺粮'}
                     </span>
                     <span className="absolute right-1.5 top-1/2 z-[1] inline-flex h-[18px] min-w-[18px] -translate-y-1/2 items-center justify-center rounded-full border border-white/85 bg-amber-300 px-1 text-[8px] font-black leading-none text-amber-950 shadow-[0_2px_6px_rgba(245,158,11,0.24)]">
                       {selectedFoodStock}
@@ -2095,7 +2473,20 @@ export function SceneView() {
             className="fixed inset-0 z-[5400]"
             onPointerDown={() => closeFoodSelector()}
           />
-          <div className="pointer-events-none fixed inset-0 z-[5420]">
+          <div className="pointer-events-none fixed inset-x-0 bottom-[6.35rem] z-[5620] flex justify-center px-4">
+            <div
+              className={cn(
+                'inline-flex max-w-[240px] items-center rounded-full border px-3 py-1.5 text-[10px] font-black shadow-[0_10px_30px_rgba(15,23,42,0.16)] backdrop-blur-md',
+                foodSelectorHoverId
+                  ? 'border-emerald-300/95 bg-[linear-gradient(180deg,rgba(16,185,129,0.95),rgba(5,150,105,0.94))] text-white shadow-[0_12px_30px_rgba(16,185,129,0.28)]'
+                  : isDarkBackdrop
+                    ? 'border-emerald-300/28 bg-[rgba(6,78,59,0.58)] text-emerald-50'
+                    : 'border-emerald-300/88 bg-[linear-gradient(180deg,rgba(209,250,229,0.96),rgba(167,243,208,0.9))] text-emerald-900',
+              )}>
+              {foodSelectorHoverId ? `${getFoodItemById(foodSelectorHoverId).label} · 松手切换` : '滑到食物上切换，松手确认'}
+            </div>
+          </div>
+          <div className="pointer-events-none fixed inset-0 z-[5600]">
             <div
               className="absolute"
               style={{
@@ -2104,13 +2495,12 @@ export function SceneView() {
               }}>
               <div
                 className={cn(
-                  'absolute -translate-x-[8%] -translate-y-[134%] rounded-full border px-2.5 py-1 text-[10px] font-black shadow-[0_10px_24px_rgba(15,23,42,0.14)] backdrop-blur-md',
+                  'absolute left-0 top-0 h-[148px] w-[148px] -translate-x-1/2 -translate-y-1/2 rounded-full border shadow-[0_18px_36px_rgba(15,23,42,0.12)]',
                   isDarkBackdrop
-                    ? 'border-white/12 bg-black/24 text-white'
-                    : 'border-white/85 bg-white/94 text-slate-700',
-                )}>
-                {foodSelectorHoverId ? `${getFoodItemById(foodSelectorHoverId).label} · 松手确认` : '滑到食物上，松手确认'}
-              </div>
+                    ? 'border-emerald-300/18 bg-[radial-gradient(circle,rgba(16,185,129,0.32)_0%,rgba(5,150,105,0.18)_42%,rgba(6,78,59,0)_74%)] shadow-[0_0_42px_rgba(16,185,129,0.2)]'
+                    : 'border-emerald-300/55 bg-[radial-gradient(circle,rgba(16,185,129,0.28)_0%,rgba(74,222,128,0.16)_44%,rgba(16,185,129,0)_76%)] shadow-[0_0_38px_rgba(16,185,129,0.18)]',
+                )}
+              />
               {foodSelectorItems.map((food) => {
                 const stock = foodInventory[food.id] ?? 0;
                 const isHovered = food.id === foodSelectorHoverId;
@@ -2119,45 +2509,55 @@ export function SceneView() {
                   <div
                     key={food.id}
                     className={cn(
-                      'absolute inline-flex h-11 w-11 items-center justify-center rounded-full border shadow-[0_10px_22px_rgba(15,23,42,0.14)] backdrop-blur-md transition-all duration-150',
+                      'absolute inline-flex h-11 w-11 items-center justify-center rounded-full border shadow-[0_12px_24px_rgba(15,23,42,0.16)] backdrop-blur-md transition-all duration-150',
                       isHovered
-                        ? 'scale-[1.16] border-amber-200 bg-amber-50'
+                        ? 'scale-[1.18] border-emerald-300 bg-[linear-gradient(180deg,rgba(52,211,153,0.98),rgba(5,150,105,0.94))] shadow-[0_14px_28px_rgba(16,185,129,0.28)]'
                         : isSelected
-                          ? 'scale-[1.03] border-amber-100 bg-amber-50/88'
+                          ? 'scale-[1.05] border-emerald-300/85 bg-[linear-gradient(180deg,rgba(187,247,208,0.96),rgba(110,231,183,0.88))] shadow-[0_10px_24px_rgba(16,185,129,0.18)]'
                           : stock <= 0
                             ? (isDarkBackdrop
                               ? 'scale-[0.94] border-white/8 bg-black/18 opacity-72'
                               : 'scale-[0.94] border-slate-200/85 bg-white/86 opacity-72')
                         : isDarkBackdrop
-                          ? 'border-white/12 bg-black/22'
-                          : 'border-white/85 bg-white/94',
+                          ? 'border-emerald-300/24 bg-[linear-gradient(180deg,rgba(5,150,105,0.36),rgba(6,78,59,0.3))]'
+                          : 'border-emerald-200/90 bg-[linear-gradient(180deg,rgba(236,253,245,0.98),rgba(209,250,229,0.94))]',
                     )}
                     style={{
                       transform: `translate(${food.offsetX}px, ${food.offsetY}px) translate(-50%, -50%)`,
                     }}
                     title={`${food.label}（库存 ${stock}）`}>
+                    {isHovered && (
+                      <>
+                        <span className="absolute inset-[-7px] rounded-full border-2 border-emerald-300/95 shadow-[0_0_0_2px_rgba(16,185,129,0.18)]" />
+                        <span className="absolute inset-[-11px] rounded-full border-2 border-emerald-300/65 animate-ping" />
+                        <span className="absolute inset-[-16px] rounded-full border border-emerald-400/30" />
+                      </>
+                    )}
                     <span
                       className={cn(
                         'inline-flex h-8 w-8 items-center justify-center rounded-full border',
                         isHovered
-                          ? 'border-amber-200 bg-white'
+                          ? 'border-emerald-200 bg-[linear-gradient(180deg,rgba(236,253,245,0.96),rgba(209,250,229,0.94))]'
                           : isSelected
-                            ? 'border-amber-100 bg-white'
+                            ? 'border-emerald-200 bg-[linear-gradient(180deg,rgba(236,253,245,0.94),rgba(187,247,208,0.92))]'
                             : stock <= 0
                               ? (isDarkBackdrop
                                 ? 'border-white/10 bg-white/4'
                                 : 'border-slate-200 bg-slate-50/92')
-                          : isDarkBackdrop
-                            ? 'border-white/10 bg-white/6'
-                            : 'border-slate-200 bg-slate-50',
+                            : isDarkBackdrop
+                              ? 'border-emerald-300/18 bg-emerald-200/10'
+                              : 'border-emerald-200 bg-[linear-gradient(180deg,rgba(240,253,244,0.98),rgba(220,252,231,0.94))]',
                       )}>
                       <FoodSprite foodId={food.id} size={18} />
                     </span>
+                    {isHovered && (
+                      <span className="absolute -bottom-2 left-1/2 h-1.5 w-7 -translate-x-1/2 rounded-full bg-emerald-950/35 blur-[2px]" />
+                    )}
                     <span
                       className={cn(
                         'absolute -right-1 -top-1 inline-flex min-w-4 items-center justify-center rounded-full border px-1 text-[8px] font-black leading-4 shadow-sm',
                         stock > 0
-                          ? 'border-white/90 bg-amber-300 text-amber-950'
+                          ? 'border-white/90 bg-emerald-300 text-emerald-950'
                           : 'border-white/90 bg-slate-300 text-slate-700',
                       )}>
                       {stock}
@@ -2264,10 +2664,12 @@ export function SceneView() {
               <div
                 className={cn(
                   'rounded-lg border px-1.5 py-0.5 text-center',
-                  isDarkBackdrop ? 'border-white/15 bg-white/[0.05]' : 'border-slate-200 bg-white/85',
+                  isDarkBackdrop
+                    ? 'border-white/15 bg-white/[0.05]'
+                    : QUALITY_TONE[cardPet.quality],
                 )}>
-                <p className={cn('text-[9px] font-semibold', isDarkBackdrop ? 'text-white/55' : 'text-slate-400')}>品质</p>
-                <p className={cn('text-[10px] font-black', isDarkBackdrop ? 'text-white' : 'text-slate-700')}>
+                <p className={cn('text-[9px] font-semibold', isDarkBackdrop ? 'text-white/55' : 'opacity-70')}>品质</p>
+                <p className={cn('text-[10px] font-black', isDarkBackdrop ? 'text-white' : '')}>
                   {QUALITY_LABELS[cardPet.quality]}
                 </p>
               </div>
@@ -2276,7 +2678,6 @@ export function SceneView() {
                 <p className="text-[10px] font-black">{isCardPetDead ? '已离世' : STATE_LABELS[cardPet.state]}</p>
               </div>
             </div>
-
             <div
               className={cn(
                 'mt-1.5 space-y-1 rounded-lg border px-2 py-1.5 text-[10px]',
@@ -2531,7 +2932,13 @@ export function SceneView() {
         coins={coins}
         selectedFoodId={selectedFoodId}
         foodInventory={foodInventory}
+        eggInventory={eggInventory}
+        facilityInventory={facilityInventory}
         onBuyFood={buyFood}
+        onBuyEgg={buyEgg}
+        onBuyFacility={buyFacility}
+        onStartFacilityPlacement={handleStartFacilityPlacement}
+        onInteract={cancelSceneToolInteractions}
         onClose={closeShopPanel}
       />
     </div>

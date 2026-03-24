@@ -1,9 +1,15 @@
 import React, {useMemo, useState} from 'react';
-import {Award, CalendarCheck2, Cloud, Lock, Palette, ShieldCheck, Smile, Sparkles, Target, Utensils, Waves, Zap} from 'lucide-react';
+import {Cloud, Lock, Palette, Smile, Sparkles, Utensils, Waves, Zap} from 'lucide-react';
 import {ThemeType} from '../data/pets';
 import {useStore} from '../store/useStore';
 import {cn} from '../utils/cn';
-import {formatZhDate, getDateKey, getSimulatedDate} from '../utils/date';
+import {formatZhDate, getSimulatedDate} from '../utils/date';
+import {
+  ACHIEVEMENT_CATEGORY_META,
+  AchievementIcon,
+  buildAchievementOverviewStats,
+  buildAchievementCatalog,
+} from '../data/achievements';
 import {
   getPetSpriteOptionByKey,
   hasPetSpriteAction,
@@ -27,22 +33,19 @@ const STATE_CHIPS = [
   {state: 'active', label: '活力'},
 ] as const;
 
-function getDayAllocatedHours(dayAllocations?: Array<{hours: number}>) {
-  if (!dayAllocations || dayAllocations.length === 0) return 0;
-  return dayAllocations.reduce((sum, item) => sum + item.hours, 0);
-}
-
-function hasActivityHours(
-  dayAllocations: Array<{hours: number; type: string}> | undefined,
-  activityType: string,
-  minimumHours = 0.5,
-) {
-  if (!dayAllocations || dayAllocations.length === 0) return false;
-  return dayAllocations.some((item) => item.type === activityType && item.hours >= minimumHours);
-}
-
 export function PokedexView() {
-  const {currentTheme, setCurrentTheme, unlockedPets, customPets, completedPets, allocations, simulatedDateOffset} = useStore();
+  const {
+    currentTheme,
+    setCurrentTheme,
+    unlockedPets,
+    customPets,
+    completedPets,
+    allocations,
+    simulatedDateOffset,
+    facilityInventory,
+    foodInventory,
+    planTemplates,
+  } = useStore();
   const [catalogMode, setCatalogMode] = useState<'pets' | 'badges'>('pets');
   const [selectedSpriteKey, setSelectedSpriteKey] = useState(FARM_SPRITE_OPTIONS[0]?.key ?? '');
   const [previewAction, setPreviewAction] = useState<PetSpriteAction>('idle');
@@ -70,40 +73,6 @@ export function PokedexView() {
   );
   const farmTotalCount = FARM_SPRITE_OPTIONS.length;
   const farmCompletionRate = farmTotalCount > 0 ? Math.round((farmUnlockedCount / farmTotalCount) * 100) : 0;
-
-  const recordedDayCount = useMemo(
-    () => Object.values(allocations).filter((day) => getDayAllocatedHours(day) > 0.01).length,
-    [allocations],
-  );
-  const fullDayCount = useMemo(
-    () => Object.values(allocations).filter((day) => getDayAllocatedHours(day) >= 23.99).length,
-    [allocations],
-  );
-  const recentDateKeys = useMemo(
-    () =>
-      Array.from({length: 7}, (_, index) =>
-        getDateKey(getSimulatedDate(simulatedDateOffset - (6 - index))),
-      ),
-    [simulatedDateOffset],
-  );
-  const recentRecordedDays = useMemo(
-    () => recentDateKeys.filter((key) => getDayAllocatedHours(allocations[key]) > 0.01).length,
-    [recentDateKeys, allocations],
-  );
-  const recentExerciseDays = useMemo(
-    () => recentDateKeys.filter((key) => hasActivityHours(allocations[key], 'exercise', 0.5)).length,
-    [recentDateKeys, allocations],
-  );
-  const recordStreak = useMemo(() => {
-    let streak = 0;
-    for (let index = 0; index < 120; index += 1) {
-      const key = getDateKey(getSimulatedDate(simulatedDateOffset - index));
-      const hasRecord = getDayAllocatedHours(allocations[key]) > 0.01;
-      if (!hasRecord) break;
-      streak += 1;
-    }
-    return streak;
-  }, [allocations, simulatedDateOffset]);
   const farmOwnedCount = useMemo(
     () => completedPets.filter((pet) => pet.theme === 'A').length,
     [completedPets],
@@ -112,60 +81,63 @@ export function PokedexView() {
     () => completedPets.filter((pet) => pet.theme === 'A' && (pet.quality === 'rare' || pet.quality === 'epic')).length,
     [completedPets],
   );
+  const farmPerfectCount = useMemo(
+    () => completedPets.filter((pet) => pet.theme === 'A' && pet.quality === 'epic').length,
+    [completedPets],
+  );
+  const customOwnedCount = useMemo(
+    () => completedPets.filter((pet) => pet.theme === 'custom').length,
+    [completedPets],
+  );
   const selectedSprite = getPetSpriteOptionByKey(selectedSpriteKey);
+  const achievementOverview = useMemo(
+    () => buildAchievementOverviewStats({
+      unlockedPets,
+      completedPets,
+      allocations,
+      simulatedDateOffset,
+      facilityInventory,
+      foodInventory,
+      planTemplateCount: planTemplates.length,
+    }),
+    [
+      allocations,
+      completedPets,
+      facilityInventory,
+      foodInventory,
+      planTemplates.length,
+      simulatedDateOffset,
+      unlockedPets,
+    ],
+  );
 
   const achievements = useMemo(
-    () => [
-      {
-        id: 'farm-first',
-        title: '初次邂逅',
-        description: '解锁 1 只农场幻兽',
-        unlocked: farmUnlockedCount >= 1,
-        progress: `${Math.min(farmUnlockedCount, 1)}/1`,
-        icon: <Sparkles size={14} />,
-      },
-      {
-        id: 'farm-half',
-        title: '收集半程',
-        description: '农场解锁达到 50%',
-        unlocked: farmUnlockedCount >= Math.max(1, Math.ceil(farmTotalCount * 0.5)),
-        progress: `${farmUnlockedCount}/${Math.max(1, Math.ceil(farmTotalCount * 0.5))}`,
-        icon: <Target size={14} />,
-      },
-      {
-        id: 'farm-master',
-        title: '农场图鉴师',
-        description: '解锁全部农场幻兽',
-        unlocked: farmTotalCount > 0 && farmUnlockedCount === farmTotalCount,
-        progress: `${farmUnlockedCount}/${farmTotalCount}`,
-        icon: <Award size={14} />,
-      },
-      {
-        id: 'record-streak',
-        title: '连续记录',
-        description: '连续记录 3 天',
-        unlocked: recordStreak >= 3,
-        progress: `${Math.min(recordStreak, 3)}/3`,
-        icon: <CalendarCheck2 size={14} />,
-      },
-      {
-        id: 'record-week',
-        title: '稳定习惯',
-        description: '近 7 天记录 ≥ 5 天',
-        unlocked: recentRecordedDays >= 5,
-        progress: `${recentRecordedDays}/5`,
-        icon: <ShieldCheck size={14} />,
-      },
-      {
-        id: 'exercise-week',
-        title: '活力节奏',
-        description: '近 7 天运动 ≥ 3 天',
-        unlocked: recentExerciseDays >= 3,
-        progress: `${recentExerciseDays}/3`,
-        icon: <Sparkles size={14} />,
-      },
+    () => buildAchievementCatalog({
+      unlockedPets,
+      completedPets,
+      allocations,
+      simulatedDateOffset,
+      facilityInventory,
+      foodInventory,
+      planTemplateCount: planTemplates.length,
+    }),
+    [
+      allocations,
+      completedPets,
+      facilityInventory,
+      foodInventory,
+      planTemplates.length,
+      simulatedDateOffset,
+      unlockedPets,
     ],
-    [farmTotalCount, farmUnlockedCount, recordStreak, recentRecordedDays, recentExerciseDays],
+  );
+  const achievementGroups = useMemo(
+    () => (Object.keys(ACHIEVEMENT_CATEGORY_META) as Array<keyof typeof ACHIEVEMENT_CATEGORY_META>).map((category) => ({
+      category,
+      meta: ACHIEVEMENT_CATEGORY_META[category],
+      items: achievements.filter((item) => item.category === category),
+    })).filter((group) => group.items.length > 0),
+    [achievements],
   );
   const unlockedBadgeCount = useMemo(
     () => achievements.filter((item) => item.unlocked).length,
@@ -257,7 +229,7 @@ export function PokedexView() {
                 <div className="mb-3 flex items-center justify-between">
                   <div>
                     <p className="text-[10px] font-black uppercase tracking-[0.22em] text-slate-400">成就总览</p>
-                    <p className="mt-1 text-xs text-slate-500">图鉴成就与时间习惯分开展示。</p>
+                    <p className="mt-1 text-xs text-slate-500">解锁会在顶部中间弹出提示，成就按主题分区展示。</p>
                   </div>
                   <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-[10px] font-black text-indigo-600">
                     已达成 {unlockedBadgeCount}/{achievements.length}
@@ -270,57 +242,64 @@ export function PokedexView() {
                   </div>
                   <div className="rounded-2xl border border-emerald-100 bg-emerald-50/70 px-3 py-2.5">
                     <p className="text-[10px] font-black text-emerald-500">连续记录</p>
-                    <p className="mt-1 text-base font-black text-emerald-700">{recordStreak} 天</p>
+                    <p className="mt-1 text-base font-black text-emerald-700">{achievementOverview.recordStreak} 天</p>
                   </div>
                   <div className="rounded-2xl border border-amber-100 bg-amber-50/70 px-3 py-2.5">
                     <p className="text-[10px] font-black text-amber-500">完整记录</p>
-                    <p className="mt-1 text-base font-black text-amber-700">{fullDayCount} 天</p>
+                    <p className="mt-1 text-base font-black text-amber-700">{achievementOverview.fullDayCount} 天</p>
                   </div>
                 </div>
               </section>
 
-              <section className="glass-card rounded-[30px] border-white/40 p-4 shadow-sm">
-                <div className="mb-3 flex items-center justify-between">
-                  <div>
-                    <p className="text-[10px] font-black uppercase tracking-[0.22em] text-slate-400">徽章墙</p>
-                    <p className="mt-1 text-xs text-slate-500">收集与习惯双轨成长。</p>
-                  </div>
-                  <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-black text-slate-500">
-                    累计记录 {recordedDayCount} 天
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 gap-2.5">
-                  {achievements.map((item) => (
-                    <div
-                      key={item.id}
-                      className={cn(
-                        'rounded-2xl border px-3 py-2.5',
-                        item.unlocked
-                          ? 'border-emerald-100 bg-emerald-50/75 shadow-[0_8px_20px_rgba(16,185,129,0.12)]'
-                          : 'border-slate-200 bg-slate-100 text-slate-400',
-                      )}>
-                      <div className="flex items-center justify-between gap-2">
-                        <div className={cn(
-                          'flex h-6 w-6 items-center justify-center rounded-xl',
-                          item.unlocked ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-300 text-slate-500',
-                        )}>
-                          {item.icon}
-                        </div>
-                        <span className={cn(
-                          'rounded-full px-2 py-0.5 text-[10px] font-black',
-                          item.unlocked ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-300 text-slate-500',
-                        )}>
-                          {item.unlocked ? '已达成' : item.progress}
-                        </span>
+              {achievementGroups.map((group) => {
+                const groupUnlockedCount = group.items.filter((item) => item.unlocked).length;
+                return (
+                  <section key={group.category} className="glass-card rounded-[30px] border-white/40 p-4 shadow-sm">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.22em] text-slate-400">
+                          {group.meta.label}
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">{group.meta.description}</p>
                       </div>
-                      <p className={cn('mt-2 text-xs font-black', item.unlocked ? 'text-emerald-700' : 'text-slate-600')}>
-                        {item.title}
-                      </p>
-                      <p className="mt-1 text-[10px] font-medium leading-4">{item.description}</p>
+                      <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-black text-slate-500">
+                        {groupUnlockedCount}/{group.items.length}
+                      </span>
                     </div>
-                  ))}
-                </div>
-              </section>
+                    <div className="grid grid-cols-2 gap-2.5">
+                      {group.items.map((item) => (
+                        <div
+                          key={item.id}
+                          className={cn(
+                            'rounded-2xl border px-3 py-2.5 transition-all',
+                            item.unlocked
+                              ? 'border-emerald-100 bg-emerald-50/80 shadow-[0_8px_20px_rgba(16,185,129,0.12)]'
+                              : 'border-slate-200 bg-slate-100/90 text-slate-400 grayscale-[0.12]',
+                          )}>
+                          <div className="flex items-center justify-between gap-2">
+                            <div className={cn(
+                              'flex h-6 w-6 items-center justify-center rounded-xl',
+                              item.unlocked ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-300 text-slate-500',
+                            )}>
+                              <AchievementIcon iconKey={item.iconKey} size={14} />
+                            </div>
+                            <span className={cn(
+                              'rounded-full px-2 py-0.5 text-[10px] font-black',
+                              item.unlocked ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-300 text-slate-500',
+                            )}>
+                              {item.unlocked ? '已达成' : item.progress}
+                            </span>
+                          </div>
+                          <p className={cn('mt-2 text-xs font-black', item.unlocked ? 'text-emerald-700' : 'text-slate-600')}>
+                            {item.title}
+                          </p>
+                          <p className="mt-1 text-[10px] font-medium leading-4">{item.description}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                );
+              })}
             </>
           ) : null}
 
@@ -514,10 +493,10 @@ export function PokedexView() {
                             (() => {
                               const unlocked = unlockedStates.includes(item.state);
                               const unlockedStyle = item.state === 'focus'
-                                ? 'border-indigo-300 bg-indigo-100 text-indigo-700 shadow-[0_4px_12px_rgba(99,102,241,0.15)]'
+                                ? 'border-rose-300 bg-rose-100 text-rose-700 shadow-[0_4px_12px_rgba(251,113,133,0.15)]'
                                 : item.state === 'heal'
-                                  ? 'border-emerald-300 bg-emerald-100 text-emerald-700 shadow-[0_4px_12px_rgba(16,185,129,0.15)]'
-                                  : 'border-amber-300 bg-amber-100 text-amber-700 shadow-[0_4px_12px_rgba(245,158,11,0.15)]';
+                                  ? 'border-sky-300 bg-sky-100 text-sky-700 shadow-[0_4px_12px_rgba(56,189,248,0.15)]'
+                                  : 'border-emerald-300 bg-emerald-100 text-emerald-700 shadow-[0_4px_12px_rgba(16,185,129,0.15)]';
 
                               return (
                                 <div
@@ -563,7 +542,16 @@ export function PokedexView() {
                     <div key={pet.id} className="glass-card rounded-[32px] p-4 flex flex-col items-center border-white/40 group transition-all hover:scale-[1.02]">
                       <div className="w-full flex justify-between items-center mb-3">
                         <span className="font-black text-slate-800 text-[10px] truncate max-w-[60%]">{pet.name}</span>
-                        <span className="text-[8px] font-black px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-500 uppercase tracking-tighter">
+                        <span className={cn(
+                          'text-[8px] font-black px-2 py-0.5 rounded-full uppercase tracking-tighter',
+                          state === 'focus'
+                            ? 'bg-rose-50 text-rose-600'
+                            : state === 'heal'
+                              ? 'bg-sky-50 text-sky-600'
+                              : state === 'active'
+                                ? 'bg-emerald-50 text-emerald-600'
+                                : 'bg-slate-100 text-slate-500',
+                        )}>
                           {state === 'focus' ? '专注' : state === 'heal' ? '治愈' : state === 'active' ? '活力' : '基础'}
                         </span>
                       </div>

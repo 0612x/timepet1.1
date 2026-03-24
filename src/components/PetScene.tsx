@@ -13,6 +13,8 @@ import {getSpriteActionLoopMs, SpriteActor} from './SpriteActor';
 import {ensureSpritePathLoaded, preloadSpritePaths} from '../utils/spriteAssetLoader';
 import {GraveSprite} from './GraveSprite';
 import {FoodSprite} from './FoodSprite';
+import {BroomActor} from './BroomActor';
+import {MAGIC_BROOM_HOME_DEFAULT, type FacilityPoint} from '../data/facilities';
 import {
   SCENE_BOTTOM_MAX,
   SCENE_BOTTOM_MIN,
@@ -117,6 +119,13 @@ const FEED_APPROACH_SNAP_DISTANCE = 1.3;
 const FEED_CHASE_NEAR_DISTANCE = 2.2;
 const FEED_CHASE_STUCK_LIMIT = 8;
 const SHOW_SCENE_MOVE_BOUNDS = false;
+const MAGIC_BROOM_MOVE_SPEED = 5.6;
+const SCENE_PET_MOVE_SPEED = 1.9;
+const SCENE_PET_CHASE_SPEED = 3.2;
+const MAGIC_BROOM_ARRIVE_DISTANCE = 0.85;
+const MAGIC_BROOM_TARGET_Y_OFFSET = 1.8;
+const MAGIC_BROOM_RETARGET_DELAY_MS = 220;
+const MAGIC_BROOM_CLEAN_DURATION_MS = 2250;
 const SCENE_POOP_ICON_PATHS = [
   '/images/pets/farm/farm_poop.png',
   '/images/pets/farm/poop.png',
@@ -286,6 +295,289 @@ const DeadPetInstance: React.FC<{
   </div>
 );
 
+interface MagicBroomLayerProps {
+  active: boolean;
+  mini: boolean;
+  homePosition: FacilityPoint;
+  wasteSpots: SceneWasteSpot[];
+  onCleanSpot: (spot: SceneWasteSpot) => void;
+}
+
+interface MagicBroomRuntimeState {
+  x: number;
+  y: number;
+  action: 'float' | 'clean';
+  targetWasteId: string | null;
+  cleanSeed: number;
+  phaseUntil: number;
+  cleanProgress: number;
+}
+
+function getNearestWasteSpot(
+  x: number,
+  y: number,
+  wasteSpots: SceneWasteSpot[],
+) {
+  let matchedSpot: SceneWasteSpot | null = null;
+  let matchedDistance = Number.POSITIVE_INFINITY;
+
+  wasteSpots.forEach((spot) => {
+    const distance = Math.hypot(spot.x - x, spot.y - y);
+    if (distance >= matchedDistance) return;
+    matchedDistance = distance;
+    matchedSpot = spot;
+  });
+
+  return matchedSpot;
+}
+
+const MagicBroomLayer: React.FC<MagicBroomLayerProps> = ({
+  active,
+  mini,
+  homePosition,
+  wasteSpots,
+  onCleanSpot,
+}) => {
+  const [runtime, setRuntime] = useState<MagicBroomRuntimeState>({
+    x: homePosition.x,
+    y: homePosition.y,
+    action: 'float',
+    targetWasteId: null,
+    cleanSeed: 0,
+    phaseUntil: 0,
+    cleanProgress: 0,
+  });
+  const runtimeRef = useRef(runtime);
+  const wasteSpotsRef = useRef(wasteSpots);
+  const onCleanSpotRef = useRef(onCleanSpot);
+  const homePositionRef = useRef(homePosition);
+  const documentVisibleRef = useRef(typeof document === 'undefined' ? true : !document.hidden);
+
+  useEffect(() => {
+    runtimeRef.current = runtime;
+  }, [runtime]);
+
+  useEffect(() => {
+    homePositionRef.current = homePosition;
+  }, [homePosition]);
+
+  useEffect(() => {
+    wasteSpotsRef.current = wasteSpots;
+  }, [wasteSpots]);
+
+  useEffect(() => {
+    onCleanSpotRef.current = onCleanSpot;
+  }, [onCleanSpot]);
+
+  useEffect(() => {
+    if (!active) {
+      const resetState = {
+        x: homePosition.x,
+        y: homePosition.y,
+        action: 'float',
+        targetWasteId: null,
+        cleanSeed: 0,
+        phaseUntil: 0,
+        cleanProgress: 0,
+      } satisfies MagicBroomRuntimeState;
+      runtimeRef.current = resetState;
+      setRuntime(resetState);
+      return;
+    }
+
+    let frameId = 0;
+    let previousAt = performance.now();
+    const handleVisibilityChange = () => {
+      documentVisibleRef.current = !document.hidden;
+      previousAt = performance.now();
+    };
+
+    if (typeof document !== 'undefined') {
+      documentVisibleRef.current = !document.hidden;
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+
+    const tick = (currentAt: number) => {
+      if (!documentVisibleRef.current) {
+        previousAt = currentAt;
+        frameId = window.requestAnimationFrame(tick);
+        return;
+      }
+
+      const deltaSeconds = Math.min(0.05, Math.max(0.001, (currentAt - previousAt) / 1000));
+      previousAt = currentAt;
+      const now = Date.now();
+      const previous = runtimeRef.current;
+      const spots = wasteSpotsRef.current;
+      const home = homePositionRef.current;
+      let next = previous;
+      let cleanedSpot: SceneWasteSpot | null = null;
+      let targetSpot = previous.targetWasteId
+        ? spots.find((spot) => spot.id === previous.targetWasteId) ?? null
+        : null;
+
+      if (previous.action === 'clean') {
+        if (!targetSpot) {
+          next = {
+            ...previous,
+            action: 'float',
+            targetWasteId: null,
+            phaseUntil: now + MAGIC_BROOM_RETARGET_DELAY_MS,
+            cleanProgress: 0,
+          };
+        } else if (now >= previous.phaseUntil) {
+          cleanedSpot = targetSpot;
+          next = {
+            ...previous,
+            action: 'float',
+            targetWasteId: null,
+            phaseUntil: now + MAGIC_BROOM_RETARGET_DELAY_MS,
+            cleanProgress: 0,
+          };
+        } else {
+          next = {
+            ...previous,
+            cleanProgress: clamp(
+              1 - (previous.phaseUntil - now) / MAGIC_BROOM_CLEAN_DURATION_MS,
+              0,
+              1,
+            ),
+          };
+        }
+      } else {
+        if (!targetSpot && now >= previous.phaseUntil && spots.length > 0) {
+          targetSpot = getNearestWasteSpot(previous.x, previous.y, spots);
+        }
+
+        if (!targetSpot) {
+          const homeX = clamp(home.x, SCENE_X_MIN + 1.5, SCENE_X_MAX - 1.5);
+          const homeY = clamp(home.y, SCENE_BOTTOM_MIN + 1.5, SCENE_BOTTOM_MAX - 1.5);
+          const deltaX = homeX - previous.x;
+          const deltaY = homeY - previous.y;
+          const distance = Math.hypot(deltaX, deltaY);
+
+          if (distance <= MAGIC_BROOM_ARRIVE_DISTANCE) {
+            next = {
+              ...previous,
+              x: homeX,
+              y: homeY,
+              action: 'float',
+              targetWasteId: null,
+              cleanProgress: 0,
+            };
+          } else {
+            const step = Math.min(distance, MAGIC_BROOM_MOVE_SPEED * deltaSeconds);
+            next = {
+              ...previous,
+              x: previous.x + (deltaX / distance) * step,
+              y: previous.y + (deltaY / distance) * step,
+              action: 'float',
+              targetWasteId: null,
+              cleanProgress: 0,
+            };
+          }
+        } else {
+          const targetX = clamp(targetSpot.x, SCENE_X_MIN + 1.5, SCENE_X_MAX - 1.5);
+          const targetY = clamp(
+            targetSpot.y - MAGIC_BROOM_TARGET_Y_OFFSET,
+            SCENE_BOTTOM_MIN + 1.5,
+            SCENE_BOTTOM_MAX - 1.5,
+          );
+          const deltaX = targetX - previous.x;
+          const deltaY = targetY - previous.y;
+          const distance = Math.hypot(deltaX, deltaY);
+
+          if (distance <= MAGIC_BROOM_ARRIVE_DISTANCE) {
+            next = {
+              ...previous,
+              x: targetX,
+              y: targetY,
+              action: 'clean',
+              targetWasteId: targetSpot.id,
+              cleanSeed: previous.cleanSeed + 1,
+              phaseUntil: now + MAGIC_BROOM_CLEAN_DURATION_MS,
+              cleanProgress: 0,
+            };
+          } else {
+            const step = Math.min(distance, MAGIC_BROOM_MOVE_SPEED * deltaSeconds);
+            next = {
+              ...previous,
+              x: previous.x + (deltaX / distance) * step,
+              y: previous.y + (deltaY / distance) * step,
+              action: 'float',
+              targetWasteId: targetSpot.id,
+              cleanProgress: 0,
+            };
+          }
+        }
+      }
+
+      if (
+        next !== previous
+        && (
+          Math.abs(next.x - previous.x) >= 0.01
+          || Math.abs(next.y - previous.y) >= 0.01
+          || next.action !== previous.action
+          || next.targetWasteId !== previous.targetWasteId
+          || next.cleanSeed !== previous.cleanSeed
+          || next.phaseUntil !== previous.phaseUntil
+          || Math.abs(next.cleanProgress - previous.cleanProgress) >= 0.01
+        )
+      ) {
+        runtimeRef.current = next;
+        setRuntime(next);
+      }
+
+      if (cleanedSpot) {
+        onCleanSpotRef.current(cleanedSpot);
+      }
+
+      frameId = window.requestAnimationFrame(tick);
+    };
+
+    frameId = window.requestAnimationFrame(tick);
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [active]);
+
+  if (!active) return null;
+
+  return (
+    <div
+      className="pointer-events-none absolute -translate-x-1/2 -translate-y-full"
+      style={{
+        left: `${runtime.x}%`,
+        top: `${runtime.y}%`,
+        zIndex: getLayerZIndex(runtime.y),
+      }}>
+      <div className="relative">
+        {runtime.action === 'clean' && (
+          <div className="absolute left-1/2 top-0 z-[1] w-11 -translate-x-1/2 -translate-y-[110%]">
+            <div className="h-1.5 overflow-hidden rounded-full bg-white/70 shadow-[0_2px_8px_rgba(15,23,42,0.12)]">
+              <div
+                className="h-full rounded-full bg-emerald-400 transition-[width] duration-75"
+                style={{width: `${Math.round(runtime.cleanProgress * 100)}%`}}
+              />
+            </div>
+          </div>
+        )}
+        <div className="absolute left-1/2 top-[72%] h-3 w-8 -translate-x-1/2 rounded-full bg-[radial-gradient(ellipse_at_center,rgba(15,23,42,0.18)_0%,rgba(15,23,42,0.06)_62%,rgba(15,23,42,0)_100%)]" />
+        <BroomActor
+          action={runtime.action}
+          seed={runtime.cleanSeed}
+          scale={mini ? 0.22 : 0.38}
+          ariaLabel="魔法扫把"
+          className="relative drop-shadow-[0_10px_18px_rgba(15,23,42,0.18)]"
+        />
+      </div>
+    </div>
+  );
+};
+
 const BasicPetInstance: React.FC<BasicPetInstanceProps> = ({pet, mini, theme, onSelect, children}) => {
   const getAnimationClass = (variant: number, currentTheme: ThemeType) => {
     if (currentTheme === 'custom') return 'animate-float';
@@ -378,6 +670,7 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   const onFeedChaseFailedRef = useRef(onFeedChaseFailed);
   const forcedIdleTimerRef = useRef<number | null>(null);
   const movingUntilRef = useRef(0);
+  const documentVisibleRef = useRef(typeof document === 'undefined' ? true : !document.hidden);
   const queuedActionIntentRef = useRef<'happy' | 'feed' | null>(null);
   const directionRef = useRef<{x: -1 | 1; y: -1 | 1}>({
     x: Math.random() > 0.5 ? 1 : -1,
@@ -393,7 +686,6 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
     mode: Math.random() < 0.2 ? 'explore' : 'roam',
     expiresAt: Date.now() + 7000 + Math.random() * 8000,
   });
-  const moveDuration = mini ? 1600 : 2200;
   const moveLoopMs = useMemo(
     () => getSpriteActionLoopMs(pet.petId, 'move') ?? 980,
     [pet.petId],
@@ -484,7 +776,7 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
         sceneSize.height > 0
           ? (spriteHeightPx / sceneSize.height) * 100
           : (mini ? 10 : 14);
-      const yMin = bottomMinPercent - spriteHeightPercent;
+      const yMin = bottomMinPercent;
       const yMax = Math.max(yMin + 1.2, bottomMaxPercent - spriteHeightPercent);
 
       return {
@@ -783,6 +1075,21 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
   useEffect(() => {
     onFeedChaseFailedRef.current = onFeedChaseFailed;
   }, [onFeedChaseFailed]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return undefined;
+
+    const handleVisibilityChange = () => {
+      documentVisibleRef.current = !document.hidden;
+      if (document.hidden) {
+        movingUntilRef.current = 0;
+      }
+    };
+
+    documentVisibleRef.current = !document.hidden;
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
 
   useEffect(() => {
     faceRightRef.current = faceRight;
@@ -1402,6 +1709,30 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       to: {x: number; y: number},
     ) => Math.hypot(to.x - from.x, (to.y - from.y) * 1.22);
 
+    const getTravelDurationMs = (
+      from: {x: number; y: number},
+      to: {x: number; y: number},
+      mode: 'move' | 'chase',
+    ) => {
+      const distance = getTravelDistance(from, to);
+      const speed = mode === 'chase' ? SCENE_PET_CHASE_SPEED : SCENE_PET_MOVE_SPEED;
+      const rawDuration = (distance / Math.max(0.1, speed)) * 1000;
+
+      if (mode === 'chase') {
+        return clamp(
+          Math.round(rawDuration),
+          mini ? 420 : 520,
+          mini ? 980 : 1320,
+        );
+      }
+
+      return clamp(
+        Math.round(rawDuration),
+        mini ? 760 : 920,
+        mini ? 1880 : 2480,
+      );
+    };
+
     const hasEnoughDisplacement = (
       from: {x: number; y: number},
       to: {x: number; y: number},
@@ -1482,6 +1813,10 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
 
     const run = () => {
       if (!alive) return;
+      if (!documentVisibleRef.current) {
+        timer = schedule(run, 260);
+        return;
+      }
       const now = Date.now();
     if (now < forcedActionUntilRef.current) {
       timer = schedule(run, 130 + Math.random() * 120);
@@ -1598,13 +1933,7 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
         feedStuckAttemptsRef.current = 0;
 
         const nextPos = {x: nextX, y: nextY};
-        const chaseTravelDistance = getTravelDistance(currentAtStart, nextPos);
-        const chaseCycles = clamp(chaseTravelDistance / (mini ? 2.4 : 3.1), 0.72, 1.42);
-        const chaseDuration = clamp(
-          Math.round(moveLoopMs * chaseCycles),
-          mini ? 420 : 520,
-          mini ? 980 : 1320,
-        );
+        const chaseDuration = getTravelDurationMs(currentAtStart, nextPos, 'chase');
         posRef.current = nextPos;
         setMotionTransitionProfile(chaseDuration, 'linear');
         setPos(nextPos);
@@ -1696,12 +2025,13 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
             setFacingDirection(nextX >= current.x);
           }
           const nextPos = {x: nextX, y: nextY};
+          const normalMoveDuration = getTravelDurationMs(current, nextPos, 'move');
           posRef.current = nextPos;
-          setMotionTransitionProfile(moveDuration, 'linear');
+          setMotionTransitionProfile(normalMoveDuration, 'linear');
           setPos(nextPos);
           onMove(pet.instanceId, nextX, nextY);
           setNextAction('move');
-          movingUntilRef.current = Date.now() + moveDuration + 60;
+          movingUntilRef.current = Date.now() + normalMoveDuration + 60;
 
           schedule(() => {
             if (!alive) return;
@@ -1716,7 +2046,7 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
             const nextRestAction = pickRestAction();
             setNextAction(nextRestAction);
             timer = schedule(run, getRestDelay(nextRestAction, nearEdge));
-          }, moveDuration + 40);
+          }, normalMoveDuration + 40);
           return;
         }
       }
@@ -1733,7 +2063,7 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
       window.clearTimeout(timer);
       timers.forEach((id) => window.clearTimeout(id));
     };
-  }, [activeFeedDropIds, availableActions, bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, clearFeedProgressTimer, defaultAction, feedMoveRequest?.nonce, finalizeFeedSession, getCollisionPressure, getFeedAnchorPosition, getInteractionCenter, isPositionBlocked, mini, moveDuration, moveLoopMs, onMove, pet.instanceId, pet.petId, pet.state, pickFeedApproachTarget, sceneSize.width, setMotionTransitionProfile]);
+  }, [activeFeedDropIds, availableActions, bounds.xMax, bounds.xMin, bounds.yMax, bounds.yMin, clearFeedProgressTimer, defaultAction, feedMoveRequest?.nonce, finalizeFeedSession, getCollisionPressure, getFeedAnchorPosition, getInteractionCenter, isPositionBlocked, mini, moveLoopMs, onMove, pet.instanceId, pet.petId, pet.state, pickFeedApproachTarget, sceneSize.width, setMotionTransitionProfile]);
 
   if (!spriteOption) return null;
 
@@ -1866,6 +2196,9 @@ const SpritePetInstance: React.FC<SpritePetInstanceProps> = ({
 interface PetSceneProps {
   mini?: boolean;
   isDarkBackdrop?: boolean;
+  magicBroomEnabled?: boolean;
+  magicBroomHomePosition?: FacilityPoint;
+  magicBroomPlacementActive?: boolean;
   sceneSurfaceRef?: React.MutableRefObject<HTMLDivElement | null>;
   onPetSelect?: (pet: CompletedPet) => void;
   onSceneBlankClick?: () => void;
@@ -1900,6 +2233,9 @@ interface PetSceneProps {
 export function PetScene({
   mini = false,
   isDarkBackdrop = false,
+  magicBroomEnabled = false,
+  magicBroomHomePosition = MAGIC_BROOM_HOME_DEFAULT,
+  magicBroomPlacementActive = false,
   sceneSurfaceRef,
   onPetSelect,
   onSceneBlankClick,
@@ -1919,6 +2255,7 @@ export function PetScene({
   const currentTheme = useStore((state) => state.currentTheme);
   const completedPets = useStore((state) => state.completedPets);
   const customPets = useStore((state) => state.customPets);
+  const cleanCompletedPetWaste = useStore((state) => state.cleanCompletedPetWaste);
   const syncPetData = useStore((state) => state.syncPetData);
   const updatePetPositionsBatch = useStore((state) => state.updatePetPositionsBatch);
   const sceneRef = useRef<HTMLDivElement | null>(null);
@@ -2077,6 +2414,12 @@ export function PetScene({
   useEffect(() => {
     onWasteSpotsChange?.(sceneWasteSpots);
   }, [onWasteSpotsChange, sceneWasteSpots]);
+  const handleAutoCleanWaste = useCallback((spot: SceneWasteSpot) => {
+    const cleaned = cleanCompletedPetWaste(spot.instanceId, spot.id);
+    if (!cleaned) return;
+
+    setSceneWasteSpots((previous) => previous.filter((item) => item.id !== spot.id));
+  }, [cleanCompletedPetWaste]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2199,6 +2542,67 @@ export function PetScene({
             );
           })()
         ))}
+        {magicBroomEnabled && currentTheme === 'A' && (
+          <div
+            className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2"
+            style={{
+              left: `${magicBroomHomePosition.x}%`,
+              top: `${magicBroomHomePosition.y}%`,
+              zIndex: 90,
+            }}>
+            <div className="relative flex flex-col items-center">
+              {magicBroomPlacementActive && (
+                <div className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-emerald-200/90 bg-[rgba(252,255,252,0.96)] px-2.5 py-1 text-[9px] font-black text-emerald-800 shadow-[0_8px_18px_rgba(16,185,129,0.16)]">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                  扫把停靠点
+                </div>
+              )}
+              <div className="relative h-7 w-12">
+                <div className={cn(
+                  'absolute left-1/2 top-1/2 h-[18px] w-11 -translate-x-1/2 -translate-y-1/2 rounded-full border',
+                  magicBroomPlacementActive
+                    ? 'border-emerald-300/85 bg-emerald-200/18 shadow-[0_0_0_2px_rgba(110,231,183,0.14),0_6px_18px_rgba(16,185,129,0.14)]'
+                    : (isDarkBackdrop
+                      ? 'border-white/20 bg-white/6 shadow-[0_4px_10px_rgba(15,23,42,0.18)]'
+                      : 'border-emerald-200/70 bg-[rgba(241,253,244,0.38)] shadow-[0_4px_10px_rgba(34,197,94,0.08)]'),
+                )} />
+                <div className={cn(
+                  'absolute left-1/2 top-1/2 h-2.5 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full border',
+                  magicBroomPlacementActive
+                    ? 'border-emerald-300/75'
+                    : (isDarkBackdrop ? 'border-white/14' : 'border-emerald-200/55'),
+                )} />
+                <div className={cn(
+                  'absolute left-1/2 top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rotate-45 rounded-[3px] border',
+                  magicBroomPlacementActive
+                    ? 'border-emerald-400/90 bg-emerald-200/85 shadow-[0_0_10px_rgba(16,185,129,0.22)]'
+                    : (isDarkBackdrop
+                      ? 'border-white/28 bg-white/18'
+                      : 'border-emerald-300/70 bg-white/78'),
+                )} />
+                <div className={cn(
+                  'absolute left-1/2 top-1/2 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full',
+                  magicBroomPlacementActive
+                    ? 'bg-emerald-600/90'
+                    : (isDarkBackdrop ? 'bg-white/45' : 'bg-emerald-500/65'),
+                )} />
+                {magicBroomPlacementActive && (
+                  <>
+                    <div className="absolute left-1/2 top-1/2 h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full border border-emerald-300/45 animate-ping" />
+                    <div className="absolute left-1/2 top-1/2 h-10 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full border border-emerald-200/28" />
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        <MagicBroomLayer
+          active={magicBroomEnabled && currentTheme === 'A'}
+          mini={mini}
+          homePosition={magicBroomHomePosition}
+          wasteSpots={sceneWasteSpots}
+          onCleanSpot={handleAutoCleanWaste}
+        />
         {petsInTheme.map((pet) => {
           if (pet.isDead) {
             return <DeadPetInstance key={pet.instanceId} pet={pet} mini={mini} onSelect={onPetSelect} />;
